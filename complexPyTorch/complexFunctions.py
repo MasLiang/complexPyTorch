@@ -6,6 +6,7 @@
 """
 
 import torch
+from torch.autograd import Function
 from torch.nn.functional import (
     avg_pool2d,
     dropout,
@@ -169,9 +170,10 @@ def complex_max_pool2d(
     return_indices=False,
 ):
     """
-    Perform complex max pooling by selecting on the absolute value on the complex values.
+    Perform complex max pooling by selecting the absolute value of the complex values.
     """
-    absolute_value, indices = max_pool2d(
+    # 1. 在模长上计算 MaxPool，仅仅为了获取最大值的位置索引 (indices)
+    _, indices = max_pool2d(
         inp.abs(),
         kernel_size=kernel_size,
         stride=stride,
@@ -180,18 +182,14 @@ def complex_max_pool2d(
         ceil_mode=ceil_mode,
         return_indices=True,
     )
-    # performs the selection on the absolute values
-    absolute_value = absolute_value.type(torch.complex64)
-    # retrieve the corresponding phase value using the indices
-    # unfortunately, the derivative for 'angle' is not implemented
-    angle = torch.atan2(inp.imag, inp.real)
-    # get only the phase values selected by max pool
-    angle = _retrieve_elements_from_indices(angle, indices)
-    return absolute_value * (
-        torch.cos(angle).type(torch.complex64)
-        + 1j * torch.sin(angle).type(torch.complex64)
-    )
-
+    
+    # 2. ✨ 专家修复：直接利用 indices 从原始复数张量中 gather 对应位置的复数。
+    # 速度极快，没有三角函数，且 Autograd 梯度回传 100% 精确无损！
+    pooled_complex = _retrieve_elements_from_indices(inp, indices)
+    
+    if return_indices:
+        return pooled_complex, indices
+    return pooled_complex
 
 def complex_dropout(inp, p=0.5, training=True):
     # need to have the same dropout mask for real and imaginary part,
@@ -209,3 +207,64 @@ def complex_dropout2d(inp, p=0.5, training=True):
     mask = dropout2d(mask, p, training) * 1 / (1 - p)
     mask.type(inp.dtype)
     return mask * inp
+
+
+class _BinarySign(Function):
+    @staticmethod
+    def forward(ctx, inp, grad_mode):
+        ctx.save_for_backward(inp)
+        ctx.grad_mode = grad_mode
+        return inp.sign()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (inp,) = ctx.saved_tensors
+        abs_inp = inp.abs()
+        if ctx.grad_mode == "bireal":
+            grad = (2.0 * (1.0 - abs_inp)).clamp(min=0.0)
+        else:
+            grad = (abs_inp <= 1.0).to(grad_output.dtype)
+        return grad_output * grad, None
+
+
+def binary_sign(inp, grad_mode="ste"):
+    return _BinarySign.apply(inp, grad_mode)
+
+
+def complex_binary_sign(inp, grad_mode="bireal"):
+    if torch.is_complex(inp):
+        real = binary_sign(inp.real, grad_mode=grad_mode)
+        imag = binary_sign(inp.imag, grad_mode=grad_mode)
+        return torch.complex(real, imag)
+    return binary_sign(inp, grad_mode=grad_mode)
+
+def binary_scale_weight_complex(weight, per_channel=True):
+    """
+    计算统一的复数权重缩放因子，保持相位各向同性
+    """
+    if not torch.is_complex(weight):
+        raise ValueError("Expected complex weight")
+        
+    if per_channel:
+        dims = tuple(range(1, weight.dim()))
+        # 直接对复数的模长(abs)求均值
+        alpha = weight.abs().mean(dim=dims, keepdim=True)
+    else:
+        alpha = weight.abs().mean()
+        shape = [1] * weight.dim()
+        alpha = alpha.view(*shape)
+        
+    return alpha
+
+def complex_binary_weight(weight, per_channel=True, grad_mode="ste"):
+    # 获取统一的缩放因子
+    alpha = binary_scale_weight_complex(weight, per_channel=per_channel)
+    
+    # 对实部和虚部进行符号二值化，并乘以相同的 alpha
+    real = binary_sign(weight.real, grad_mode=grad_mode) * alpha
+    imag = binary_sign(weight.imag, grad_mode=grad_mode) * alpha
+    
+    return torch.complex(real, imag)
+
+def complex_binary_activation(inp, grad_mode="bireal"):
+    return complex_binary_sign(inp, grad_mode=grad_mode)

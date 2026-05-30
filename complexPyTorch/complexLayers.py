@@ -11,6 +11,7 @@ Based on https://openreview.net/forum?id=H1T2hmZAb
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch.nn import (
     Module, Parameter, init,
     Conv2d, ConvTranspose2d, Linear, LSTM, GRU,
@@ -27,6 +28,8 @@ from .complexFunctions import (
     complex_dropout,
     complex_dropout2d,
     complex_opposite,
+    complex_binary_activation,
+    complex_binary_weight,
 )
 
 
@@ -211,6 +214,134 @@ class ComplexLinear(Module):
         return apply_complex(self.fc_r, self.fc_i, inp)
 
 
+class BinaryComplexActivation(Module):
+    def __init__(self, grad_mode="bireal"):
+        super().__init__()
+        self.grad_mode = grad_mode
+
+    def forward(self, inp):
+        return complex_binary_activation(inp, grad_mode=self.grad_mode)
+
+
+class BinaryComplexConv2d(Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias=True,
+        per_channel=True,
+        weight_grad_mode="ste",
+    ):
+        super().__init__()
+        self.conv_r = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+        )
+        self.conv_i = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+        )
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self.per_channel = per_channel
+        self.weight_grad_mode = weight_grad_mode
+
+    def forward(self, inp):
+        weight = torch.complex(self.conv_r.weight, self.conv_i.weight)
+        weight = complex_binary_weight(
+            weight,
+            per_channel=self.per_channel,
+            grad_mode=self.weight_grad_mode,
+        )
+        w_r = weight.real
+        w_i = weight.imag
+
+        real = F.conv2d(
+            inp.real,
+            w_r,
+            bias=self.conv_r.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+        real = real - F.conv2d(
+            inp.imag,
+            w_i,
+            bias=self.conv_i.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+
+        imag = F.conv2d(
+            inp.imag,
+            w_r,
+            bias=self.conv_r.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+        imag = imag + F.conv2d(
+            inp.real,
+            w_i,
+            bias=self.conv_i.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+
+        return torch.complex(real, imag)
+
+
+class BinaryComplexLinear(Module):
+    def __init__(self, in_features, out_features, bias=True, per_channel=True, weight_grad_mode="ste"):
+        super().__init__()
+        self.fc_r = Linear(in_features, out_features, bias=bias)
+        self.fc_i = Linear(in_features, out_features, bias=bias)
+        self.per_channel = per_channel
+        self.weight_grad_mode = weight_grad_mode
+
+    def forward(self, inp):
+        weight = torch.complex(self.fc_r.weight, self.fc_i.weight)
+        weight = complex_binary_weight(
+            weight,
+            per_channel=self.per_channel,
+            grad_mode=self.weight_grad_mode,
+        )
+        w_r = weight.real
+        w_i = weight.imag
+
+        real = F.linear(inp.real, w_r, self.fc_r.bias)
+        real = real - F.linear(inp.imag, w_i, self.fc_i.bias)
+        imag = F.linear(inp.imag, w_r, self.fc_r.bias)
+        imag = imag + F.linear(inp.real, w_i, self.fc_i.bias)
+
+        return torch.complex(real, imag)
+
+
 class NaiveComplexBatchNorm1d(Module):
     """
     Naive approach to complex batch norm, perform batch norm independently on real and imaginary part.
@@ -385,10 +516,10 @@ class ComplexBatchNorm2d(_ComplexBatchNorm):
                 )
 
         # calculate the inverse square root the covariance matrix
-        det = Crr * Cii - Cri.pow(2)
+        det = (Crr * Cii - Cri.pow(2)).clamp(min=1e-7)
         s = torch.sqrt(det)
-        t = torch.sqrt(Cii + Crr + 2 * s)
-        inverse_st = 1.0 / (s * t)
+        t = torch.sqrt(Cii + Crr + 2 * s).clamp(min=1e-7)
+        inverse_st = 1.0 / (s * t).clamp(min=1e-7)
         Rrr = (Cii + s) * inverse_st
         Rii = (Crr + s) * inverse_st
         Rri = -Cri * inverse_st
@@ -420,22 +551,23 @@ class ComplexBatchNorm2d(_ComplexBatchNorm):
 
 class ComplexBatchNorm1d(_ComplexBatchNorm):
     def forward(self, inp):
-
         exponential_average_factor = 0.0
 
         if self.training and self.track_running_stats:
             if self.num_batches_tracked is not None:
                 self.num_batches_tracked += 1
                 if self.momentum is None:  # use cumulative moving average
-                    exponential_average_factor = 1.0 / \
-                        float(self.num_batches_tracked)
+                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
                 else:  # use exponential moving average
                     exponential_average_factor = self.momentum
 
+        reduce_dims = tuple([0] + list(range(2, inp.dim())))
+        view_shape = [1, inp.size(1)] + [1] * (inp.dim() - 2)
+
         if self.training or (not self.track_running_stats):
             # calculate mean of real and imaginary part
-            mean_r = inp.real.mean(dim=0).type(torch.complex64)
-            mean_i = inp.imag.mean(dim=0).type(torch.complex64)
+            mean_r = inp.real.mean(dim=reduce_dims).type(torch.complex64)
+            mean_i = inp.imag.mean(dim=reduce_dims).type(torch.complex64)
             mean = mean_r + 1j * mean_i
         else:
             mean = self.running_mean
@@ -448,14 +580,14 @@ class ComplexBatchNorm1d(_ComplexBatchNorm):
                     + (1 - exponential_average_factor) * self.running_mean
                 )
 
-        inp = inp - mean[None, ...]
+        inp = inp - mean.view(*view_shape)
 
         if self.training or (not self.track_running_stats):
             # Elements of the covariance matrix (biased for train)
             n = inp.numel() / inp.size(1)
-            Crr = inp.real.var(dim=0, unbiased=False) + self.eps
-            Cii = inp.imag.var(dim=0, unbiased=False) + self.eps
-            Cri = (inp.real.mul(inp.imag)).mean(dim=0)
+            Crr = inp.real.pow(2).mean(dim=reduce_dims) + self.eps
+            Cii = inp.imag.pow(2).mean(dim=reduce_dims) + self.eps
+            Cri = (inp.real.mul(inp.imag)).mean(dim=reduce_dims)
         else:
             Crr = self.running_covar[:, 0] + self.eps
             Cii = self.running_covar[:, 1] + self.eps
@@ -465,53 +597,50 @@ class ComplexBatchNorm1d(_ComplexBatchNorm):
             with torch.no_grad():
                 self.running_covar[:, 0] = (
                     exponential_average_factor * Crr * n / (n - 1)
-                    + (1 - exponential_average_factor) *
-                    self.running_covar[:, 0]
+                    + (1 - exponential_average_factor) * self.running_covar[:, 0]
                 )
-
                 self.running_covar[:, 1] = (
                     exponential_average_factor * Cii * n / (n - 1)
-                    + (1 - exponential_average_factor) *
-                    self.running_covar[:, 1]
+                    + (1 - exponential_average_factor) * self.running_covar[:, 1]
                 )
-
                 self.running_covar[:, 2] = (
                     exponential_average_factor * Cri * n / (n - 1)
-                    + (1 - exponential_average_factor) *
-                    self.running_covar[:, 2]
+                    + (1 - exponential_average_factor) * self.running_covar[:, 2]
                 )
 
         # calculate the inverse square root the covariance matrix
-        det = Crr * Cii - Cri.pow(2)
+        det = (Crr * Cii - Cri.pow(2)).clamp(min=1e-7)
         s = torch.sqrt(det)
-        t = torch.sqrt(Cii + Crr + 2 * s)
-        inverse_st = 1.0 / (s * t)
+        t = torch.sqrt(Cii + Crr + 2 * s).clamp(min=1e-7)
+        inverse_st = 1.0 / (s * t).clamp(min=1e-7)
         Rrr = (Cii + s) * inverse_st
         Rii = (Crr + s) * inverse_st
         Rri = -Cri * inverse_st
 
-        inp = (Rrr[None, :] * inp.real + Rri[None, :] * inp.imag).type(
-            torch.complex64
-        ) + 1j * (Rii[None, :] * inp.imag + Rri[None, :] * inp.real).type(
-            torch.complex64
-        )
+        # 将所有的协方差参数拓展为 view_shape 以匹配输入张量的广播
+        Rrr_v = Rrr.view(*view_shape)
+        Rii_v = Rii.view(*view_shape)
+        Rri_v = Rri.view(*view_shape)
+
+        inp = (Rrr_v * inp.real + Rri_v * inp.imag).type(torch.complex64) + 1j * (
+            Rii_v * inp.imag + Rri_v * inp.real
+        ).type(torch.complex64)
 
         if self.affine:
+            # 可学习仿射变换参数也必须安全广播
+            w0 = self.weight[:, 0].view(*view_shape)
+            w1 = self.weight[:, 1].view(*view_shape)
+            w2 = self.weight[:, 2].view(*view_shape)
+            b0 = self.bias[:, 0].view(*view_shape)
+            b1 = self.bias[:, 1].view(*view_shape)
+
             inp = (
-                self.weight[None, :, 0] * inp.real
-                + self.weight[None, :, 2] * inp.imag
-                + self.bias[None, :, 0]
+                w0 * inp.real + w2 * inp.imag + b0
             ).type(torch.complex64) + 1j * (
-                self.weight[None, :, 2] * inp.real
-                + self.weight[None, :, 1] * inp.imag
-                + self.bias[None, :, 1]
-            ).type(
-                torch.complex64
-            )
+                w2 * inp.real + w1 * inp.imag + b1
+            ).type(torch.complex64)
 
-        del Crr, Cri, Cii, Rrr, Rii, Rri, det, s, t
         return inp
-
 
 class ComplexGRUCell(Module):
     """
