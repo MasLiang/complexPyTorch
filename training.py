@@ -1,0 +1,822 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import logging
+import os
+import random
+import socket
+import sys
+import time
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
+from torchvision import datasets, transforms
+
+from complexPyTorch.complexBinaryResNet import BinaryComplexResNet
+from complexPyTorch.complexResNet import ComplexResNet
+
+
+LOGLEVELS = {
+    "none": logging.NOTSET,
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warn": logging.WARN,
+    "err": logging.ERROR,
+    "crit": logging.CRITICAL,
+}
+
+
+class SubtractMean(object):
+    def __init__(self, mean):
+        self.mean = mean
+
+    def __call__(self, tensor):
+        return tensor - self.mean
+
+
+class SVHNDataset(datasets.SVHN):
+    def __getitem__(self, index):
+        image, target = super().__getitem__(index)
+        if target == 10:
+            target = 0
+        return image, target
+
+
+def setup_logging(workdir, loglevel, is_main):
+    if not is_main:
+        logging.basicConfig(level=logging.ERROR)
+        train_logger = logging.getLogger("train")
+        entry_logger = logging.getLogger("entry")
+        null_handler = logging.NullHandler()
+        train_logger.addHandler(null_handler)
+        entry_logger.addHandler(null_handler)
+        return entry_logger, train_logger
+
+    if not os.path.isdir(workdir):
+        os.makedirs(workdir)
+    logdir = os.path.join(workdir, "logs")
+    if not os.path.isdir(logdir):
+        os.makedirs(logdir)
+
+    formatter = logging.Formatter(
+        "[%(asctime)s ~~ %(levelname)-8s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(LOGLEVELS[loglevel])
+    stdout_handler.setFormatter(formatter)
+
+    train_handler = logging.FileHandler(
+        os.path.join(logdir, "train.txt"), mode="a", encoding="utf-8"
+    )
+    train_handler.setLevel(LOGLEVELS[loglevel])
+    train_handler.setFormatter(formatter)
+
+    entry_handler = logging.FileHandler(
+        os.path.join(logdir, "entry.txt"), mode="a", encoding="utf-8"
+    )
+    entry_handler.setLevel(LOGLEVELS[loglevel])
+    entry_handler.setFormatter(formatter)
+
+    logging.basicConfig(level=LOGLEVELS[loglevel], handlers=[stdout_handler])
+
+    train_logger = logging.getLogger("train")
+    train_logger.setLevel(LOGLEVELS[loglevel])
+    train_logger.addHandler(train_handler)
+
+    entry_logger = logging.getLogger("entry")
+    entry_logger.setLevel(LOGLEVELS[loglevel])
+    entry_logger.addHandler(entry_handler)
+
+    return entry_logger, train_logger
+
+
+def init_distributed(args):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    use_ddp = args.ddp or world_size > 1
+    if not use_ddp:
+        return False, 0, 0, 1
+
+    backend = args.ddp_backend
+    if backend == "nccl" and (args.cpu or not torch.cuda.is_available()):
+        backend = "gloo"
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend, init_method="env://")
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = args.local_rank
+    if local_rank is None:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    return True, rank, local_rank, world_size
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def summarize_envvar(var):
+    if var in os.environ:
+        return "{}={}".format(var, os.environ.get(var))
+    return "{} unset".format(var)
+
+
+def compute_pixel_mean(dataset, batch_size=256, num_workers=2):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    pixel_sum = None
+    count = 0
+    for data, _ in loader:
+        if pixel_sum is None:
+            pixel_sum = torch.zeros_like(data[0])
+        pixel_sum += data.sum(dim=0)
+        count += data.size(0)
+    return (pixel_sum / float(count)).type(torch.float32)
+
+
+def split_weight_decay_params(model):
+    decay = []
+    no_decay = []
+    
+    # 获取模型是否为二值化模型的标志
+    is_binary_model = 'Binary' in model.__class__.__name__
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+            
+        # 1. Bias 和 BatchNorm 参数绝对不加正则化
+        if len(param.shape) == 1 or param.ndim == 1:
+            no_decay.append(param)
+        else:
+            # 2. 🌟 核心修复：如果是二值网络，且是复数卷积的潜权重，免除正则化！
+            if is_binary_model and ('conv_r.weight' in name or 'conv_i.weight' in name):
+                no_decay.append(param)
+            else:
+                # 全精度权重（或者 Stem 层的权重）正常加正则化
+                decay.append(param)
+
+    return decay, no_decay
+
+
+def get_lr_for_epoch(epoch, args):
+    if args.schedule == "bireal":
+        warmup_epochs = 5
+        if epoch < warmup_epochs:
+            return args.lr * float(epoch + 1) / float(warmup_epochs)
+        t1 = int(args.num_epochs * 0.5)
+        t2 = int(args.num_epochs * 0.75)
+        t3 = int(args.num_epochs * 0.875)
+        if epoch < t1:
+            return args.lr
+        if epoch < t2:
+            return args.lr * 0.1
+        if epoch < t3:
+            return args.lr * 0.01
+        return args.lr * 0.001
+
+    if epoch < 10:
+        return 0.01
+    if epoch < 100:
+        return 0.1
+    if epoch < 120:
+        return 0.01
+    if epoch < 150:
+        return 0.001
+    return 0.0001
+
+
+def set_optimizer_lr(optimizer, lr):
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def build_datasets(args, train_logger, ddp_enabled, is_main):
+    if args.dataset == "cifar10":
+        dataset_cls = datasets.CIFAR10
+        n_train = 45000
+        n_classes = 10
+        train_kwargs = {"train": True}
+        test_kwargs = {"train": False}
+    elif args.dataset == "cifar100":
+        dataset_cls = datasets.CIFAR100
+        n_train = 45000
+        n_classes = 100
+        train_kwargs = {"train": True}
+        test_kwargs = {"train": False}
+    elif args.dataset == "svhn":
+        dataset_cls = SVHNDataset
+        n_train = 65000
+        n_classes = 10
+        train_kwargs = {"split": "train"}
+        test_kwargs = {"split": "test"}
+    else:
+        raise ValueError("Unknown dataset: {}".format(args.dataset))
+
+    if ddp_enabled:
+        if is_main:
+            base_train = dataset_cls(
+                root=args.datadir,
+                download=True,
+                transform=transforms.ToTensor(),
+                **train_kwargs
+            )
+            dist.barrier()
+        else:
+            dist.barrier()
+            base_train = dataset_cls(
+                root=args.datadir,
+                download=False,
+                transform=transforms.ToTensor(),
+                **train_kwargs
+            )
+    else:
+        base_train = dataset_cls(
+            root=args.datadir,
+            download=True,
+            transform=transforms.ToTensor(),
+            **train_kwargs
+        )
+
+    shuf_inds = np.arange(len(base_train))
+    np.random.seed(0xDEADBEEF)
+    np.random.shuffle(shuf_inds)
+    train_inds = shuf_inds[:n_train]
+    val_inds = shuf_inds[n_train:]
+
+    pixel_mean = None
+    if is_main:
+        pixel_mean = compute_pixel_mean(Subset(base_train, train_inds), batch_size=args.batch_size)
+    if ddp_enabled:
+        obj_list = [pixel_mean]
+        dist.broadcast_object_list(obj_list, src=0)
+        pixel_mean = obj_list[0]
+
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomAffine(degrees=0, translate=(0.125, 0.125)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            SubtractMean(pixel_mean),
+        ]
+    )
+    eval_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            SubtractMean(pixel_mean),
+        ]
+    )
+
+    train_dataset = dataset_cls(
+        root=args.datadir,
+        download=False,
+        transform=train_transform,
+        **train_kwargs
+    )
+    val_dataset = dataset_cls(
+        root=args.datadir,
+        download=False,
+        transform=eval_transform,
+        **train_kwargs
+    )
+    test_dataset = dataset_cls(
+        root=args.datadir,
+        download=False,
+        transform=eval_transform,
+        **test_kwargs
+    )
+
+    train_split = Subset(train_dataset, train_inds)
+    val_split = Subset(val_dataset, val_inds)
+
+    if train_logger is not None:
+        train_logger.info("Training   set size: {}".format(len(train_split)))
+        train_logger.info("Validation set size: {}".format(len(val_split)))
+        train_logger.info("Test       set size: {}".format(len(test_dataset)))
+
+    if args.no_validation:
+        full_train_dataset = dataset_cls(
+            root=args.datadir,
+            download=False,
+            transform=train_transform,
+            **train_kwargs
+        )
+        full_indices = shuf_inds
+        full_split = Subset(full_train_dataset, full_indices)
+        train_sampler = DistributedSampler(full_split, shuffle=True, seed=args.seed) if ddp_enabled else None
+        return full_split, None, test_dataset, n_classes, pixel_mean, train_sampler
+
+    train_sampler = DistributedSampler(train_split, shuffle=True, seed=args.seed) if ddp_enabled else None
+    return train_split, val_split, test_dataset, n_classes, pixel_mean, train_sampler
+
+
+def build_model(args, num_classes):
+    if args.binary:
+        model = BinaryComplexResNet(
+            in_channels=3,
+            num_blocks=args.num_blocks,
+            start_filters=args.start_filter,
+            num_classes=num_classes,
+            spectral_pool_scheme=args.spectral_pool_scheme,
+            spectral_pool_gamma=args.spectral_pool_gamma,
+            binary_stem=args.binary_stem,
+            is_sar_input=False,
+            is_binary=True
+        )
+    elif args.fp_bireal:
+        model = BinaryComplexResNet(
+            in_channels=3,
+            num_blocks=args.num_blocks,
+            start_filters=args.start_filter,
+            num_classes=num_classes,
+            spectral_pool_scheme=args.spectral_pool_scheme,
+            spectral_pool_gamma=args.spectral_pool_gamma,
+            binary_stem=args.binary_stem,
+            is_sar_input=False,
+            is_binary=False
+        )
+    else:
+        model = ComplexResNet(
+            in_channels=3,
+            num_blocks=args.num_blocks,
+            start_filters=args.start_filter,
+            num_classes=num_classes,
+            spectral_pool_scheme=args.spectral_pool_scheme,
+            spectral_pool_gamma=args.spectral_pool_gamma,
+        )
+    return model
+
+
+def build_optimizer(args, model):
+    base_model = model.module if hasattr(model, "module") else model
+    decay_params, no_decay_params = split_weight_decay_params(base_model)
+    param_groups = [
+        {"params": decay_params, "weight_decay": args.l2},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
+    if args.optimizer in ["sgd", "nag"]:
+        return torch.optim.SGD(
+            param_groups,
+            lr=args.lr,
+            momentum=args.momentum,
+            nesterov=(args.optimizer == "nag"),
+        )
+    if args.optimizer == "rmsprop":
+        return torch.optim.RMSprop(
+            param_groups,
+            lr=args.lr,
+        )
+    if args.optimizer == "adam":
+        return torch.optim.Adam(
+            param_groups,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+        )
+    raise ValueError("Unknown optimizer: {}".format(args.optimizer))
+
+
+def train_one_epoch(model, loader, optimizer, device, clipnorm, clipval):
+    model.train()
+    loss_sum = 0.0
+    correct = 0
+    count = 0
+    for data, target in loader:
+        data = data.to(device)
+        target = target.to(device)
+
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.cross_entropy(output, target)
+        loss.backward()
+
+        if clipnorm is not None and clipnorm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clipnorm)
+        if clipval is not None and clipval > 0:
+            torch.nn.utils.clip_grad_value_(model.parameters(), clipval)
+
+        optimizer.step()
+
+        loss_sum += loss.item() * data.size(0)
+        pred = output.argmax(dim=1)
+        correct += (pred == target).sum().item()
+        count += data.size(0)
+
+    return loss_sum, correct, count
+
+
+def evaluate(model, loader, device):
+    model.eval()
+    loss_sum = 0.0
+    correct = 0
+    count = 0
+    with torch.no_grad():
+        for data, target in loader:
+            data = data.to(device)
+            target = target.to(device)
+
+            output = model(data)
+            loss = F.cross_entropy(output, target)
+            loss_sum += loss.item() * data.size(0)
+            pred = output.argmax(dim=1)
+            correct += (pred == target).sum().item()
+            count += data.size(0)
+    if count == 0:
+        return 0.0, 0.0
+    return loss_sum / count, correct / float(count)
+
+
+def save_checkpoint(state, workdir, filename):
+    chkpt_dir = os.path.join(workdir, "chkpts")
+    if not os.path.isdir(chkpt_dir):
+        os.makedirs(chkpt_dir)
+    path = os.path.join(chkpt_dir, filename)
+    torch.save(state, path)
+    return path
+
+
+def train(args):
+    ddp_enabled, rank, local_rank, world_size = init_distributed(args)
+    is_main = rank == 0
+
+    if ddp_enabled and torch.cuda.is_available() and not args.cpu:
+        torch.cuda.set_device(local_rank)
+
+    entry_logger, train_logger = setup_logging(args.workdir, args.loglevel, is_main)
+    set_seed(args.seed)
+
+    if args.bireal_tune:
+        if not args.binary:
+            args.binary = True
+        args.num_epochs = 400
+        args.batch_size = 128
+        args.lr = 0.1
+        args.schedule = "bireal"
+        args.optimizer = "sgd"
+        args.momentum = 0.9
+        args.l2 = 1e-4
+        args.decay = 0.0
+
+    entry_logger.info("INVOCATION:     " + " ".join(sys.argv))
+    entry_logger.info("HOSTNAME:       " + socket.gethostname())
+    entry_logger.info("PWD:            " + os.getcwd())
+
+    summary = []
+    summary.append("Environment:")
+    summary.append(summarize_envvar("CUDA_VISIBLE_DEVICES"))
+    summary.append("")
+    summary.append("Software Versions:")
+    summary.append("Torch:                   " + torch.__version__)
+    summary.append("")
+    summary.append("Arguments:")
+    summary.append("Path to Datasets:        " + str(args.datadir))
+    summary.append("Path to Workspace:       " + str(args.workdir))
+    summary.append("Model:                   " + str(args.model))
+    summary.append("Dataset:                 " + str(args.dataset))
+    summary.append("Number of Epochs:        " + str(args.num_epochs))
+    summary.append("Batch Size:              " + str(args.batch_size))
+    summary.append("Number of Start Filters: " + str(args.start_filter))
+    summary.append("Number of Blocks/Stage:  " + str(args.num_blocks))
+    summary.append("Dropout Probability:     " + str(args.dropout))
+    summary.append("Spectral Param:          " + str(args.spectral_param))
+    summary.append("Spectral Pool Gamma:     " + str(args.spectral_pool_gamma))
+    summary.append("Spectral Pool Scheme:    " + str(args.spectral_pool_scheme))
+    summary.append("Activation:              " + str(args.act))
+    summary.append("Advanced Activation:     " + str(args.aact))
+    summary.append("Complex Init:            " + str(args.comp_init))
+    summary.append("Optimizer:               " + str(args.optimizer))
+    summary.append("Learning Rate:           " + str(args.lr))
+    summary.append("Learning Rate Decay:     " + str(args.decay))
+    summary.append("Learning Rate Schedule:  " + str(args.schedule))
+    summary.append("Clipping Norm:           " + str(args.clipnorm))
+    summary.append("Clipping Value:          " + str(args.clipval))
+    summary.append("L1 Penalty:              " + str(args.l1))
+    summary.append("L2 Penalty:              " + str(args.l2))
+    summary.append("Compile:                 " + str(args.compile))
+    summary.append("BiReal Tune:             " + str(args.bireal_tune))
+    entry_logger.info("\n".join(summary))
+
+    if is_main:
+        train_logger.info("Loading dataset {} ...".format(args.dataset))
+    train_dataset, val_dataset, test_dataset, num_classes, pixel_mean, train_sampler = build_datasets(
+        args,
+        train_logger if is_main else None,
+        ddp_enabled,
+        is_main,
+    )
+    if is_main:
+        torch.save(pixel_mean, os.path.join(args.workdir, "pixel_mean.pt"))
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    val_loader = None
+    test_loader = None
+    if is_main:
+        if val_dataset is not None:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=True,
+            )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    model = build_model(args, num_classes).to(device)
+
+    effective_compile_backend = args.compile_backend
+    if args.compile and effective_compile_backend == "inductor":
+        effective_compile_backend = "aot_eager"
+        if is_main:
+            train_logger.info(
+                "Inductor does not support complex operators; falling back to aot_eager."
+            )
+
+    if args.compile:
+        if hasattr(torch, "compile"):
+            model = torch.compile(
+                model,
+                backend=effective_compile_backend,
+                mode=args.compile_mode,
+            )
+            if is_main:
+                train_logger.info(
+                    "Using torch.compile backend={}, mode={}".format(
+                        effective_compile_backend,
+                        args.compile_mode,
+                    )
+                )
+        elif is_main:
+            train_logger.info("torch.compile not available in this PyTorch version.")
+
+    if ddp_enabled:
+        if device.type == "cuda":
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        else:
+            model = DDP(model)
+
+    optimizer = build_optimizer(args, model)
+
+    unwrapped_model = model.module if ddp_enabled else model
+    if args.summary and is_main:
+        entry_logger.info(str(unwrapped_model))
+    if is_main:
+        entry_logger.info(
+            "# of Parameters:              {:10d}".format(
+                sum(p.numel() for p in unwrapped_model.parameters())
+            )
+        )
+
+    chkpt_link = os.path.join(args.workdir, "chkpts", "ModelChkpt.pt")
+    initial_epoch = 0
+
+    if args.binary:
+        fp_ckpt_path = os.path.join(args.workdir, "chkpts", "Bestmodel_FP_Bireal.pt") 
+        
+        if os.path.isfile(fp_ckpt_path) :# and not os.path.isfile(chkpt_link):
+            if is_main:
+                train_logger.info(f"==> Loading full-precision weights from {fp_ckpt_path} for Binary Network Initialization...")
+            fp_checkpoint = torch.load(fp_ckpt_path, map_location="cpu")
+            
+            unwrapped_model.load_state_dict(fp_checkpoint["model"], strict=False)
+            
+            if is_main:
+                train_logger.info("==> Successfully initialized binary model with full-precision weights!")
+
+    # if os.path.isfile(chkpt_link):
+    #     if is_main:
+    #         train_logger.info("Reloading checkpoint from {} ...".format(chkpt_link))
+    #     checkpoint = torch.load(chkpt_link, map_location="cpu")
+    #     unwrapped_model.load_state_dict(checkpoint["model"])
+    #     if "optimizer" in checkpoint:
+    #         optimizer.load_state_dict(checkpoint["optimizer"])
+    #     initial_epoch = checkpoint.get("epoch", 0)
+    #     if is_main:
+    #         train_logger.info("Training will restart at epoch {:5d}.".format(initial_epoch + 1))
+
+    if is_main:
+        train_logger.info("**********************************************")
+        if initial_epoch > 0:
+            train_logger.info("*** Reentering Training Loop @ Epoch {:5d} ***".format(initial_epoch + 1))
+        else:
+            train_logger.info("***  Entering Training Loop  @ First Epoch ***")
+        train_logger.info("**********************************************")
+
+    train_loss_hist = []
+    train_acc_hist = []
+    val_loss_hist = []
+    val_acc_hist = []
+    test_loss_hist = []
+    test_acc_hist = []
+
+    best_acc = 0.0
+
+    for epoch in range(initial_epoch, args.num_epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if args.schedule in ["default", "bireal"]:
+            lr = get_lr_for_epoch(epoch, args)
+            set_optimizer_lr(optimizer, lr)
+            if is_main:
+                if args.schedule == "default" and epoch in [0, 10, 100, 120, 150]:
+                    train_logger.info("Current learning rate value is {}".format(lr))
+                if args.schedule == "bireal":
+                    warmup_epochs = 5
+                    t1 = int(args.num_epochs * 0.5)
+                    t2 = int(args.num_epochs * 0.75)
+                    t3 = int(args.num_epochs * 0.875)
+                    if epoch in [0, warmup_epochs - 1, t1, t2, t3]:
+                        train_logger.info("Current learning rate value is {}".format(lr))
+
+        t0 = time.time()
+        train_loss_sum, train_correct, train_count = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            clipnorm=args.clipnorm,
+            clipval=args.clipval,
+        )
+        elapsed = time.time() - t0
+
+        if ddp_enabled:
+            stats = torch.tensor(
+                [train_loss_sum, train_correct, train_count],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            train_loss_sum = stats[0].item()
+            train_correct = stats[1].item()
+            train_count = stats[2].item()
+
+        train_loss = train_loss_sum / max(train_count, 1.0)
+        train_acc = train_correct / max(train_count, 1.0)
+
+        val_loss, val_acc = (0.0, 0.0)
+        if val_loader is not None and is_main:
+            val_loss, val_acc = evaluate(model, val_loader, device)
+
+        test_loss, test_acc = (0.0, 0.0)
+        if test_loader is not None and is_main:
+            test_loss, test_acc = evaluate(model, test_loader, device)
+
+        train_loss_hist.append(train_loss)
+        train_acc_hist.append(train_acc)
+        val_loss_hist.append(val_loss)
+        val_acc_hist.append(val_acc)
+        test_loss_hist.append(test_loss)
+        test_acc_hist.append(test_acc)
+
+        if is_main:
+            train_logger.info(
+                "Epoch {:5d} train_loss: {:.6f}, train_acc: {:.4f}, val_loss: {:.6f}, val_acc: {:.4f}, test_loss: {:.6f}, test_acc: {:.4f} ({:.2f}s)".format(
+                    epoch + 1,
+                    train_loss,
+                    train_acc,
+                    val_loss,
+                    val_acc,
+                    test_loss,
+                    test_acc,
+                    elapsed,
+                )
+            )
+
+        if is_main and (epoch + 1) % args.save_period == 0:
+            checkpoint = {
+                "model": unwrapped_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch + 1,
+                "args": vars(args),
+            }
+            filename = "ModelChkpt{:06d}.pt".format(epoch + 1)
+            chkpt_path = save_checkpoint(checkpoint, args.workdir, filename)
+            tmp_link = chkpt_link + ".rename"
+            if os.path.exists(tmp_link):
+                os.remove(tmp_link)
+            os.symlink(os.path.basename(chkpt_path), tmp_link)
+            os.replace(tmp_link, chkpt_link)
+            train_logger.info("Saved checkpoint to {} at epoch {:5d}".format(chkpt_path, epoch + 1))
+
+        if is_main and val_loader is not None and val_acc > best_acc:
+            best_acc = val_acc
+            checkpoint = {
+                "model": unwrapped_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch + 1,
+                "args": vars(args),
+            }
+            if args.binary:
+                filename = "Bestmodel_Binary_{:06d}_{:.4f}_{:.4f}.pt".format(epoch + 1, val_acc, val_loss)
+            elif args.fp_bireal:
+                filename = "Bestmodel_FP_Bireal.pt".format(epoch + 1, val_acc, val_loss)
+            else:
+                filename = "Bestmodel_{:06d}_{:.4f}_{:.4f}.pt".format(epoch + 1, val_acc, val_loss)
+            best_path = save_checkpoint(checkpoint, args.workdir, filename)
+            train_logger.info("Saved best model to {} at epoch {:5d}".format(best_path, epoch + 1))
+
+        if ddp_enabled:
+            dist.barrier()
+
+    if is_main:
+        np.savetxt(os.path.join(args.workdir, "train_loss.txt"), np.asarray(train_loss_hist))
+        np.savetxt(os.path.join(args.workdir, "train_acc.txt"), np.asarray(train_acc_hist))
+        np.savetxt(os.path.join(args.workdir, "val_loss.txt"), np.asarray(val_loss_hist))
+        np.savetxt(os.path.join(args.workdir, "val_acc.txt"), np.asarray(val_acc_hist))
+        np.savetxt(os.path.join(args.workdir, "test_loss.txt"), np.asarray(test_loss_hist))
+        np.savetxt(os.path.join(args.workdir, "test_acc.txt"), np.asarray(test_acc_hist))
+
+    if ddp_enabled and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Complex ResNet training")
+    parser.add_argument("-d", "--datadir", default=".", type=str)
+    parser.add_argument("-w", "--workdir", default=".", type=str)
+    parser.add_argument("-l", "--loglevel", default="info", type=str, choices=LOGLEVELS.keys())
+    parser.add_argument("-s", "--seed", default=0xE4223644E98B8E64, type=int)
+    parser.add_argument("--summary", action="store_true")
+    parser.add_argument("--model", default="complex", type=str, choices=["real", "complex"])
+    parser.add_argument("--dataset", default="cifar10", type=str, choices=["cifar10", "cifar100", "svhn"])
+    parser.add_argument("--dropout", default=0.0, type=float)
+    parser.add_argument("-n", "--num-epochs", default=200, type=int)
+    parser.add_argument("-b", "--batch-size", default=64, type=int)
+    parser.add_argument("--start-filter", "--sf", dest="start_filter", default=11, type=int)
+    parser.add_argument("--num-blocks", "--nb", dest="num_blocks", default=10, type=int)
+    parser.add_argument("--spectral-pool-gamma", default=0.5, type=float)
+    parser.add_argument(
+        "--spectral-pool-scheme",
+        default="none",
+        type=str,
+        choices=["none", "stagemiddle", "proj", "nodownsample"],
+    )
+    parser.add_argument("--spectral-param", action="store_true")
+    parser.add_argument("--act", default="relu", type=str, choices=["relu"])
+    parser.add_argument("--aact", default="modrelu", type=str, choices=["modrelu"])
+    parser.add_argument("--comp_init", default="complex_independent", type=str)
+    parser.add_argument("--no-validation", action="store_true")
+    parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--num-workers", default=4, type=int)
+    parser.add_argument("--save-period", default=10, type=int)
+    parser.add_argument("--binary", action="store_true")
+    parser.add_argument("--fp_bireal", action="store_true", help="train a full-precision model for later use in binary model initialization")
+    parser.add_argument("--binary-stem", action="store_true")
+    parser.add_argument("--bireal-tune", action="store_true")
+    parser.add_argument("--ddp", action="store_true")
+    parser.add_argument("--ddp-backend", default="nccl", type=str)
+    parser.add_argument("--local-rank", default=None, type=int)
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--compile-backend", default="inductor", type=str)
+    parser.add_argument("--compile-mode", default="default", type=str)
+
+    opt = parser.add_argument_group("Optimizers")
+    opt.add_argument("--optimizer", "--opt", default="sgd", type=str, choices=["sgd", "nag", "adam", "rmsprop"])
+    opt.add_argument("--clipnorm", "--cn", default=1.0, type=float)
+    opt.add_argument("--clipval", "--cv", default=1.0, type=float)
+    opt.add_argument("--l1", default=0.0, type=float)
+    opt.add_argument("--l2", default=0.0, type=float)
+    opt.add_argument("--lr", default=1e-3, type=float)
+    opt.add_argument("--momentum", "--mom", default=0.9, type=float)
+    opt.add_argument("--decay", default=0.0, type=float)
+    opt.add_argument("--schedule", default="default", type=str)
+
+    opt = parser.add_argument_group("Adam")
+    opt.add_argument("--beta1", default=0.9, type=float)
+    opt.add_argument("--beta2", default=0.999, type=float)
+
+    return parser.parse_args(argv)
+
+
+def main(argv):
+    args = parse_args(argv[1:])
+    train(args)
+
+
+if __name__ == "__main__":
+    main(sys.argv) 

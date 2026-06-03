@@ -10,6 +10,7 @@ from .complexLayers import (
     BinaryComplexConv2d,
     ComplexBatchNorm2d,
     ComplexConv2d,
+    ComplexReLU,
 )
 from .complexResNet import LearnImagBlock, apply_spectral_pooling, _SPECTRAL_SCHEMES
 
@@ -37,6 +38,7 @@ class BiRealComplexResidualBlock(nn.Module):
         per_channel=True,
         weight_grad_mode="ste",
         act_grad_mode="bireal",
+        is_binary=True,
     ):
         super().__init__()
         padding = _same_padding(kernel_size)
@@ -48,19 +50,28 @@ class BiRealComplexResidualBlock(nn.Module):
         self.bn_pre = ComplexBatchNorm2d(in_channels, eps=1e-4)
         
         # 2. 二值化激活 (Sign)
-        self.act = BinaryComplexActivation(grad_mode=act_grad_mode)
-        
-        # 3. 二值复数卷积
-        self.conv = BinaryComplexConv2d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
+        if is_binary:
+            self.act = BinaryComplexActivation(grad_mode=act_grad_mode)
+            self.conv = BinaryComplexConv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride=stride,
+                padding=padding,
             bias=False,
             per_channel=per_channel,
             weight_grad_mode=weight_grad_mode,
         )
+        else:
+            self.act = ComplexReLU()
+            self.conv = ComplexConv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=False,
+            )
         
         # 4. 卷积后 BN (用于消除二值累加造成的尺度爆炸)
         self.bn_post = ComplexBatchNorm2d(out_channels, eps=1e-4)
@@ -119,6 +130,7 @@ class BinaryComplexResNet(nn.Module):
         act_grad_mode="bireal",
         binary_stem=False,
         is_sar_input=True, # 新增标志位：如果是真实SAR复数数据，跳过 LearnImagBlock
+        is_binary=True, # 是否使用二值化卷积和激活，默认为 True；如果为 False，则整个网络退化为全精度复数 ResNet
     ):
         super().__init__()
         if spectral_pool_scheme not in _SPECTRAL_SCHEMES:
@@ -129,6 +141,7 @@ class BinaryComplexResNet(nn.Module):
         self.spectral_pool_scheme = spectral_pool_scheme
         self.spectral_pool_gamma = spectral_pool_gamma
         self.is_sar_input = is_sar_input
+        self.is_binary = is_binary
 
         # 仅针对非复数输入(如光学图像)保留虚部学习模块
         if not self.is_sar_input:
@@ -180,7 +193,7 @@ class BinaryComplexResNet(nn.Module):
             BiRealComplexResidualBlock(
                 in_channels, out_channels, stride=stride, projection=True,
                 spectral_pool_scheme=self.spectral_pool_scheme, spectral_pool_gamma=self.spectral_pool_gamma,
-                per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode
+                per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode, is_binary=self.is_binary
             )
         )
         # Stage 的后续 Blocks 保持维度不变
@@ -189,7 +202,7 @@ class BinaryComplexResNet(nn.Module):
                 BiRealComplexResidualBlock(
                     out_channels, out_channels, stride=1, projection=False,
                     spectral_pool_scheme=self.spectral_pool_scheme, spectral_pool_gamma=self.spectral_pool_gamma,
-                    per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode
+                    per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode, is_binary=self.is_binary
                 )
             )
         return nn.ModuleList(layers)
