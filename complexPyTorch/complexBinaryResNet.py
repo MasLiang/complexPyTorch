@@ -8,6 +8,8 @@ from .complexFunctions import complex_avg_pool2d, complex_relu
 from .complexLayers import (
     BinaryComplexActivation,
     BinaryComplexConv2d,
+    LUTAwareComplexBinaryConv2d,
+    ComplexLUTConv2d,
     ComplexBatchNorm2d,
     ComplexConv2d,
     ComplexReLU,
@@ -39,6 +41,10 @@ class BiRealComplexResidualBlock(nn.Module):
         weight_grad_mode="ste",
         act_grad_mode="bireal",
         is_binary=True,
+        phase=2,
+        lut_sets=1,
+        lut_allocation="layer",
+        lut_sets_per_channel=1,
     ):
         super().__init__()
         padding = _same_padding(kernel_size)
@@ -52,16 +58,22 @@ class BiRealComplexResidualBlock(nn.Module):
         # 2. 二值化激活 (Sign)
         if is_binary:
             self.act = BinaryComplexActivation(grad_mode=act_grad_mode)
-            self.conv = BinaryComplexConv2d(
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride=stride,
-                padding=padding,
-            bias=False,
-            per_channel=per_channel,
-            weight_grad_mode=weight_grad_mode,
-        )
+            if phase==4 or phase==5:
+                self.conv = ComplexLUTConv2d(
+                    in_channels, out_channels, kernel_size, stride=stride, padding=padding,
+                    phase=phase, lut_sets=lut_sets, lut_allocation=lut_allocation,
+                    lut_sets_per_channel=lut_sets_per_channel
+                )
+            elif phase == 3:
+                self.conv = LUTAwareComplexBinaryConv2d(
+                    in_channels, out_channels, kernel_size, stride=stride, padding=padding,
+                    bias=False, per_channel=per_channel, weight_grad_mode=weight_grad_mode,
+                )
+            else:
+                self.conv = BinaryComplexConv2d(
+                    in_channels, out_channels, kernel_size, stride=stride, padding=padding,
+                    bias=False, per_channel=per_channel, weight_grad_mode=weight_grad_mode,
+                )
         else:
             self.act = ComplexReLU()
             self.conv = ComplexConv2d(
@@ -121,7 +133,7 @@ class BinaryComplexResNet(nn.Module):
         self,
         in_channels=3,
         num_blocks=3, # 这里的 num_blocks 是指双卷积Block的数量。代码内会自动 x2 转换为单卷积Bi-Real Block
-        start_filters=16,
+        start_filters=8,
         num_classes=10,
         spectral_pool_scheme="none",
         spectral_pool_gamma=0.0,
@@ -131,6 +143,10 @@ class BinaryComplexResNet(nn.Module):
         binary_stem=False,
         is_sar_input=True, # 新增标志位：如果是真实SAR复数数据，跳过 LearnImagBlock
         is_binary=True, # 是否使用二值化卷积和激活，默认为 True；如果为 False，则整个网络退化为全精度复数 ResNet
+        phase=2,
+        lut_sets=1,
+        lut_allocation="layer",
+        lut_sets_per_channel=1,
     ):
         super().__init__()
         if spectral_pool_scheme not in _SPECTRAL_SCHEMES:
@@ -142,6 +158,10 @@ class BinaryComplexResNet(nn.Module):
         self.spectral_pool_gamma = spectral_pool_gamma
         self.is_sar_input = is_sar_input
         self.is_binary = is_binary
+        self.phase = phase
+        self.lut_sets = lut_sets
+        self.lut_allocation = lut_allocation
+        self.lut_sets_per_channel = lut_sets_per_channel
 
         # 仅针对非复数输入(如光学图像)保留虚部学习模块
         if not self.is_sar_input:
@@ -193,7 +213,9 @@ class BinaryComplexResNet(nn.Module):
             BiRealComplexResidualBlock(
                 in_channels, out_channels, stride=stride, projection=True,
                 spectral_pool_scheme=self.spectral_pool_scheme, spectral_pool_gamma=self.spectral_pool_gamma,
-                per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode, is_binary=self.is_binary
+                per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode,
+                is_binary=self.is_binary, phase=self.phase, lut_sets=self.lut_sets,
+                lut_allocation=self.lut_allocation, lut_sets_per_channel=self.lut_sets_per_channel
             )
         )
         # Stage 的后续 Blocks 保持维度不变
@@ -202,7 +224,9 @@ class BinaryComplexResNet(nn.Module):
                 BiRealComplexResidualBlock(
                     out_channels, out_channels, stride=1, projection=False,
                     spectral_pool_scheme=self.spectral_pool_scheme, spectral_pool_gamma=self.spectral_pool_gamma,
-                    per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode, is_binary=self.is_binary
+                    per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode,
+                    is_binary=self.is_binary, phase=self.phase, lut_sets=self.lut_sets,
+                    lut_allocation=self.lut_allocation, lut_sets_per_channel=self.lut_sets_per_channel
                 )
             )
         return nn.ModuleList(layers)

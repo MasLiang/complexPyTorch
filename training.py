@@ -4,10 +4,12 @@
 import argparse
 import logging
 import os
+import json
 import random
 import socket
 import sys
 import time
+import math
 
 import numpy as np
 import torch
@@ -19,7 +21,6 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 
 from complexPyTorch.complexBinaryResNet import BinaryComplexResNet
-from complexPyTorch.complexResNet import ComplexResNet
 
 
 LOGLEVELS = {
@@ -30,6 +31,138 @@ LOGLEVELS = {
     "err": logging.ERROR,
     "crit": logging.CRITICAL,
 }
+
+PHASE_DESCRIPTIONS = {
+    1: "full-precision BiReal",
+    2: "binary BiReal",
+    3: "LUT-aware BNN",
+    4: "LUTNN",
+}
+
+PHASE_CHECKPOINT_TEMPLATE = "Bestmodel_phase{}.pt"
+LEGACY_BEST_CHECKPOINT_FILENAME = "Bestmodel.pt"
+PHASE_METRICS_FILENAME = "phase_metrics.json"
+
+
+def phase_checkpoint_filename(phase):
+    return PHASE_CHECKPOINT_TEMPLATE.format(phase)
+
+
+def phase_checkpoint_path(workdir, phase):
+    return os.path.join(workdir, "chkpts", phase_checkpoint_filename(phase))
+
+
+def legacy_best_checkpoint_path(workdir):
+    return os.path.join(workdir, "chkpts", LEGACY_BEST_CHECKPOINT_FILENAME)
+
+
+def load_phase_checkpoint(model, checkpoint_path, device='cpu', expected_phase=None):
+    print(f"==> Loading and Mapping weights from '{checkpoint_path}'...")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    stored_phase = checkpoint.get("phase") if isinstance(checkpoint, dict) else None
+    if stored_phase is None and isinstance(checkpoint, dict):
+        metrics = checkpoint.get("metrics")
+        if isinstance(metrics, dict):
+            stored_phase = metrics.get("phase")
+    if stored_phase is None and isinstance(checkpoint, dict):
+        checkpoint_args = checkpoint.get("args")
+        if isinstance(checkpoint_args, dict):
+            stored_phase = checkpoint_args.get("phase")
+    if expected_phase is not None and stored_phase is not None and int(stored_phase) != expected_phase:
+        raise ValueError(
+            "Checkpoint {} belongs to Phase {}, but Phase {} is required.".format(
+                checkpoint_path, stored_phase, expected_phase
+            )
+        )
+
+    state_dict = checkpoint['model'] if 'model' in checkpoint else (checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint)
+    target_state = model.state_dict()
+    new_state_dict = {}
+    skipped_keys = []
+
+    def strip_wrappers(key):
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ('_orig_mod.', 'module.'):
+                if key.startswith(prefix):
+                    key = key[len(prefix):]
+                    changed = True
+        return key
+
+    clean_target_to_actual = {}
+    for target_key in target_state.keys():
+        clean_target_to_actual[strip_wrappers(target_key)] = target_key
+
+    def phase3_to_phase4_candidates(key):
+        candidates = [key]
+        if '.conv.conv_r.weight' in key:
+            candidates.append(key.replace('.conv.conv_r.weight', '.conv.weight_r'))
+        if '.conv.conv_i.weight' in key:
+            candidates.append(key.replace('.conv.conv_i.weight', '.conv.weight_i'))
+        return candidates
+
+    for k, v in state_dict.items():
+        clean_k = strip_wrappers(k)
+        mapped_key = None
+        mapped_value = v
+
+        for candidate in phase3_to_phase4_candidates(clean_k):
+            actual_target_key = clean_target_to_actual.get(candidate)
+            if actual_target_key is None:
+                continue
+
+            target_value = target_state[actual_target_key]
+            if target_value.shape == v.shape:
+                mapped_key = actual_target_key
+                break
+            if (
+                candidate.endswith((".lut_r", ".lut_i"))
+                and target_value.ndim == 2
+                and target_value.shape[1] == 16
+                and (v.shape == torch.Size([16]) or v.shape == torch.Size([1, 16]))
+            ):
+                mapped_key = actual_target_key
+                source_lut = v.unsqueeze(0) if v.ndim == 1 else v
+                mapped_value = source_lut.expand_as(target_value).clone()
+                break
+
+        if mapped_key is None:
+            skipped_keys.append(clean_k)
+            continue
+
+        new_state_dict[mapped_key] = mapped_value
+
+    missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+
+    print(f"==> Checkpoint mapped and loaded! ({len(new_state_dict)}/{len(state_dict)} tensors used)")
+
+    if missing_keys:
+        expected_missing_keywords = ['lut_r', 'lut_i', 'lut_set_ids', 'flat_c', 'flat_dy', 'flat_dx', 'shifts', 'tau', 'hard']
+        unexpected_missing = [
+            k for k in missing_keys
+            if not any(keyword in k for keyword in expected_missing_keywords)
+        ]
+
+        if unexpected_missing:
+            print(f"[Warning] Found unexpected missing keys in model:\n{unexpected_missing}")
+        else:
+            print(f"[Info] All missing keys are LUT-specific initialized buffers/parameters as expected.")
+
+    if unexpected_keys:
+        print(f"[Warning] Found unexpected keys after loading mapped checkpoint:\n{unexpected_keys}")
+
+    if skipped_keys:
+        preview = skipped_keys[:20]
+        suffix = '...' if len(skipped_keys) > len(preview) else ''
+        print(f"[Info] Skipped {len(skipped_keys)} checkpoint tensors with no compatible target key/shape: {preview}{suffix}")
+
+    return model
+
+
+def load_bnn_to_lut_model(model, checkpoint_path, device='cpu'):
+    return load_phase_checkpoint(model, checkpoint_path, device=device)
 
 
 class SubtractMean(object):
@@ -160,8 +293,8 @@ def split_weight_decay_params(model):
         if len(param.shape) == 1 or param.ndim == 1:
             no_decay.append(param)
         else:
-            # 2. 🌟 核心修复：如果是二值网络，且是复数卷积的潜权重，免除正则化！
-            if is_binary_model and ('conv_r.weight' in name or 'conv_i.weight' in name):
+            lut_keywords = ['conv_r.weight', 'conv_i.weight', 'weight_r', 'weight_i', 'lut_r', 'lut_i']
+            if is_binary_model and any(kw in name for kw in lut_keywords):
                 no_decay.append(param)
             else:
                 # 全精度权重（或者 Stem 层的权重）正常加正则化
@@ -322,40 +455,28 @@ def build_datasets(args, train_logger, ddp_enabled, is_main):
 
 
 def build_model(args, num_classes):
-    if args.binary:
-        model = BinaryComplexResNet(
-            in_channels=3,
-            num_blocks=args.num_blocks,
-            start_filters=args.start_filter,
-            num_classes=num_classes,
-            spectral_pool_scheme=args.spectral_pool_scheme,
-            spectral_pool_gamma=args.spectral_pool_gamma,
-            binary_stem=args.binary_stem,
-            is_sar_input=False,
-            is_binary=True
-        )
-    elif args.fp_bireal:
-        model = BinaryComplexResNet(
-            in_channels=3,
-            num_blocks=args.num_blocks,
-            start_filters=args.start_filter,
-            num_classes=num_classes,
-            spectral_pool_scheme=args.spectral_pool_scheme,
-            spectral_pool_gamma=args.spectral_pool_gamma,
-            binary_stem=args.binary_stem,
-            is_sar_input=False,
-            is_binary=False
-        )
-    else:
-        model = ComplexResNet(
-            in_channels=3,
-            num_blocks=args.num_blocks,
-            start_filters=args.start_filter,
-            num_classes=num_classes,
-            spectral_pool_scheme=args.spectral_pool_scheme,
-            spectral_pool_gamma=args.spectral_pool_gamma,
-        )
-    return model
+    if args.phase not in PHASE_DESCRIPTIONS:
+        raise ValueError("phase must be one of {}".format(sorted(PHASE_DESCRIPTIONS)))
+    if args.lut_sets < 1:
+        raise ValueError("lut_sets must be at least 1")
+    if args.lut_sets_per_channel < 1:
+        raise ValueError("lut_sets_per_channel must be at least 1")
+
+    return BinaryComplexResNet(
+        in_channels=3,
+        num_blocks=args.num_blocks,
+        start_filters=args.start_filter,
+        num_classes=num_classes,
+        spectral_pool_scheme=args.spectral_pool_scheme,
+        spectral_pool_gamma=args.spectral_pool_gamma,
+        binary_stem=args.binary_stem,
+        is_sar_input=False,
+        is_binary=(args.phase >= 2),
+        phase=args.phase,
+        lut_sets=args.lut_sets,
+        lut_allocation=args.lut_allocation,
+        lut_sets_per_channel=args.lut_sets_per_channel,
+    )
 
 
 def build_optimizer(args, model):
@@ -380,6 +501,12 @@ def build_optimizer(args, model):
         )
     if args.optimizer == "adam":
         return torch.optim.Adam(
+            param_groups,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+        )
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(
             param_groups,
             lr=args.lr,
             betas=(args.beta1, args.beta2),
@@ -445,8 +572,53 @@ def save_checkpoint(state, workdir, filename):
     torch.save(state, path)
     return path
 
+def update_lut_annealing(model, epoch, num_epochs, phase, train_logger, is_main):
+    if phase != 4:
+        return True
+
+    # Phase 4 keeps the soft LUT annealing period for training, but best-checkpoint
+    # selection starts only when hard mode is active.
+    hard_epoch_start = int(num_epochs * 0.9)
+    tau_min, tau_max = 1.0, 10.0
+
+    if epoch < hard_epoch_start:
+        ratio = epoch / max(1, hard_epoch_start)
+        current_tau = tau_min * math.pow((tau_max / tau_min), ratio)
+        is_hard = 0.0
+    else:
+        current_tau = tau_max
+        is_hard = 1.0
+
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == "ComplexLUTConv2d" or module.__class__.__name__ == "UltimateComplexLUTConv2d":
+            if hasattr(module, "tau") and hasattr(module, "hard"):
+                module.tau.fill_(current_tau)
+                module.hard.fill_(is_hard)
+
+    if is_main and (epoch == 0 or epoch == hard_epoch_start or epoch % 10 == 0):
+        if train_logger is not None:
+            train_logger.info(f"[Phase 4 Annealing Scheduler] Epoch {epoch}: tau={current_tau:.4f}, hard_mode={bool(is_hard)}")
+
+    return bool(is_hard)
+
+
+def update_phase_metrics(workdir, phase, metrics):
+    path = os.path.join(workdir, PHASE_METRICS_FILENAME)
+    all_metrics = {}
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            all_metrics = json.load(f)
+    all_metrics[f"phase{phase}"] = metrics
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(all_metrics, f, indent=2, sort_keys=True)
+    return path
+
 
 def train(args):
+    if args.phase not in PHASE_DESCRIPTIONS:
+        raise ValueError("phase must be one of {}".format(sorted(PHASE_DESCRIPTIONS)))
+    args.binary = args.phase >= 2
+
     ddp_enabled, rank, local_rank, world_size = init_distributed(args)
     is_main = rank == 0
 
@@ -457,16 +629,21 @@ def train(args):
     set_seed(args.seed)
 
     if args.bireal_tune:
-        if not args.binary:
-            args.binary = True
         args.num_epochs = 400
         args.batch_size = 128
-        args.lr = 0.1
         args.schedule = "bireal"
-        args.optimizer = "sgd"
-        args.momentum = 0.9
         args.l2 = 1e-4
         args.decay = 0.0
+
+        if args.optimizer in ["adam", "adamw"]:
+            args.lr = 0.001  # Adam 系的微调黄金学习率
+            args.momentum = 0.9 # 保留占位符
+        else:
+            args.lr = 0.1    # SGD 依然用 0.1
+            args.optimizer = "sgd"
+            args.momentum = 0.9
+        if args.phase==4:
+            args.lr = args.lr/10
 
     entry_logger.info("INVOCATION:     " + " ".join(sys.argv))
     entry_logger.info("HOSTNAME:       " + socket.gethostname())
@@ -484,6 +661,10 @@ def train(args):
     summary.append("Path to Workspace:       " + str(args.workdir))
     summary.append("Model:                   " + str(args.model))
     summary.append("Dataset:                 " + str(args.dataset))
+    summary.append("Phase:                   {} ({})".format(args.phase, PHASE_DESCRIPTIONS[args.phase]))
+    summary.append("LUT Allocation:          " + str(args.lut_allocation))
+    summary.append("LUT Sets per Layer:      " + str(args.lut_sets))
+    summary.append("LUT Sets per Channel:    " + str(args.lut_sets_per_channel))
     summary.append("Number of Epochs:        " + str(args.num_epochs))
     summary.append("Batch Size:              " + str(args.batch_size))
     summary.append("Number of Start Filters: " + str(args.start_filter))
@@ -548,6 +729,7 @@ def train(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     model = build_model(args, num_classes).to(device)
+    print(model)
 
     effective_compile_backend = args.compile_backend
     if args.compile and effective_compile_backend == "inductor":
@@ -592,32 +774,45 @@ def train(args):
             )
         )
 
-    chkpt_link = os.path.join(args.workdir, "chkpts", "ModelChkpt.pt")
     initial_epoch = 0
 
-    if args.binary:
-        fp_ckpt_path = os.path.join(args.workdir, "chkpts", "Bestmodel_FP_Bireal.pt") 
-        
-        if os.path.isfile(fp_ckpt_path) :# and not os.path.isfile(chkpt_link):
-            if is_main:
-                train_logger.info(f"==> Loading full-precision weights from {fp_ckpt_path} for Binary Network Initialization...")
-            fp_checkpoint = torch.load(fp_ckpt_path, map_location="cpu")
-            
-            unwrapped_model.load_state_dict(fp_checkpoint["model"], strict=False)
-            
-            if is_main:
-                train_logger.info("==> Successfully initialized binary model with full-precision weights!")
+    if args.phase > 1:
+        previous_phase = args.phase - 1
+        if args.checkpoint is not None:
+            ckpt_path = args.checkpoint
+            if not os.path.isfile(ckpt_path):
+                raise FileNotFoundError("Checkpoint not found: {}".format(ckpt_path))
+        else:
+            ckpt_path = phase_checkpoint_path(args.workdir, previous_phase)
+            legacy_ckpt_path = legacy_best_checkpoint_path(args.workdir)
+            if not os.path.isfile(ckpt_path):
+                if os.path.isfile(legacy_ckpt_path):
+                    ckpt_path = legacy_ckpt_path
+                    if is_main:
+                        train_logger.info(
+                            "[Compatibility] Phase-specific checkpoint missing; using legacy {}.".format(ckpt_path)
+                        )
+                else:
+                    raise FileNotFoundError(
+                        "Phase {} expects Phase {} checkpoint at {}".format(
+                            args.phase, previous_phase, ckpt_path
+                        )
+                    )
+        if is_main:
+            train_logger.info(
+                "==> Loading Phase {} initialization for Phase {} from {} ...".format(
+                    previous_phase, args.phase, ckpt_path
+                )
+            )
+        load_phase_checkpoint(
+            model=unwrapped_model,
+            checkpoint_path=ckpt_path,
+            device=device,
+            expected_phase=previous_phase,
+        )
+        if is_main:
+            train_logger.info("==> Successfully initialized phase {} model from previous best checkpoint.".format(args.phase))
 
-    # if os.path.isfile(chkpt_link):
-    #     if is_main:
-    #         train_logger.info("Reloading checkpoint from {} ...".format(chkpt_link))
-    #     checkpoint = torch.load(chkpt_link, map_location="cpu")
-    #     unwrapped_model.load_state_dict(checkpoint["model"])
-    #     if "optimizer" in checkpoint:
-    #         optimizer.load_state_dict(checkpoint["optimizer"])
-    #     initial_epoch = checkpoint.get("epoch", 0)
-    #     if is_main:
-    #         train_logger.info("Training will restart at epoch {:5d}.".format(initial_epoch + 1))
 
     if is_main:
         train_logger.info("**********************************************")
@@ -653,6 +848,16 @@ def train(args):
                     if epoch in [0, warmup_epochs - 1, t1, t2, t3]:
                         train_logger.info("Current learning rate value is {}".format(lr))
 
+        phase_can_save_best = True
+        if args.phase == 4:
+            phase_can_save_best = update_lut_annealing(
+                model=model, 
+                epoch=epoch, 
+                num_epochs=args.num_epochs, 
+                phase=args.phase, 
+                train_logger=train_logger if is_main else None, 
+                is_main=is_main
+            )
         t0 = time.time()
         train_loss_sum, train_correct, train_count = train_one_epoch(
             model,
@@ -707,38 +912,36 @@ def train(args):
                 )
             )
 
-        if is_main and (epoch + 1) % args.save_period == 0:
-            checkpoint = {
-                "model": unwrapped_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch + 1,
-                "args": vars(args),
-            }
-            filename = "ModelChkpt{:06d}.pt".format(epoch + 1)
-            chkpt_path = save_checkpoint(checkpoint, args.workdir, filename)
-            tmp_link = chkpt_link + ".rename"
-            if os.path.exists(tmp_link):
-                os.remove(tmp_link)
-            os.symlink(os.path.basename(chkpt_path), tmp_link)
-            os.replace(tmp_link, chkpt_link)
-            train_logger.info("Saved checkpoint to {} at epoch {:5d}".format(chkpt_path, epoch + 1))
 
-        if is_main and val_loader is not None and val_acc > best_acc:
-            best_acc = val_acc
+        metric_loss, metric_acc = (val_loss, val_acc) if val_loader is not None else (test_loss, test_acc)
+        if is_main and phase_can_save_best and metric_acc > best_acc:
+            best_acc = metric_acc
+            best_metrics = {
+                "phase": args.phase,
+                "phase_name": PHASE_DESCRIPTIONS[args.phase],
+                "epoch": epoch + 1,
+                "best_acc": float(metric_acc),
+                "best_loss": float(metric_loss),
+                "val_acc": float(val_acc),
+                "val_loss": float(val_loss),
+                "test_acc": float(test_acc),
+                "test_loss": float(test_loss),
+                "train_acc": float(train_acc),
+                "train_loss": float(train_loss),
+                "hard_mode": bool(args.phase != 4 or phase_can_save_best),
+            }
             checkpoint = {
+                "phase": args.phase,
                 "model": unwrapped_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "epoch": epoch + 1,
                 "args": vars(args),
+                "metrics": best_metrics,
             }
-            if args.binary:
-                filename = "Bestmodel_Binary_{:06d}_{:.4f}_{:.4f}.pt".format(epoch + 1, val_acc, val_loss)
-            elif args.fp_bireal:
-                filename = "Bestmodel_FP_Bireal.pt".format(epoch + 1, val_acc, val_loss)
-            else:
-                filename = "Bestmodel_{:06d}_{:.4f}_{:.4f}.pt".format(epoch + 1, val_acc, val_loss)
-            best_path = save_checkpoint(checkpoint, args.workdir, filename)
+            best_path = save_checkpoint(checkpoint, args.workdir, phase_checkpoint_filename(args.phase))
+            metrics_path = update_phase_metrics(args.workdir, args.phase, best_metrics)
             train_logger.info("Saved best model to {} at epoch {:5d}".format(best_path, epoch + 1))
+            train_logger.info("Updated phase metrics at {}".format(metrics_path))
 
         if ddp_enabled:
             dist.barrier()
@@ -768,7 +971,7 @@ def parse_args(argv):
     parser.add_argument("-n", "--num-epochs", default=200, type=int)
     parser.add_argument("-b", "--batch-size", default=64, type=int)
     parser.add_argument("--start-filter", "--sf", dest="start_filter", default=11, type=int)
-    parser.add_argument("--num-blocks", "--nb", dest="num_blocks", default=10, type=int)
+    parser.add_argument("--num-blocks", "--nb", dest="num_blocks", default=3, type=int)
     parser.add_argument("--spectral-pool-gamma", default=0.5, type=float)
     parser.add_argument(
         "--spectral-pool-scheme",
@@ -783,9 +986,7 @@ def parse_args(argv):
     parser.add_argument("--no-validation", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--num-workers", default=4, type=int)
-    parser.add_argument("--save-period", default=10, type=int)
-    parser.add_argument("--binary", action="store_true")
-    parser.add_argument("--fp_bireal", action="store_true", help="train a full-precision model for later use in binary model initialization")
+    parser.add_argument("--binary", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--binary-stem", action="store_true")
     parser.add_argument("--bireal-tune", action="store_true")
     parser.add_argument("--ddp", action="store_true")
@@ -794,9 +995,18 @@ def parse_args(argv):
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--compile-backend", default="inductor", type=str)
     parser.add_argument("--compile-mode", default="default", type=str)
+    parser.add_argument("--phase", default=1, type=int, choices=sorted(PHASE_DESCRIPTIONS))
+    parser.add_argument("--checkpoint", default=None, type=str,
+                        help="Explicit checkpoint path to initialize phases greater than 1")
+    parser.add_argument("--lut-sets", default=1, type=int,
+                        help="Number of independently learnable LUT pairs per ComplexLUTConv2d layer")
+    parser.add_argument("--lut-allocation", default="layer", choices=["layer", "channel"],
+                        help="Allocate LUT sets from a layer-shared pool or from per-output-channel pools")
+    parser.add_argument("--lut-sets-per-channel", default=1, type=int,
+                        help="Number of independently learnable LUT pairs owned by each output channel when --lut-allocation=channel")
 
     opt = parser.add_argument_group("Optimizers")
-    opt.add_argument("--optimizer", "--opt", default="sgd", type=str, choices=["sgd", "nag", "adam", "rmsprop"])
+    opt.add_argument("--optimizer", "--opt", default="sgd", type=str, choices=["sgd", "nag", "adam", "adamw", "rmsprop"])
     opt.add_argument("--clipnorm", "--cn", default=1.0, type=float)
     opt.add_argument("--clipval", "--cv", default=1.0, type=float)
     opt.add_argument("--l1", default=0.0, type=float)
