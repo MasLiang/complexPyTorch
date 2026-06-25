@@ -1,0 +1,6 @@
+# ninja log v7
+0	40328	1780745701447088118	/home/jliangbr/workspace/complexPyTorch/lut_cuda/build/temp.linux-x86_64-cpython-310/lut_conv_cuda_backend.o	6f3bf11787c4fa1e
+3	36458	1780745742147173916	/home/jliangbr/workspace/complexPyTorch/lut_cuda/build/temp.linux-x86_64-cpython-310/lut_conv_binary_cuda_backend.o	2cb87ff173f45059
+14	36484	1780745935211837315	/home/jliangbr/workspace/complexPyTorch/lut_cuda/build/temp.linux-x86_64-cpython-310/lut_conv_binary_cuda_backend.o	2cb87ff173f45059
+10	41908	1780750310741539624	/home/jliangbr/workspace/complexPyTorch/lut_cuda/build/temp.linux-x86_64-cpython-310/lut_conv_cuda_backend.o	6f3bf11787c4fa1e
+10	41915	1780750493048392804	/home/jliangbr/workspace/complexPyTorch/lut_cuda/build/temp.linux-x86_64-cpython-310/lut_conv_cuda_backend.o	6f3bf11787c4fa1e
