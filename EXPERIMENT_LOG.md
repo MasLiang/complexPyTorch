@@ -844,3 +844,70 @@ Git 历史显示：
 ### 文件记录
 
 本条仅通过 `scripts/append_experiment_log.py` 更新 `EXPERIMENT_LOG.md`；没有修改模型、训练器或启动命令。
+
+<!-- experiment-entry:pre-post-complex-bn-hardware-20260730 -->
+## 2026-07-30 - pre/post ComplexBN 的硬件代价与消融设计
+
+### 当前实现确认
+
+`BiRealComplexResidualBlock` 中：
+
+- `bn_pre = ComplexBatchNorm2d(in_channels, eps=1e-4)`
+- `bn_post = ComplexBatchNorm2d(out_channels, eps=1e-4)`
+- projection 分支也使用 `ComplexBatchNorm2d`
+
+这里的 ComplexBatchNorm2d 不是 real/imag 独立的 NaiveComplexBatchNorm2d，而是计算 real/imag 的 2x2 covariance whitening，并带有交叉仿射参数。推理阶段 running statistics 固定后，每个复数 channel 可合并为：
+
+```
+y_r = A00*x_r + A01*x_i + c0
+y_i = A10*x_r + A11*x_i + c1
+```
+
+其中 A 同时包含 covariance whitening 和 affine matrix。也就是说，当前 pre/post BN 都需要 real/imag 交叉通路。
+
+### 硬件友好性
+
+**pre-BN 相对更容易折叠**。因为它后面立刻接 sign，实际不需要物化浮点 BN 输出，只需计算：
+
+```
+bit_r = 1[A00*x_r + A01*x_i + c0 >= 0]
+bit_i = 1[A10*x_r + A11*x_i + c1 >= 0]
+```
+
+这可以实现成两个固定系数二维比较器。它仍比普通 threshold 昂贵，因为存在 real/imag cross term，但不需要保留归一化后的幅值。
+
+若 pre-BN 改成 `NaiveComplexBatchNorm2d`，real/imag 完全独立，则 sign(BN(x)) 可严格折叠为每通道两个阈值比较（外加 scale 为负时的极性翻转），基本不需要乘法器。这是最硬件友好的形式。
+
+**post-BN 更难折叠**。它的输出先与 residual 相加，幅值和尺度都会影响后续层，不能只保留 sign。当前结构实际需要：
+
+```
+out = A * [lut_count_r, lut_count_i] + c + residual
+```
+
+即使 A 和 c 都是推理期常数，也仍需在 LUT 整数累加结果上执行定点常系数乘加；cross term 还会让 real LUT count 参与 imag 输出、imag count 参与 real 输出。可以用 DSP、shift-add 或加权 adder tree 实现，但不能像 pre-BN 那样简单退化为阈值。
+
+post-BN 也不能直接与下一层 pre-BN 完全相消，因为二者之间夹着 residual add；代数组合后仍需要分别缩放 LUT branch 和 identity branch。
+
+### 训练角度
+
+硬件更友好不等于训练中更不重要：
+
+- pre-BN 将 sign 输入拉回单位尺度，有助于 Bi-Real surrogate `2(1-|x|)` 保持非零，但也会随 running/affine 参数变化持续改变 LUT 地址分布。
+- post-BN 负责归一化大量局部 0/1 LUT outputs 的整数累加，并校准 residual branch 尺度。实数 LUT-BiReal 保留的正是 post-BN，因此完全删除 post-BN 的训练风险高于删除 pre-BN。
+- 当前日志不能判断是哪一个 BN 导致 49% 平台；旧 Phase1/2 同时使用二者仍能训练，说明二者都不是普遍错误，但随机 hard-LUT scratch 下的联合动态可能不同。
+
+### 推荐消融顺序
+
+不要第一步同时删除两个 BN。建议固定优化器、seed、LUT 初始化和其他结构，按以下顺序：
+
+1. baseline：covariance pre + covariance post（当前）。
+2. no-pre：无 pre-BN + covariance post。只回答额外 pre-BN 是否妨碍 hard-LUT scratch，并更接近实数 block。
+3. naive-pre：naive/diagonal pre + covariance post。若它优于 baseline，说明问题主要来自 pre-BN 的 real/imag covariance cross coupling，而不是 pre-normalization 本身。
+4. covariance pre + naive/diagonal post。测试 post-BN 的 cross coupling，同时保留 LUT count 的尺度归一化。
+5. no-post 只作为最后的高风险实验；若测试，应同时加入简单可学习/定点友好的 branch scale，否则 LUT count 与 residual 尺度失配会混淆结论。
+
+从硬件与训练的折中看，最有希望的最终形式是 **naive pre-BN（折叠成阈值）+ naive post-BN（两个独立定点 scale/offset）**；是否需要 pre-BN 本身由 no-pre 对照决定。
+
+### 文件记录
+
+本条只通过 `scripts/append_experiment_log.py` 更新 `EXPERIMENT_LOG.md`，没有修改模型代码。
