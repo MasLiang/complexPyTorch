@@ -180,3 +180,104 @@ class LUTFloatingConvFunction(torch.autograd.Function):
             grad_x = grad_x[:, :, padding:padding + h, padding:padding + w]
 
         return grad_x.to(ctx.in_dtype), grads[1].to(ctx.w_dtype), None, None, None, None, None, None
+
+
+class LUTFloatingShadowInputGradFunction(torch.autograd.Function):
+    """Use the physical LUT in forward and a shadow LUT for input gradients.
+
+    The multilinear LUT gradient with respect to an input bit is the
+    difference between the paired LUT slices. A duplicated LUT5 therefore
+    gives its fifth input exactly zero gradient. This function keeps the
+    physical forward output and LUT-parameter gradient unchanged, while the
+    caller may provide a slightly asymmetric table for ``grad_x`` only.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        w,
+        shadow_w,
+        offsets,
+        groups,
+        K,
+        kernel_size,
+        stride,
+        padding,
+    ):
+        if w.shape != shadow_w.shape:
+            raise ValueError(
+                "w and shadow_w must have the same shape, got {} and {}".format(
+                    tuple(w.shape),
+                    tuple(shadow_w.shape),
+                )
+            )
+
+        ctx.in_dtype = x.dtype
+        ctx.w_dtype = w.dtype
+        ctx.input_hw = (x.size(2), x.size(3))
+
+        B, _, H, W = x.shape
+        OH = (H + 2 * padding - kernel_size) // stride + 1
+        OW = (W + 2 * padding - kernel_size) // stride + 1
+
+        if padding > 0:
+            x = F.pad(x, (padding, padding, padding, padding), "constant", 0.0)
+
+        x_cl = x.contiguous(memory_format=torch.channels_last)
+        w_cont = w.contiguous()
+        shadow_w_cont = shadow_w.detach().contiguous()
+        offsets_cont = offsets.contiguous()
+
+        ctx.save_for_backward(x_cl, shadow_w_cont, offsets_cont)
+        ctx.params = (groups, K, kernel_size, stride, padding)
+
+        return torch.ops.lut_lib.floating_conv(
+            x_cl,
+            w_cont,
+            offsets_cont,
+            groups,
+            K,
+            kernel_size,
+            stride,
+            OH,
+            OW,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        x_cl, shadow_w_cont, offsets_cont = ctx.saved_tensors
+        groups, K, kernel_size, stride, padding = ctx.params
+        _, _, OH, OW = grad_y.shape
+
+        grads = torch.ops.lut_lib.floating_conv_bw(
+            grad_y.contiguous(memory_format=torch.channels_last),
+            x_cl,
+            shadow_w_cont,
+            offsets_cont,
+            groups,
+            K,
+            kernel_size,
+            stride,
+            OH,
+            OW,
+        )
+
+        grad_x = grads[0]
+        if padding > 0:
+            h, w = ctx.input_hw
+            grad_x = grad_x[:, :, padding:padding + h, padding:padding + w]
+
+        # grad_w is independent of LUT values because the LUT output is
+        # linear in each table entry. It is therefore valid for physical w.
+        return (
+            grad_x.to(ctx.in_dtype),
+            grads[1].to(ctx.w_dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )

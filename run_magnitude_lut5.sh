@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+export CHECKPOINT=${CHECKPOINT:-"$ROOT_DIR/bi_workdir/chkpts/Bestmodel_phase3.pt"}
+export WORKDIR=${WORKDIR:-"$ROOT_DIR/runs/phase4_lut5_magnitude_ste_grad"}
+
+export LUT_INPUTS=5
+export LUT_EXTRA_BIT=magnitude_ste
+export LUT_INIT_MODE=binary
+export LUT_SIGN_FLIP_PROB=0
+
+export NUM_EPOCHS=${NUM_EPOCHS:-200}
+export BATCH_SIZE=${BATCH_SIZE:-128}
+export LR=${LR:-0.001}
+export SCHEDULE=${SCHEDULE:-cosine}
+export MIN_LR_FACTOR=${MIN_LR_FACTOR:-0.1}
+
+export LUT_LOGIT_INIT=${LUT_LOGIT_INIT:-2.0}
+export LUT_LR=${LUT_LR:-0.005}
+export LUT_SCHEDULE=${LUT_SCHEDULE:-follow_base}
+export LUT_TAU_MIN=${LUT_TAU_MIN:-0.5}
+export LUT_TAU_MAX=${LUT_TAU_MAX:-10.0}
+export LUT_ANNEAL_EPOCHS=${LUT_ANNEAL_EPOCHS:-120}
+export LUT_HARD_TRANSITION_EPOCHS=${LUT_HARD_TRANSITION_EPOCHS:-40}
+
+export MAGNITUDE_THRESHOLD_INIT=${MAGNITUDE_THRESHOLD_INIT:-1.0}
+export MAGNITUDE_THRESHOLD_LR=${MAGNITUDE_THRESHOLD_LR:-0.001}
+export MAGNITUDE_THRESHOLD_SCHEDULE=${MAGNITUDE_THRESHOLD_SCHEDULE:-follow_base}
+export MAGNITUDE_BIT_BETA=${MAGNITUDE_BIT_BETA:-2.0}
+export MAGNITUDE_SHADOW_EPSILON=${MAGNITUDE_SHADOW_EPSILON:-0.05}
+
+export LUT_ALLOCATION=${LUT_ALLOCATION:-layer}
+export LUT_SETS=${LUT_SETS:-1}
+export LUT_SETS_PER_CHANNEL=${LUT_SETS_PER_CHANNEL:-1}
+export COMPILE=${COMPILE:-0}
+
+exec "$ROOT_DIR/run_phase4.sh" "$@"

@@ -1,0 +1,267 @@
+import itertools
+import math
+import tempfile
+import unittest
+from unittest import mock
+
+import torch
+import torch.nn as nn
+
+from complexPyTorch.complexBinaryResNet import BinaryComplexResNet
+from complexPyTorch.complexLayers import (
+    BinaryComplexConv2d,
+    C8ComplexActivation,
+    C8LUTAwareComplexBinaryConv2d,
+    LUTFloatingConvFunction,
+)
+from training import (
+    C8CodeOccupancyTracker,
+    load_phase_checkpoint,
+    parse_args,
+    phase_checkpoint_filename,
+    phase_initialization_sources,
+    set_fixed_c8_qat_state,
+)
+
+
+class Phase2p1Phase3p1C8Test(unittest.TestCase):
+    def test_c8_activation_is_hard_unit_circle_with_qat_gradients(self):
+        activation = C8ComplexActivation(beta=2.0)
+        codebook = activation.c8_codebook
+        source = torch.complex(
+            codebook[:, 0],
+            codebook[:, 1],
+        ).reshape(1, 1, 1, 8)
+
+        output = activation(source)
+        phase_indices = activation.hard_phase_indices(source)
+        self.assertEqual(phase_indices.flatten().tolist(), list(range(8)))
+        self.assertTrue(torch.equal(output.real.flatten(), codebook[:, 0]))
+        self.assertTrue(torch.equal(output.imag.flatten(), codebook[:, 1]))
+        self.assertTrue(
+            torch.allclose(output.abs(), torch.ones_like(output.abs()), atol=1e-6)
+        )
+
+        torch.manual_seed(41)
+        real = torch.randn(2, 3, 4, 4, requires_grad=True)
+        imag = torch.randn(2, 3, 4, 4, requires_grad=True)
+        qat_output = activation(torch.complex(real, imag))
+        loss = (0.7 * qat_output.real + 0.3 * qat_output.imag).square().mean()
+        loss.backward()
+        self.assertTrue(torch.isfinite(real.grad).all())
+        self.assertTrue(torch.isfinite(imag.grad).all())
+        self.assertGreater(real.grad.abs().sum().item(), 0.0)
+        self.assertGreater(imag.grad.abs().sum().item(), 0.0)
+
+    def test_phase2p1_uses_ordinary_binary_complex_convolution(self):
+        activation = C8ComplexActivation(beta=2.0)
+        phase2p1_conv = BinaryComplexConv2d(
+            1,
+            1,
+            kernel_size=1,
+            bias=False,
+        )
+        phase3p1_conv = C8LUTAwareComplexBinaryConv2d(
+            1,
+            1,
+            kernel_size=1,
+            padding=0,
+        )
+        for layer in (phase2p1_conv, phase3p1_conv):
+            layer.conv_r.weight.data.fill_(1.0)
+            layer.conv_i.weight.data.fill_(1.0)
+
+        source = torch.complex(
+            torch.ones(1, 1, 1, 1),
+            torch.zeros(1, 1, 1, 1),
+        )
+        quantized = activation(source)
+        ordinary = phase2p1_conv(quantized)
+        local_compare = phase3p1_conv(quantized)
+        alpha = math.sqrt(2.0)
+
+        self.assertTrue(
+            torch.allclose(
+                ordinary,
+                torch.complex(
+                    torch.full_like(ordinary.real, alpha),
+                    torch.full_like(ordinary.imag, alpha),
+                ),
+                atol=1e-6,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                local_compare,
+                torch.complex(
+                    torch.full_like(local_compare.real, 2.0 * alpha),
+                    torch.full_like(local_compare.imag, 2.0 * alpha),
+                ),
+                atol=1e-6,
+            )
+        )
+
+    def test_phase3p1_all_32_states_match_local_multiply_and_compare(self):
+        activation = C8ComplexActivation(beta=2.0)
+        layer = C8LUTAwareComplexBinaryConv2d(
+            1,
+            1,
+            kernel_size=1,
+            padding=0,
+            beta=2.0,
+        )
+        codebook = activation.c8_codebook
+        source = torch.complex(
+            codebook[:, 0],
+            codebook[:, 1],
+        ).reshape(1, 1, 1, 8)
+        quantized = activation(source)
+
+        for weight_r, weight_i in itertools.product((-1.0, 1.0), repeat=2):
+            layer.conv_r.weight.data.fill_(weight_r)
+            layer.conv_i.weight.data.fill_(weight_i)
+            hard_r, hard_i = layer.hard_local_sums(quantized)
+            expected_r = (
+                codebook[:, 0] * weight_r
+                - codebook[:, 1] * weight_i
+                >= 0
+            ).to(torch.float32)
+            expected_i = (
+                codebook[:, 0] * weight_i
+                + codebook[:, 1] * weight_r
+                >= 0
+            ).to(torch.float32)
+            self.assertTrue(torch.equal(hard_r.flatten(), expected_r))
+            self.assertTrue(torch.equal(hard_i.flatten(), expected_i))
+
+    def test_phase3p1_avoids_lut_backend_and_backpropagates(self):
+        torch.manual_seed(19)
+        activation = C8ComplexActivation(beta=2.0)
+        layer = C8LUTAwareComplexBinaryConv2d(
+            2,
+            3,
+            kernel_size=3,
+            padding=1,
+            beta=2.0,
+        )
+        real = torch.randn(2, 2, 5, 5, requires_grad=True)
+        imag = torch.randn(2, 2, 5, 5, requires_grad=True)
+
+        with mock.patch.object(
+            LUTFloatingConvFunction,
+            "apply",
+            side_effect=AssertionError("LUT backend must not be called"),
+        ):
+            output = layer(activation(torch.complex(real, imag)))
+            output.abs().mean().backward()
+
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertGreater(real.grad.abs().sum().item(), 0.0)
+        self.assertGreater(imag.grad.abs().sum().item(), 0.0)
+        self.assertGreater(layer.conv_r.weight.grad.abs().sum().item(), 0.0)
+        self.assertGreater(layer.conv_i.weight.grad.abs().sum().item(), 0.0)
+
+    def test_resnet_assigns_c8_activation_and_expected_convolution(self):
+        common = {
+            "num_blocks": 1,
+            "start_filters": 2,
+            "num_classes": 10,
+            "is_sar_input": False,
+            "is_binary": True,
+            "lut_inputs": 5,
+            "c8_beta": 2.0,
+        }
+        phase2p1 = BinaryComplexResNet(phase=2.1, **common)
+        phase3p1 = BinaryComplexResNet(phase=3.1, **common)
+
+        for block in list(phase2p1.stage2) + list(phase2p1.stage3) + list(phase2p1.stage4):
+            self.assertIsInstance(block.act, C8ComplexActivation)
+            self.assertIsInstance(block.conv, BinaryComplexConv2d)
+        for block in list(phase3p1.stage2) + list(phase3p1.stage3) + list(phase3p1.stage4):
+            self.assertIsInstance(block.act, C8ComplexActivation)
+            self.assertIsInstance(block.conv, C8LUTAwareComplexBinaryConv2d)
+
+    def test_phase2p1_checkpoint_maps_all_parameters_into_phase3p1(self):
+        torch.manual_seed(23)
+        common = {
+            "num_blocks": 1,
+            "start_filters": 2,
+            "num_classes": 10,
+            "is_sar_input": False,
+            "is_binary": True,
+            "lut_inputs": 5,
+            "c8_beta": 2.0,
+        }
+        source = BinaryComplexResNet(phase=2.1, **common)
+        target = BinaryComplexResNet(phase=3.1, **common)
+        for parameter in source.parameters():
+            parameter.data.normal_()
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as checkpoint_file:
+            torch.save(
+                {
+                    "phase": 2.1,
+                    "model": source.state_dict(),
+                    "args": {"phase": 2.1, "lut_inputs": 5},
+                },
+                checkpoint_file.name,
+            )
+            load_phase_checkpoint(
+                target,
+                checkpoint_file.name,
+                expected_phase=2.1,
+                expected_lut_inputs=5,
+            )
+
+        source_parameters = dict(source.named_parameters())
+        target_parameters = dict(target.named_parameters())
+        self.assertEqual(set(source_parameters), set(target_parameters))
+        for name, source_parameter in source_parameters.items():
+            self.assertTrue(
+                torch.equal(source_parameter, target_parameters[name]),
+                msg=name,
+            )
+
+    def test_occupancy_tracker_supports_standalone_c8_activation(self):
+        activation = C8ComplexActivation(beta=2.0)
+        model = nn.Sequential(activation)
+        tracker = C8CodeOccupancyTracker(model)
+        codebook = activation.c8_codebook
+        source = torch.complex(
+            codebook[:, 0],
+            codebook[:, 1],
+        ).reshape(1, 1, 1, 8)
+
+        tracker.start()
+        model(source)
+        stats = tracker.finish()
+        tracker.close()
+
+        self.assertEqual(stats["counts"], [1] * 8)
+        self.assertEqual(stats["active_codes"], 8)
+        self.assertAlmostEqual(stats["added_axis_ratio"], 0.5)
+        self.assertAlmostEqual(stats["normalized_entropy"], 1.0)
+        self.assertLess(stats["mean_angle_error_deg"], 0.1)
+
+    def test_cli_predecessors_and_checkpoint_names(self):
+        args2p1 = parse_args(
+            ["--phase", "2.1", "--lut-inputs", "5", "--c8-beta", "3.0"]
+        )
+        args3p1 = parse_args(["--phase", "3p1", "--lut-inputs", "5"])
+        self.assertEqual(args2p1.phase, 2.1)
+        self.assertEqual(args2p1.c8_beta, 3.0)
+        self.assertEqual(args3p1.phase, 3.1)
+        self.assertEqual(phase_initialization_sources(2.1, 5), (1,))
+        self.assertEqual(phase_initialization_sources(3.1, 5), (2.1,))
+        self.assertEqual(
+            phase_checkpoint_filename(2.1),
+            "Bestmodel_phase2p1.pt",
+        )
+        self.assertEqual(
+            phase_checkpoint_filename(3.1),
+            "Bestmodel_phase3p1.pt",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

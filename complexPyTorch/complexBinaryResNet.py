@@ -8,15 +8,17 @@ from .complexFunctions import complex_avg_pool2d, complex_relu
 from .complexLayers import (
     BinaryComplexActivation,
     BinaryComplexConv2d,
+    C8ComplexActivation,
+    C8LUTAwareComplexBinaryConv2d,
+    C8LUTAwareComplexQATConv2d,
+    LUT5AwareComplexQATConv2d,
+    LUTAwareComplexBinaryConv2d,
+    ComplexLUTConv2d,
     ComplexBatchNorm2d,
     ComplexConv2d,
     ComplexReLU,
-    PairLUTNeuronConv2d,
 )
 from .complexResNet import LearnImagBlock, apply_spectral_pooling, _SPECTRAL_SCHEMES
-
-
-ACTIVE_PHASES = (1, 2, 3)
 
 
 def _same_padding(kernel_size):
@@ -44,34 +46,189 @@ class BiRealComplexResidualBlock(nn.Module):
         act_grad_mode="bireal",
         is_binary=True,
         phase=2,
-        lut_logit_init=1.0,
-        lut_tau_init=0.5,
-        lut_training_mode="anneal",
+        lut_sets=1,
+        lut_allocation="layer",
+        lut_sets_per_channel=1,
+        lut_inputs=4,
+        lut_logit_init=2.0,
+        lut_init_mode="binary",
+        lut_sign_flip_prob=0.0,
+        comp_init="complex_independent",
+        c8_beta=2.0,
+        c8_codebook="roots",
+        c8_grad_mode="softmax",
+        phase3p1_padding_mode="low_code",
+        phase2p1_mode="c8",
+        phase3p1_mode="fixed",
+        lut_init_tau=1.0,
+        neural_lut_hidden=8,
+        neural_lut_residual_scale=1.0,
+        lut_extra_bit="phase",
+        magnitude_threshold_init=1.0,
+        magnitude_bit_beta=2.0,
+        magnitude_shadow_epsilon=0.05,
     ):
         super().__init__()
         padding = _same_padding(kernel_size)
         self.projection = projection
         self.spectral_pool_scheme = spectral_pool_scheme
         self.spectral_pool_gamma = spectral_pool_gamma
+        self.phase = phase
+        self.lut_inputs = lut_inputs
+        self.lut_logit_init = lut_logit_init
+        self.lut_init_mode = lut_init_mode
+        self.lut_sign_flip_prob = lut_sign_flip_prob
+        self.comp_init = comp_init
+        self.c8_beta = c8_beta
+        self.c8_codebook = c8_codebook
+        self.c8_grad_mode = c8_grad_mode
+        self.phase3p1_padding_mode = phase3p1_padding_mode
+        self.phase2p1_mode = phase2p1_mode
+        self.phase3p1_mode = phase3p1_mode
+        self.lut_init_tau = lut_init_tau
+        self.neural_lut_hidden = neural_lut_hidden
+        self.neural_lut_residual_scale = neural_lut_residual_scale
+        self.lut_extra_bit = lut_extra_bit
+        self.magnitude_threshold_init = magnitude_threshold_init
+        self.magnitude_bit_beta = magnitude_bit_beta
+        self.magnitude_shadow_epsilon = magnitude_shadow_epsilon
+        self.learned_lut5_phase2p1 = (
+            is_binary
+            and phase == 2.1
+            and phase2p1_mode == "learned_lut5"
+        )
+        self.learned_lut5_phase3p1 = (
+            is_binary
+            and phase == 3.1
+            and phase3p1_mode in (
+                "learned_lut5",
+                "semantic_lut5",
+                "neural_lut5",
+                "pure_mlp",
+            )
+        )
+        self.semantic_lut5_phase3p1 = (
+            is_binary and phase == 3.1 and phase3p1_mode == "semantic_lut5"
+        )
+        self.neural_lut5_phase3p1 = (
+            is_binary
+            and phase == 3.1
+            and phase3p1_mode == "neural_lut5"
+        )
+        self.pure_mlp_phase3p1 = (
+            is_binary
+            and phase == 3.1
+            and phase3p1_mode == "pure_mlp"
+        )
+        self.uses_lut5 = (
+            is_binary
+            and lut_inputs == 5
+            and (
+                phase in (3, 3.5, 3.6, 4, 5)
+                or self.learned_lut5_phase2p1
+                or self.learned_lut5_phase3p1
+            )
+        )
 
         # 1. 预激活 BN (用于拉平输入 x 的分布)
         self.bn_pre = ComplexBatchNorm2d(in_channels, eps=1e-4)
         
-        # 2. 二值化激活 (Sign)
+        # 2. Quantized activation and phase-specific convolution.
         if is_binary:
-            self.act = BinaryComplexActivation(grad_mode=act_grad_mode)
-            if phase == 3:
-                self.conv = PairLUTNeuronConv2d(
-                    in_channels,
-                    out_channels,
-                    kernel_size,
-                    stride=stride,
-                    padding=padding,
-                    bias=False,
+            if phase in (2.1, 3.1) and not self.learned_lut5_phase2p1:
+                self.act = C8ComplexActivation(
+                    beta=c8_beta,
+                    codebook_mode=c8_codebook,
+                    grad_mode=c8_grad_mode,
+                )
+            else:
+                self.act = BinaryComplexActivation(grad_mode=act_grad_mode)
+
+            if (
+                phase in (4, 5)
+                or self.learned_lut5_phase2p1
+                or self.learned_lut5_phase3p1
+            ):
+                self.conv = ComplexLUTConv2d(
+                    in_channels, out_channels, kernel_size, stride=stride, padding=padding,
+                    phase=(
+                        4
+                        if (
+                            self.learned_lut5_phase2p1
+                            or self.learned_lut5_phase3p1
+                        )
+                        else phase
+                    ),
+                    lut_sets=lut_sets, lut_allocation=lut_allocation,
+                    lut_sets_per_channel=lut_sets_per_channel, lut_inputs=lut_inputs,
+                    lut_logit_init=lut_logit_init, lut_init_mode=lut_init_mode,
+                    lut_sign_flip_prob=lut_sign_flip_prob,
+                    comp_init=comp_init,
+                    lut5_init_strategy=(
+                        "duplicate_lut4"
+                        if lut_extra_bit == "magnitude_ste"
+                        else (
+                            "semantic_c8_product"
+                            if self.semantic_lut5_phase3p1
+                            else (
+                                "c8_product"
+                                if self.learned_lut5_phase3p1
+                                else (
+                                    "duplicate_lut4"
+                                    if self.learned_lut5_phase2p1
+                                    else "phase_conditioned"
+                                )
+                            )
+                        )
+                    ),
+                    c8_codebook_mode=c8_codebook,
+                    lut_init_tau=lut_init_tau,
+                    lut_parameterization=(
+                        "mlp"
+                        if self.pure_mlp_phase3p1
+                        else (
+                            "neural"
+                            if self.neural_lut5_phase3p1
+                            else "direct"
+                        )
+                    ),
+                    neural_lut_hidden=neural_lut_hidden,
+                    neural_lut_residual_scale=neural_lut_residual_scale,
+                    lut_extra_bit=lut_extra_bit,
+                    magnitude_threshold_init=magnitude_threshold_init,
+                    magnitude_bit_beta=magnitude_bit_beta,
+                    magnitude_shadow_epsilon=magnitude_shadow_epsilon,
+                )
+            elif phase == 3.6:
+                self.conv = C8LUTAwareComplexQATConv2d(
+                    in_channels, out_channels, kernel_size, stride=stride,
+                    padding=padding, lut_sets=lut_sets,
+                    lut_allocation=lut_allocation,
+                    lut_sets_per_channel=lut_sets_per_channel,
+                    lut_logit_init=lut_logit_init,
+                    comp_init=comp_init,
                     per_channel=per_channel,
-                    logit_init=lut_logit_init,
-                    tau_init=lut_tau_init,
-                    training_mode=lut_training_mode,
+                    weight_grad_mode=weight_grad_mode,
+                )
+            elif phase == 3.5:
+                self.conv = LUT5AwareComplexQATConv2d(
+                    in_channels, out_channels, kernel_size, stride=stride,
+                    padding=padding, bias=False, per_channel=per_channel,
+                    weight_grad_mode=weight_grad_mode,
+                )
+            elif phase == 3.1:
+                self.conv = C8LUTAwareComplexBinaryConv2d(
+                    in_channels, out_channels, kernel_size, stride=stride,
+                    padding=padding, bias=False, per_channel=per_channel,
+                    weight_grad_mode=weight_grad_mode, beta=c8_beta,
+                    c8_codebook_mode=c8_codebook,
+                    phase3p1_padding_mode=phase3p1_padding_mode,
+                )
+            elif phase == 3:
+                self.conv = LUTAwareComplexBinaryConv2d(
+                    in_channels, out_channels, kernel_size, stride=stride, padding=padding,
+                    bias=False, per_channel=per_channel, weight_grad_mode=weight_grad_mode,
+                    lut_inputs=lut_inputs,
                 )
             else:
                 self.conv = BinaryComplexConv2d(
@@ -114,12 +271,34 @@ class BiRealComplexResidualBlock(nn.Module):
 
         # 主干分支：严格按照 BN -> Act -> Conv -> BN
         out = self.bn_pre(x)
-        out = self.act(out)
-        
-        if self.projection and self.spectral_pool_scheme == "proj":
-            out = apply_spectral_pooling(out, self.spectral_pool_gamma)
-            
-        out = self.conv(out)
+        phase_source = out if self.uses_lut5 else None
+        if self.learned_lut5_phase3p1:
+            if self.projection and self.spectral_pool_scheme == "proj":
+                phase_source = apply_spectral_pooling(
+                    phase_source, self.spectral_pool_gamma
+                )
+            activation_bits = (
+                self.act.semantic_code_bits(phase_source)
+                if self.semantic_lut5_phase3p1
+                else self.act.phase_code_bits(phase_source)
+            )
+            out = self.conv(
+                phase_source,
+                activation_bits=activation_bits,
+            )
+        else:
+            out = self.act(out)
+            if self.projection and self.spectral_pool_scheme == "proj":
+                out = apply_spectral_pooling(out, self.spectral_pool_gamma)
+                if phase_source is not None:
+                    phase_source = apply_spectral_pooling(
+                        phase_source, self.spectral_pool_gamma
+                    )
+
+            if phase_source is not None:
+                out = self.conv(out, phase_source=phase_source)
+            else:
+                out = self.conv(out)
         out = self.bn_post(out)
 
         # Shortcut 分支处理
@@ -146,17 +325,31 @@ class BinaryComplexResNet(nn.Module):
         act_grad_mode="bireal",
         binary_stem=False,
         is_sar_input=True, # 新增标志位：如果是真实SAR复数数据，跳过 LearnImagBlock
-        is_binary=None,
+        is_binary=True, # 是否使用二值化卷积和激活，默认为 True；如果为 False，则整个网络退化为全精度复数 ResNet
         phase=2,
-        lut_logit_init=1.0,
-        lut_tau_init=0.5,
-        lut_training_mode="anneal",
+        lut_sets=1,
+        lut_allocation="layer",
+        lut_sets_per_channel=1,
+        lut_inputs=4,
+        lut_logit_init=2.0,
+        lut_init_mode="binary",
+        lut_sign_flip_prob=0.0,
+        comp_init="complex_independent",
+        c8_beta=2.0,
+        c8_codebook="roots",
+        c8_grad_mode="softmax",
+        phase3p1_padding_mode="low_code",
+        phase2p1_mode="c8",
+        phase3p1_mode="fixed",
+        lut_init_tau=1.0,
+        neural_lut_hidden=8,
+        neural_lut_residual_scale=1.0,
+        lut_extra_bit="phase",
+        magnitude_threshold_init=1.0,
+        magnitude_bit_beta=2.0,
+        magnitude_shadow_epsilon=0.05,
     ):
         super().__init__()
-        if phase not in ACTIVE_PHASES:
-            raise ValueError(
-                "Only Phase 1, Phase 2, and Phase 3 are active"
-            )
         if spectral_pool_scheme not in _SPECTRAL_SCHEMES:
             raise ValueError(f"Unknown spectral_pool_scheme: {spectral_pool_scheme}")
         
@@ -165,11 +358,29 @@ class BinaryComplexResNet(nn.Module):
         self.spectral_pool_scheme = spectral_pool_scheme
         self.spectral_pool_gamma = spectral_pool_gamma
         self.is_sar_input = is_sar_input
-        self.is_binary = phase >= 2 if is_binary is None else is_binary
+        self.is_binary = is_binary
         self.phase = phase
+        self.lut_sets = lut_sets
+        self.lut_allocation = lut_allocation
+        self.lut_sets_per_channel = lut_sets_per_channel
+        self.lut_inputs = lut_inputs
         self.lut_logit_init = lut_logit_init
-        self.lut_tau_init = lut_tau_init
-        self.lut_training_mode = lut_training_mode
+        self.lut_init_mode = lut_init_mode
+        self.lut_sign_flip_prob = lut_sign_flip_prob
+        self.comp_init = comp_init
+        self.c8_beta = c8_beta
+        self.c8_codebook = c8_codebook
+        self.c8_grad_mode = c8_grad_mode
+        self.phase3p1_padding_mode = phase3p1_padding_mode
+        self.phase2p1_mode = phase2p1_mode
+        self.phase3p1_mode = phase3p1_mode
+        self.lut_init_tau = lut_init_tau
+        self.neural_lut_hidden = neural_lut_hidden
+        self.neural_lut_residual_scale = neural_lut_residual_scale
+        self.lut_extra_bit = lut_extra_bit
+        self.magnitude_threshold_init = magnitude_threshold_init
+        self.magnitude_bit_beta = magnitude_bit_beta
+        self.magnitude_shadow_epsilon = magnitude_shadow_epsilon
 
         # 仅针对非复数输入(如光学图像)保留虚部学习模块
         if not self.is_sar_input:
@@ -222,9 +433,25 @@ class BinaryComplexResNet(nn.Module):
                 in_channels, out_channels, stride=stride, projection=True,
                 spectral_pool_scheme=self.spectral_pool_scheme, spectral_pool_gamma=self.spectral_pool_gamma,
                 per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode,
-                is_binary=self.is_binary, phase=self.phase,
-                lut_logit_init=self.lut_logit_init, lut_tau_init=self.lut_tau_init,
-                lut_training_mode=self.lut_training_mode
+                is_binary=self.is_binary, phase=self.phase, lut_sets=self.lut_sets,
+                lut_allocation=self.lut_allocation, lut_sets_per_channel=self.lut_sets_per_channel,
+                lut_inputs=self.lut_inputs, lut_logit_init=self.lut_logit_init,
+                lut_init_mode=self.lut_init_mode,
+                lut_sign_flip_prob=self.lut_sign_flip_prob,
+                comp_init=self.comp_init,
+                c8_beta=self.c8_beta,
+                c8_codebook=self.c8_codebook,
+                c8_grad_mode=self.c8_grad_mode,
+                phase3p1_padding_mode=self.phase3p1_padding_mode,
+                phase2p1_mode=self.phase2p1_mode,
+                phase3p1_mode=self.phase3p1_mode,
+                lut_init_tau=self.lut_init_tau,
+                neural_lut_hidden=self.neural_lut_hidden,
+                neural_lut_residual_scale=self.neural_lut_residual_scale,
+                lut_extra_bit=self.lut_extra_bit,
+                magnitude_threshold_init=self.magnitude_threshold_init,
+                magnitude_bit_beta=self.magnitude_bit_beta,
+                magnitude_shadow_epsilon=self.magnitude_shadow_epsilon,
             )
         )
         # Stage 的后续 Blocks 保持维度不变
@@ -234,9 +461,25 @@ class BinaryComplexResNet(nn.Module):
                     out_channels, out_channels, stride=1, projection=False,
                     spectral_pool_scheme=self.spectral_pool_scheme, spectral_pool_gamma=self.spectral_pool_gamma,
                     per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode,
-                    is_binary=self.is_binary, phase=self.phase,
-                    lut_logit_init=self.lut_logit_init, lut_tau_init=self.lut_tau_init,
-                    lut_training_mode=self.lut_training_mode
+                    is_binary=self.is_binary, phase=self.phase, lut_sets=self.lut_sets,
+                    lut_allocation=self.lut_allocation, lut_sets_per_channel=self.lut_sets_per_channel,
+                    lut_inputs=self.lut_inputs, lut_logit_init=self.lut_logit_init,
+                    lut_init_mode=self.lut_init_mode,
+                    lut_sign_flip_prob=self.lut_sign_flip_prob,
+                    comp_init=self.comp_init,
+                    c8_beta=self.c8_beta,
+                    c8_codebook=self.c8_codebook,
+                    c8_grad_mode=self.c8_grad_mode,
+                    phase3p1_padding_mode=self.phase3p1_padding_mode,
+                    phase2p1_mode=self.phase2p1_mode,
+                    phase3p1_mode=self.phase3p1_mode,
+                    lut_init_tau=self.lut_init_tau,
+                    neural_lut_hidden=self.neural_lut_hidden,
+                    neural_lut_residual_scale=self.neural_lut_residual_scale,
+                    lut_extra_bit=self.lut_extra_bit,
+                    magnitude_threshold_init=self.magnitude_threshold_init,
+                    magnitude_bit_beta=self.magnitude_bit_beta,
+                    magnitude_shadow_epsilon=self.magnitude_shadow_epsilon,
                 )
             )
         return nn.ModuleList(layers)

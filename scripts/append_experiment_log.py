@@ -1,74 +1,62 @@
 #!/usr/bin/env python3
-"""Append a structured, optionally deduplicated experiment-log entry."""
+"""Append a dated, optionally deduplicated section to the experiment log."""
 
 import argparse
 import datetime as dt
-import sys
 from pathlib import Path
+import sys
 
 
-def parse_args(argv=None):
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_LOG = REPO_ROOT / "PHASE4_LUT_EXPERIMENT_LOG.md"
+
+
+def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log", default="EXPERIMENT_LOG.md")
     parser.add_argument("--title", required=True)
-    parser.add_argument("--body", default=None)
-    parser.add_argument("--body-file", default=None)
-    parser.add_argument("--date", default=None)
-    parser.add_argument("--dedupe-key", default=None)
-    return parser.parse_args(argv)
-
-
-def load_body(args):
-    sources = sum(
-        value is not None for value in (args.body, args.body_file)
+    parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
+    parser.add_argument("--body-file", type=Path)
+    parser.add_argument(
+        "--dedupe-key",
+        help="Skip the append when this exact marker already exists",
     )
-    if sources > 1:
-        raise ValueError("Use only one of --body or --body-file")
-    if args.body_file is not None:
-        return Path(args.body_file).read_text(encoding="utf-8").strip()
-    if args.body is not None:
-        return args.body.strip()
-    return sys.stdin.read().strip()
+    parser.add_argument(
+        "--date",
+        default=dt.date.today().isoformat(),
+        help="Section date in YYYY-MM-DD form",
+    )
+    return parser.parse_args()
 
 
-def append_entry(path, title, body, date, dedupe_key=None):
-    path = Path(path)
-    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-    marker = None
-    if dedupe_key:
-        marker = "<!-- experiment-entry:{} -->".format(dedupe_key)
-        if marker in existing:
-            return False
-
-    parts = []
-    if existing and not existing.endswith("\n"):
-        parts.append("\n")
-    if existing:
-        parts.append("\n")
-    if marker:
-        parts.append(marker + "\n")
-    parts.append("## {} - {}\n\n".format(date, title))
-    parts.append(body + "\n")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write("".join(parts))
-    return True
-
-
-def main(argv=None):
-    args = parse_args(argv)
-    date = args.date or dt.date.today().isoformat()
-    body = load_body(args)
+def main():
+    args = parse_args()
+    body = (
+        args.body_file.read_text(encoding="utf-8")
+        if args.body_file is not None
+        else sys.stdin.read()
+    ).strip()
     if not body:
-        raise ValueError("Experiment log body cannot be empty")
-    appended = append_entry(
-        args.log,
+        raise SystemExit("Refusing to append an empty log section")
+
+    existing = (
+        args.log.read_text(encoding="utf-8")
+        if args.log.exists()
+        else ""
+    )
+    marker = args.dedupe_key or ""
+    if marker and marker in existing:
+        print("Log section already present; skipped: {}".format(marker))
+        return
+
+    section = "\n\n## {} {}\n\n{}\n".format(
+        args.date,
         args.title,
         body,
-        date,
-        dedupe_key=args.dedupe_key,
     )
-    print("appended" if appended else "already present")
+    args.log.parent.mkdir(parents=True, exist_ok=True)
+    with args.log.open("a", encoding="utf-8") as stream:
+        stream.write(section)
+    print("Appended experiment log section to {}".format(args.log))
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python}
-DATADIR=${DATADIR:-"$ROOT_DIR/data"}
-WORKDIR=${WORKDIR:-"$ROOT_DIR/runs/manual"}
+DATADIR=${DATADIR:-"."}
+WORKDIR=${WORKDIR:-"."}
 GPU_ID=${GPU_ID:-}
 if [[ -n "${GPU_ID}" ]]; then
   export CUDA_VISIBLE_DEVICES="$GPU_ID"
@@ -20,16 +20,25 @@ NUM_GPUS=${NUM_GPUS:-1}
 EXTRA_ARGS=("$@")
 
 if [[ "${USE_DDP:-0}" == "1" ]]; then
-  exec "$PYTHON_BIN" -m torch.distributed.run \
-    --nproc_per_node="$NUM_GPUS" \
-    "$ROOT_DIR/training.py" \
-    --ddp \
-    --datadir "$DATADIR" \
-    --workdir "$WORKDIR" \
-    "${COMPILE_ARGS[@]}" \
-    "${EXTRA_ARGS[@]}"
+  if command -v torchrun >/dev/null 2>&1; then
+    torchrun --nproc_per_node="$NUM_GPUS" \
+      "$ROOT_DIR/training.py" \
+      --ddp \
+      --datadir "$DATADIR" \
+      --workdir "$WORKDIR" \
+      "${COMPILE_ARGS[@]}" \
+      "${EXTRA_ARGS[@]}"
+  else
+    "$PYTHON_BIN" -m torch.distributed.run --nproc_per_node="$NUM_GPUS" \
+      "$ROOT_DIR/training.py" \
+      --ddp \
+      --datadir "$DATADIR" \
+      --workdir "$WORKDIR" \
+      "${COMPILE_ARGS[@]}" \
+      "${EXTRA_ARGS[@]}"
+  fi
 else
-  exec "$PYTHON_BIN" "$ROOT_DIR/training.py" \
+  "$PYTHON_BIN" "$ROOT_DIR/training.py" \
     --datadir "$DATADIR" \
     --workdir "$WORKDIR" \
     "${COMPILE_ARGS[@]}" \
