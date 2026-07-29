@@ -957,3 +957,57 @@ GPU0 已有的 phase3_pair_lut_real_aligned_binary_clean 是 covariance/covarian
 - covariance/none 风险最高：post-BN 负责 LUT 累加和 residual branch 的尺度校准，因此暂不列入第一批，除非前四组提示 post-BN 本身有害。
 
 所有实验必须使用唯一 WORKDIR，防止 checkpoint 和日志覆盖；其余 real-compatible 参数与 GPU0 基线完全相同，使用相同默认 seed，便于单变量比较。
+
+<!-- experiment-entry:bn-ablation-results-20260730 -->
+## 2026-07-30 - Residual BN ablation results and remaining real-LUT differences
+
+### 已完成的 BN 消融结果
+
+使用 scripts/analyze_training_run.py 统一解析完成实验。四组均采用 real-compatible hard-forward identity-STE、Adam、普通参数与 LUT LR=0.01 线性衰减、batch size 256、50k train、相同 seed 和独立 workdir。
+
+| pre-BN | post-BN | best test | best epoch | final test | best train | final LUT sign diff |
+|---|---:|---:|---:|---:|---:|---:|
+| none | covariance | 51.33% | 205 | 50.12% | 41.78% | 23.25% |
+| naive | covariance | 49.77% | 219 | 48.10% | 39.46% | 22.85% |
+| covariance | naive | 51.11% | 251 | 50.87% | 41.13% | 22.57% |
+| naive | naive | 48.85% | 239 | 47.36% | 39.04% | 22.64% |
+
+旧 covariance/covariance clean run 在 epoch 130 被提前停止，已达到 best 50.03%，不能作为完整 256-epoch final，但平台与四组一致。
+
+结论：
+
+1. 删除 pre-BN、将 covariance whitening 改为 real/imag 独立 naive BN，均只能产生约 1-2 个百分点波动，无法解释与实数 LUT 网络约 30-35 个百分点的差距。
+2. 四组最终都有约 22.5%-23.2% LUT entry sign flip，说明 LUT 参数并非不更新。问题是大量离散变化只形成约 39%-42% augmented train accuracy，属于表示/优化方向不足，而不是 LUT 冻结。
+3. covariance/none 仍作为最后一个高风险 BN 对照，命令为：
+   GPU_ID=0 PRE_BN_MODE=covariance POST_BN_MODE=none WORKDIR=runs/phase3_bn_covpre_nopost ./run_phase3_real_compatible.sh
+
+### 与实数 LUT-BiReal 已确认对齐的项目
+
+- 数据：CIFAR-10 50k train、RandomCrop、HorizontalFlip、CIFAR10 AutoAugment、相同 mean/std、label smoothing 0.1。
+- optimizer：Adam，无 weight decay，无 gradient clipping。
+- schedule：初始 LR 0.01，256 epoch linear decay；LUT 与普通参数使用同一 LR。
+- LUT logit：50/50 bimodal Normal(-1,0.2) / Normal(+1,0.1)。
+- LUT forward：从 epoch 1 使用 hard 0/1 entry，logit 使用 identity STE。
+- activation 总梯度：实数 BinaryActivation 的 0/1 surrogate 导数为 1-|x|；复数路径先以 +/-1 输出产生 2(1-|x|)，进入 pair-LUT probability 编码时乘 1/2，合成后同样为 1-|x|。
+- binary CUDA 与 floating multilinear backend 已有 exact forward/backward corner regression test，因此当前 binary packing 不是首要嫌疑。
+
+### 仍未对齐且优先级更高的差异
+
+1. LUT fan-in 与局部函数阶数。实数网络每个 neuron 使用 LUT6：6 个 scalar activation bits 到 1 bit，单表 64 entries。当前 pair-LUT 使用两个复数 activation，也就是 4 bits，并分别输出 real/imag bit：两张 LUT4 合计只有 32 entries。当前每个输出分量只能学习 4-bit interaction，不能复现实数 LUT6 的 6-bit interaction。
+2. Boolean 参数容量。实数 BiRealNet20 的 LUT entries 约 2,850,816；当前 start_filter=11 pair-LUT 为 2,022,592，只有约 71%。更关键的是，当前每个物理双输出 LUT 只使用 32 个 INIT 自由度，而 LUT6 单输出使用 64 个。
+3. 物理利用率。按当前 stage 宽度估算，pair-LUT 需要约 63,206 个 4-input/2-output physical neurons；实数 16-channel LUT6 网络约 44,544 个。当前方案可能消耗更多 physical LUT，却因为只使用 4 个输入而获得更低的局部阶数。
+4. 网络前端。实数版是 real Conv stem；当前先用 LearnImagBlock 从 RGB 学习 imaginary，再走 ComplexConv + covariance stem BN。
+5. projection。实数下采样 shortcut 为 AvgPool -> 1x1 Conv -> BN；当前是 stride-2 ComplexConv -> selected post-BN。
+6. 宽度。实数网络 start width=16 real channels；当前为 11 complex channels，不能只按 channel 数直接等价比较。
+7. 随机训练能力尚无控制组。现有 canonical Phase 2 的 82.21% 来自 Phase 1 checkpoint，不是同配方 scratch。必须先判断 complex BNN 本身能否用当前 scratch recipe 训练。
+
+### 下一步控制实验
+
+与 no-post 并行跑 Phase 2 scratch，保持 no-pre/cov-post 和实数训练配方：
+
+GPU_ID=1 TRAIN_FROM_SCRATCH=1 NUM_EPOCHS=256 BATCH_SIZE=256 LR=0.01 SCHEDULE=linear WEIGHT_DECAY=0 WORKDIR=runs/phase2_scratch_real_recipe_nopre_covpost ./run_phase2.sh --optimizer adam --clipnorm 0 --clipval 0 --augmentation real_lut --label-smoothing 0.1 --no-validation --pre-bn-mode none --post-bn-mode covariance
+
+判据：
+
+- 若 Phase 2 scratch 也约 50%，先解决 complex backbone scratch optimization，不能继续归因于 pair-LUT。
+- 若 Phase 2 scratch 达到约 80%，则主要瓶颈就是 LUT4 pair grouping。下一版优先考虑将全部 real/imag scalar bits flatten 后每 5 bit 一组，用一块 LUT6_2 实现两个独立 LUT5 outputs。这样每个物理单元拥有 32+32=64 entries，与实数 LUT6 的 64 个布尔自由度相当，同时 physical neuron 数比当前 4-bit grouping 更少；输出仍可解释为一个复数的 real/imag 两个 bit。
