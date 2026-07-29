@@ -41,9 +41,12 @@ GPU_ID=1 WORKDIR=runs/phase3_pair_lut_real_compatible \
 This keeps the complex 4-input/2-output pair-LUT architecture, but matches the
 real implementation's bimodal logits, hard-forward identity STE, Adam,
 unclipped gradients, linear learning-rate decay, CIFAR-10 AutoAugment,
-normalization, label smoothing, and 50k-image training split. Since that split
-uses test accuracy for model selection, it is intended as a training-mechanism
-comparison rather than an unbiased final test report.
+normalization, label smoothing, and 50k-image training split. It also defaults
+to the packed binary CUDA LUT kernel used for hard table lookup; the activation
+addresses are encoded as `0/1` probabilities and thresholded at `0.5`, matching
+the real-domain Bi-Real input-gradient convention. Since that split uses test
+accuracy for model selection, it is intended as a training-mechanism comparison
+rather than an unbiased final test report.
 
 `LR`, `BATCH_SIZE`, `NUM_EPOCHS`, and `SCHEDULE` are explicit launcher
 inputs and are never silently replaced. Phase-specific best and last

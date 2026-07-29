@@ -90,6 +90,55 @@ class PairLUTNeuronTests(unittest.TestCase):
         table.sum().backward()
         torch.testing.assert_close(logits.grad, torch.ones_like(logits))
 
+    def test_binary_kernel_rejects_soft_annealing_tables(self):
+        with self.assertRaisesRegex(ValueError, "requires real_compatible"):
+            PairLUTNeuronConv2d(
+                2,
+                1,
+                kernel_size=1,
+                training_mode="anneal",
+                kernel_mode="binary",
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_binary_and_floating_kernels_match_forward_and_backward(self):
+        torch.manual_seed(23)
+        floating = PairLUTNeuronConv2d(
+            18,
+            35,
+            kernel_size=1,
+            training_mode="real_compatible",
+            kernel_mode="floating",
+        ).cuda()
+        binary = PairLUTNeuronConv2d(
+            18,
+            35,
+            kernel_size=1,
+            training_mode="real_compatible",
+            kernel_mode="binary",
+        ).cuda()
+        floating.initialize_bimodal()
+        binary.load_state_dict(floating.state_dict())
+
+        real_f = torch.randn(4, 18, 5, 5, device="cuda", requires_grad=True)
+        imag_f = torch.randn(4, 18, 5, 5, device="cuda", requires_grad=True)
+        real_b = real_f.detach().clone().requires_grad_(True)
+        imag_b = imag_f.detach().clone().requires_grad_(True)
+
+        output_f = floating(torch.complex(real_f, imag_f))
+        output_b = binary(torch.complex(real_b, imag_b))
+        torch.testing.assert_close(output_b, output_f, rtol=0.0, atol=0.0)
+
+        probe_r = torch.randn_like(output_f.real)
+        probe_i = torch.randn_like(output_f.imag)
+        (output_f.real * probe_r + output_f.imag * probe_i).sum().backward()
+        (output_b.real * probe_r + output_b.imag * probe_i).sum().backward()
+
+        torch.testing.assert_close(real_b.grad, real_f.grad)
+        torch.testing.assert_close(imag_b.grad, imag_f.grad)
+        torch.testing.assert_close(binary.lut_r.grad, floating.lut_r.grad)
+        torch.testing.assert_close(binary.lut_i.grad, floating.lut_i.grad)
+
     def test_initialized_truth_table_matches_two_complex_products(self):
         layer = PairLUTNeuronConv2d(2, 1, kernel_size=1)
         weight_r = torch.tensor([[[[1.0]], [[-1.0]]]])

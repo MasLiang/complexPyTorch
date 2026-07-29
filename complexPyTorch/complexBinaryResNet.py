@@ -47,6 +47,7 @@ class BiRealComplexResidualBlock(nn.Module):
         lut_logit_init=1.0,
         lut_tau_init=0.5,
         lut_training_mode="anneal",
+        lut_kernel_mode="auto",
     ):
         super().__init__()
         padding = _same_padding(kernel_size)
@@ -72,6 +73,7 @@ class BiRealComplexResidualBlock(nn.Module):
                     logit_init=lut_logit_init,
                     tau_init=lut_tau_init,
                     training_mode=lut_training_mode,
+                    kernel_mode=lut_kernel_mode,
                 )
             else:
                 self.conv = BinaryComplexConv2d(
@@ -151,6 +153,7 @@ class BinaryComplexResNet(nn.Module):
         lut_logit_init=1.0,
         lut_tau_init=0.5,
         lut_training_mode="anneal",
+        lut_kernel_mode="auto",
     ):
         super().__init__()
         if phase not in ACTIVE_PHASES:
@@ -170,6 +173,7 @@ class BinaryComplexResNet(nn.Module):
         self.lut_logit_init = lut_logit_init
         self.lut_tau_init = lut_tau_init
         self.lut_training_mode = lut_training_mode
+        self.lut_kernel_mode = lut_kernel_mode
 
         # 仅针对非复数输入(如光学图像)保留虚部学习模块
         if not self.is_sar_input:
@@ -224,7 +228,8 @@ class BinaryComplexResNet(nn.Module):
                 per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode,
                 is_binary=self.is_binary, phase=self.phase,
                 lut_logit_init=self.lut_logit_init, lut_tau_init=self.lut_tau_init,
-                lut_training_mode=self.lut_training_mode
+                lut_training_mode=self.lut_training_mode,
+                lut_kernel_mode=self.lut_kernel_mode
             )
         )
         # Stage 的后续 Blocks 保持维度不变
@@ -236,7 +241,8 @@ class BinaryComplexResNet(nn.Module):
                     per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode,
                     is_binary=self.is_binary, phase=self.phase,
                     lut_logit_init=self.lut_logit_init, lut_tau_init=self.lut_tau_init,
-                    lut_training_mode=self.lut_training_mode
+                    lut_training_mode=self.lut_training_mode,
+                    lut_kernel_mode=self.lut_kernel_mode
                 )
             )
         return nn.ModuleList(layers)

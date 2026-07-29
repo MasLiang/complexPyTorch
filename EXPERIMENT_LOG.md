@@ -690,3 +690,71 @@ WORKDIR=runs/phase3_pair_lut_real_compatible \
 - bash -n run_phase3.sh run_phase3_real_compatible.sh：通过。
 - 使用 PYTHON_BIN=/bin/echo dry run 核对，完整参数包含 Adam、LR/LUT_LR=0.01、linear、no clipping、bimodal、real_lut、label smoothing=0.1、no-validation 和 train-from-scratch。
 - git diff --check 的唯一告警来自用户此前保留的 lut_cuda/lut_conv_binary_cuda_backend.cu 两处尾随空格，本次没有修改该文件。
+
+<!-- experiment-entry:git-route-binary-cuda-alignment-20260729 -->
+## 2026-07-29 - Git 路线分支与 binary CUDA 全面对齐
+
+### 路线分支
+
+本次将两条技术路线正式分离，Git 中只提交代码、启动脚本、测试和必要文档，不提交 checkpoint、数据集、runs、训练日志或 CUDA 编译产物。
+
+- 旧 LUT-as-operator 路线恢复到 `archive/lut-operator-legacy`，提交为 `bab0ade`，并已推送到 origin。恢复源来自 `backup/route_reset_phase12_20260729`；其中旧版 complexBinaryResNet 支持 Phase 1/2/2.1/3/3.1/3.5/3.6/4/5。
+- 用户保留的 `complexLayers_lut_as_op_backup.py` 与 `lut_backend_lut_as_op_backup.py` 和路线重置快照完全一致。名为 `complexBinaryResNet_lut_as_op_backup.py` 的文件实际只允许 Phase 1/2，因此旧分支采用备份目录中真正支持旧 phase 的版本。
+- 当前 LUT-as-neuron 路线位于 `route/lut-neuron-real-aligned`。它保留 Phase 1/2，并以两个二值复数输入、一个二值复数输出的 4-input/2-output pair-LUT 作为 Phase 3。
+
+旧分支验证：Python 编译通过，全部 shell 启动器语法通过，旧路线单元测试 106/106 通过。提交前检查确认没有 `.pt`、`.pth`、`.so`、`.o`、`.pyc`、runs、data 或 chkpts 文件进入 Git。
+
+### 与实数 LUT-BiReal 的 kernel 对齐
+
+实数参考实现的真实调用链是 `train.py -> lut_birealnet.BasicBlock -> lut_conv_group -> lut_conv_func_group -> lut_kernel_group -> LUT6Function.apply -> torch.ops.mylib.lut_forward -> lut_cuda_grouped_binary.forward/backward`。其前向把浮点形式的 0/1 输入按 `>0.5` 硬索引；反向对 LUT 返回被选 entry 的梯度，对输入返回相邻两个 entry 的差值梯度。
+
+当前复数 pair-LUT 的 real-compatible 路径现已使用同构的 packed binary CUDA lookup：
+
+1. 两个复数 activation 形成 `[x0_r,x0_i,x1_r,x1_i]` 四个地址 bit，real/imag 使用相同地址、两张独立 16-entry table。
+2. `BinaryComplexActivation` 先产生 -1/+1，再用 `(x+1)/2` 转成 0/1 probability 编码。binary kernel 使用 `>0.5`，避免把 0 错当成 high。
+3. Bi-Real signed activation 的代理导数为 `2(1-|x|)`，随后的除以 2 恰好得到 `1-|x|`，与实数参考实现的 0/1 Bi-Real 反向尺度一致。
+4. 输入 bit 按 channel 每 32 位打包，offset 覆盖 kernel 空间和输入 channel，shift 指定字内 bit。输出通道也由 CUDA kernel 分 tile 处理。
+5. annealing 路线仍使用 floating multilinear kernel；`real_compatible` 默认使用 binary kernel。可用 `--lut-kernel-mode auto|floating|binary` 显式控制，且 binary 模式只允许 hard real-compatible forward。
+6. CUDA 回归测试使用 18 个复数输入 channel 和 35 个输出 channel，覆盖多 input packed word 和多 output tile；binary/floating 在 hard Boolean corner 的 forward、activation gradient、real LUT gradient、imag LUT gradient逐项完全相等。
+
+### 当前路线文件修改
+
+- `complexPyTorch/lut_backend.py`：binary autograd wrapper 增加 signed/probability 输入编码；旧调用默认 signed，pair-LUT 使用 probability。
+- `complexPyTorch/complexLayers.py`：PairLUTNeuronConv2d 增加 auto/floating/binary kernel 选择、packed offsets/shifts 构造和 binary CUDA 调用；阻止 annealing 错用 binary backend。
+- `complexPyTorch/complexBinaryResNet.py`：把 LUT kernel mode 从模型入口传到所有 Phase3 block。
+- `training.py`：增加 `--lut-kernel-mode` 并传入模型。
+- `run_phase3.sh`：暴露、打印并传递 `LUT_KERNEL_MODE`。
+- `run_phase3_real_compatible.sh`：默认 `LUT_KERNEL_MODE=binary`。
+- `tests/test_pair_lut_phase3.py`：增加非法模式检查以及跨 packing/tile 边界的 CUDA forward/backward 精确等价测试。
+- `README.md`：说明 real-compatible 默认 binary CUDA 与 0/1 梯度约定。
+- `CURRENT_TECHNICAL_ROUTE.md`：记录 backend 选择、数学梯度关系和验证范围。
+- `EXPERIMENT_LOG.md`：使用可复用的 `scripts/append_experiment_log.py` 写入本条记录。
+
+### 下一次实验
+
+使用 `run_phase3_real_compatible.sh` 从头训练，默认 Adam、普通参数/LUT LR 都为 0.01、linear 256 epochs、batch size 256、bimodal LUT logits、hard identity STE、binary CUDA、无全局梯度裁剪、50k train/no-validation。首先观察前 10-20 epoch 的准确率、LUT sign diff、LUT update norm 和 GPU 吞吐，再判断训练不动是否仍来自 complex pair-LUT 结构本身。
+
+<!-- experiment-entry:binary-cuda-validation-handoff-20260729 -->
+## 2026-07-29 - binary CUDA 回归验证与运行交接
+
+### 验证结果
+
+- `CUDA_VISIBLE_DEVICES=0 conda run -n lut_net python -m unittest discover -s tests -v`：23/23 通过。
+- CUDA binary/floating 等价测试覆盖 18 complex input channels 和 35 output channels，forward 与全部输入/LUT gradient 完全一致。
+- `conda run -n lut_net python scripts/audit_active_route.py`：通过，活动路线只暴露 Phase 1/2/3。
+- `bash -n run_phase1.sh run_phase2.sh run_phase3.sh run_phase3_real_compatible.sh`：通过。
+- real-compatible dry run 确认参数包含 `real_compatible`、`binary`、Adam、LR/LUT_LR=0.01、linear、bimodal、no clipping、batch size 256、no-validation 和 train-from-scratch。
+- 1 epoch 前台诊断成功：训练进入 binary CUDA forward/backward，第 1 epoch test accuracy 25.84%，LUT sign diff 1350/2,022,592，说明 LUT entry 已发生更新；该诊断输出与 checkpoint 仅位于本地 `runs/debug_phase3_real_binary`，不进入 Git。
+- 曾启动的 GPU 0 tmux 正式任务已按用户要求停止，GPU 由用户自行启动；推荐独立 workdir 为 `runs/phase3_pair_lut_real_aligned_binary_clean`。
+
+### 用户运行命令
+
+```bash
+GPU_ID=0 \
+WORKDIR=runs/phase3_pair_lut_real_aligned_binary_clean \
+./run_phase3_real_compatible.sh
+```
+
+### 文件记录
+
+本条仅通过 `scripts/append_experiment_log.py` 更新 `EXPERIMENT_LOG.md`，记录验证和运行交接；没有修改模型数学、训练配置或 CUDA 实现。

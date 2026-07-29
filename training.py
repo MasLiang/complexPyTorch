@@ -656,6 +656,7 @@ def build_model(args, num_classes):
         lut_logit_init=args.lut_logit_init,
         lut_tau_init=args.lut_tau_min,
         lut_training_mode=args.lut_training_mode,
+        lut_kernel_mode=args.lut_kernel_mode,
     )
 
 
@@ -1582,6 +1583,11 @@ def parse_args(argv=None):
         "--lut-training-mode",
         default="anneal",
         choices=["anneal", "real_compatible"],
+    )
+    parser.add_argument(
+        "--lut-kernel-mode",
+        default="auto",
+        choices=["auto", "floating", "binary"],
     )
     parser.add_argument(
         "--lut-init-mode",

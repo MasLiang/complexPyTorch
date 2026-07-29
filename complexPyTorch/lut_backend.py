@@ -77,7 +77,19 @@ def pack_weights_to_int64(w_q, K):
 class LUTBinaryConvFunction(torch.autograd.Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32) 
-    def forward(ctx, x, w_q, offsets, shifts, groups, K, kernel_size, stride, padding):
+    def forward(
+        ctx,
+        x,
+        w_q,
+        offsets,
+        shifts,
+        groups,
+        K,
+        kernel_size,
+        stride,
+        padding,
+        input_encoding="signed",
+    ):
         ctx.in_dtype = x.dtype
         ctx.w_dtype = w_q.dtype
         ctx.params = (groups, K, kernel_size, stride, padding)
@@ -87,7 +99,18 @@ class LUTBinaryConvFunction(torch.autograd.Function):
         OH = (H + 2 * padding - kernel_size) // stride + 1
         OW = (W + 2 * padding - kernel_size) // stride + 1
 
-        x_int8 = torch.where(x >= 0, 
+        if input_encoding == "signed":
+            positive = x >= 0.0
+        elif input_encoding == "probability":
+            positive = x > 0.5
+        else:
+            raise ValueError(
+                "Unknown binary LUT input encoding: {}".format(
+                    input_encoding
+                )
+            )
+
+        x_int8 = torch.where(positive,
                              torch.tensor(1, dtype=torch.int8, device=x.device), 
                              torch.tensor(0, dtype=torch.int8, device=x.device))
 
@@ -133,7 +156,7 @@ class LUTBinaryConvFunction(torch.autograd.Function):
 
         return (
             grad_x_nchw.to(ctx.in_dtype), grad_w_fp32.to(ctx.w_dtype), 
-            None, None, None, None, None, None, None
+            None, None, None, None, None, None, None, None
         )
 
 class LUTFloatingConvFunction(torch.autograd.Function):

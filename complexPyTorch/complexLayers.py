@@ -1064,6 +1064,7 @@ class PairLUTNeuronConv2d(Module):
         logit_init=1.0,
         tau_init=0.5,
         training_mode="anneal",
+        kernel_mode="auto",
     ):
         super().__init__()
         if not isinstance(kernel_size, int):
@@ -1082,6 +1083,14 @@ class PairLUTNeuronConv2d(Module):
             raise ValueError(
                 "Unknown pair-LUT training mode: {}".format(training_mode)
             )
+        if kernel_mode not in ("auto", "floating", "binary"):
+            raise ValueError(
+                "Unknown pair-LUT kernel mode: {}".format(kernel_mode)
+            )
+        if kernel_mode == "binary" and training_mode != "real_compatible":
+            raise ValueError(
+                "The binary LUT kernel requires real_compatible hard tables"
+            )
 
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
@@ -1093,6 +1102,7 @@ class PairLUTNeuronConv2d(Module):
         self.per_channel = bool(per_channel)
         self.logit_init = float(logit_init)
         self.training_mode = training_mode
+        self.kernel_mode = kernel_mode
         self.logical_positions = (
             self.in_channels * self.kernel_size * self.kernel_size
         )
@@ -1475,6 +1485,30 @@ class PairLUTNeuronConv2d(Module):
             self.padding,
         )
 
+    def _binary_lut_forward(self, x_prob, table):
+        if not x_prob.is_cuda:
+            return self._reference_forward(x_prob, table)
+        padded_width = x_prob.size(3) + 2 * self.padding
+        packed_channels = (x_prob.size(1) + 31) // 32
+        offsets = (
+            (self.input_dy * padded_width + self.input_dx)
+            * packed_channels
+            + self.input_channels // 32
+        ).reshape(-1)
+        shifts = (self.input_channels % 32).reshape(-1)
+        return LUTBinaryConvFunction.apply(
+            x_prob,
+            table,
+            offsets,
+            shifts,
+            self.groups,
+            self.LUT_K,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            "probability",
+        )
+
     def forward(self, inp):
         if not bool(self.initialized):
             raise RuntimeError(
@@ -1520,8 +1554,20 @@ class PairLUTNeuronConv2d(Module):
             self.hard_ratio,
             self.training_mode,
         )
-        count_r = self._lut_forward(x_prob, table_r)
-        count_i = self._lut_forward(x_prob, table_i)
+        use_binary_kernel = (
+            self.kernel_mode == "binary"
+            or (
+                self.kernel_mode == "auto"
+                and self.training_mode == "real_compatible"
+            )
+        )
+        lut_forward = (
+            self._binary_lut_forward
+            if use_binary_kernel
+            else self._lut_forward
+        )
+        count_r = lut_forward(x_prob, table_r)
+        count_i = lut_forward(x_prob, table_i)
         scale = self.output_scale.view(1, -1, 1, 1)
         output_r = (count_r - self.pair_num / 2.0) * 4.0 * scale
         output_i = (count_i - self.pair_num / 2.0) * 4.0 * scale
@@ -1530,7 +1576,8 @@ class PairLUTNeuronConv2d(Module):
     def extra_repr(self):
         return (
             "in_channels={}, out_channels={}, kernel_size={}, stride={}, "
-            "padding={}, pairs={}, per_channel={}, training_mode={}, entries={}"
+            "padding={}, pairs={}, per_channel={}, training_mode={}, "
+            "kernel_mode={}, entries={}"
         ).format(
             self.in_channels,
             self.out_channels,
@@ -1540,6 +1587,7 @@ class PairLUTNeuronConv2d(Module):
             self.pair_num,
             self.per_channel,
             self.training_mode,
+            self.kernel_mode,
             self.lut_r.numel() + self.lut_i.numel(),
         )
 

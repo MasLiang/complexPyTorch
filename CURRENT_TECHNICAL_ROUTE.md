@@ -76,6 +76,19 @@ standard normalization, label smoothing 0.1, and all 50k training images.
 The LUT neuron remains the complex 4-input/2-output design; this mode aligns
 the optimization recipe, not the network topology.
 
+The LUT execution backend is independently selectable with
+`--lut-kernel-mode {auto,floating,binary}`. The default `auto` keeps the
+multilinear floating kernel for the annealing route and selects the packed
+binary CUDA kernel for `real_compatible`. Binary mode packs activation bits
+into 32-bit words, performs an exact hard truth-table lookup, and uses the same
+selected-entry LUT gradient and neighboring-entry input gradient as the
+real-domain implementation. Its inputs are the `0/1` values produced by
+`(binary_activation + 1) / 2` and are thresholded at `0.5`; combined with the
+complex Bi-Real activation STE, this gives the same input-gradient scale as the
+real network's `0/1` activation. Binary and floating backends are regression
+tested for exact forward and backward equality at hard Boolean corners,
+including channel counts that cross both 32-bit packing boundaries.
+
 ## Commands
 
 Phase 1:
@@ -125,6 +138,9 @@ GPU_ID=1 \
 WORKDIR=runs/phase3_pair_lut_real_compatible \
 ./run_phase3_real_compatible.sh
 ```
+
+This wrapper defaults `LUT_KERNEL_MODE=binary`. Set
+`LUT_KERNEL_MODE=floating` only for a backend-equivalence diagnostic.
 
 This recipe deliberately trains on all 50k CIFAR-10 training images and uses
 test accuracy for selection to match the referenced real LUT code. Keep its
