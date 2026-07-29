@@ -11,9 +11,11 @@ import training
 from complexPyTorch.complexBinaryResNet import BinaryComplexResNet
 from complexPyTorch.complexLayers import (
     BinaryComplexConv2d,
+    ComplexBatchNorm2d,
     ComplexConv2d,
     ComplexLUTConv2d,
     LUTAwareComplexBinaryConv2d,
+    NaiveComplexBatchNorm2d,
     PairLUTNeuronConv2d,
 )
 
@@ -71,6 +73,54 @@ class ActiveRouteTests(unittest.TestCase):
                 for name, _ in phase3.named_parameters()
             )
         )
+
+    def test_residual_batch_norm_modes_are_configurable(self):
+        defaults = training.parse_args([])
+        self.assertEqual(defaults.pre_bn_mode, "covariance")
+        self.assertEqual(defaults.post_bn_mode, "covariance")
+
+        expected_types = {
+            "covariance": ComplexBatchNorm2d,
+            "naive": NaiveComplexBatchNorm2d,
+            "none": torch.nn.Identity,
+        }
+        for pre_mode, pre_type in expected_types.items():
+            for post_mode, post_type in expected_types.items():
+                with self.subTest(pre=pre_mode, post=post_mode):
+                    model = BinaryComplexResNet(
+                        in_channels=3,
+                        num_blocks=1,
+                        start_filters=2,
+                        num_classes=10,
+                        is_sar_input=False,
+                        phase=2,
+                        pre_bn_mode=pre_mode,
+                        post_bn_mode=post_mode,
+                    )
+                    block = model.stage3[0]
+                    self.assertIsInstance(block.bn_pre, pre_type)
+                    self.assertIsInstance(block.bn_post, post_type)
+                    self.assertIsInstance(block.proj[1], post_type)
+
+    def test_naive_and_no_bn_routes_forward_and_backward(self):
+        for pre_mode, post_mode in (("naive", "naive"), ("none", "none")):
+            with self.subTest(pre=pre_mode, post=post_mode):
+                model = BinaryComplexResNet(
+                    in_channels=3,
+                    num_blocks=1,
+                    start_filters=2,
+                    num_classes=10,
+                    is_sar_input=False,
+                    phase=2,
+                    pre_bn_mode=pre_mode,
+                    post_bn_mode=post_mode,
+                )
+                output = model(torch.randn(2, 3, 32, 32))
+                self.assertEqual(tuple(output.shape), (2, 10))
+                output.square().mean().backward()
+
+        with self.assertRaisesRegex(ValueError, "BatchNorm mode"):
+            BinaryComplexResNet(pre_bn_mode="unsupported")
 
     def test_phase1_and_phase2_state_keys_match(self):
         phase1 = self.make_model(1)

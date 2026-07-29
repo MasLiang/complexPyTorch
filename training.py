@@ -657,6 +657,8 @@ def build_model(args, num_classes):
         lut_tau_init=args.lut_tau_min,
         lut_training_mode=args.lut_training_mode,
         lut_kernel_mode=args.lut_kernel_mode,
+        pre_bn_mode=args.pre_bn_mode,
+        post_bn_mode=args.post_bn_mode,
     )
 
 
@@ -1538,6 +1540,18 @@ def parse_args(argv=None):
         "--activation-grad-mode",
         default="bireal",
         choices=["ste", "bireal"],
+    )
+    parser.add_argument(
+        "--pre-bn-mode",
+        default="covariance",
+        choices=["covariance", "naive", "none"],
+        help="Complex normalization before each residual activation",
+    )
+    parser.add_argument(
+        "--post-bn-mode",
+        default="covariance",
+        choices=["covariance", "naive", "none"],
+        help="Complex normalization after main and projection convolutions",
     )
     parser.add_argument("--no-validation", action="store_true")
     parser.add_argument(

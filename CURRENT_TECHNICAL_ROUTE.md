@@ -89,6 +89,16 @@ real network's `0/1` activation. Binary and floating backends are regression
 tested for exact forward and backward equality at hard Boolean corners,
 including channel counts that cross both 32-bit packing boundaries.
 
+Residual normalization is independently selectable with
+`--pre-bn-mode` and `--post-bn-mode` (or launcher variables `PRE_BN_MODE` and
+`POST_BN_MODE`). Both accept `covariance`, `naive`, and `none`, and default to
+`covariance` so existing checkpoints and commands retain the previous model.
+`naive` applies independent real/imag BatchNorm; `none` uses identity. The
+post mode controls both the main path after the convolution and the projection
+shortcut, avoiding a mixed projection definition during ablations. These
+switches apply to the shared Phase 1/2/3 residual-block implementation, while
+the stem's `bn1` remains covariance BatchNorm.
+
 ## Commands
 
 Phase 1:

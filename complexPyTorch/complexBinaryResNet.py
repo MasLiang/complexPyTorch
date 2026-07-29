@@ -11,18 +11,32 @@ from .complexLayers import (
     ComplexBatchNorm2d,
     ComplexConv2d,
     ComplexReLU,
+    NaiveComplexBatchNorm2d,
     PairLUTNeuronConv2d,
 )
 from .complexResNet import LearnImagBlock, apply_spectral_pooling, _SPECTRAL_SCHEMES
 
 
 ACTIVE_PHASES = (1, 2, 3)
+_BN_MODES = ("covariance", "naive", "none")
 
 
 def _same_padding(kernel_size):
     if isinstance(kernel_size, tuple):
         return tuple(k // 2 for k in kernel_size)
     return kernel_size // 2
+
+
+def _make_complex_batch_norm(num_features, mode, eps=1e-4):
+    if mode == "covariance":
+        return ComplexBatchNorm2d(num_features, eps=eps)
+    if mode == "naive":
+        return NaiveComplexBatchNorm2d(num_features, eps=eps)
+    if mode == "none":
+        return nn.Identity()
+    raise ValueError(
+        f"Unknown complex BatchNorm mode {mode!r}; expected one of {_BN_MODES}"
+    )
 
 
 class BiRealComplexResidualBlock(nn.Module):
@@ -48,15 +62,21 @@ class BiRealComplexResidualBlock(nn.Module):
         lut_tau_init=0.5,
         lut_training_mode="anneal",
         lut_kernel_mode="auto",
+        pre_bn_mode="covariance",
+        post_bn_mode="covariance",
     ):
         super().__init__()
         padding = _same_padding(kernel_size)
         self.projection = projection
         self.spectral_pool_scheme = spectral_pool_scheme
         self.spectral_pool_gamma = spectral_pool_gamma
+        self.pre_bn_mode = pre_bn_mode
+        self.post_bn_mode = post_bn_mode
 
         # 1. 预激活 BN (用于拉平输入 x 的分布)
-        self.bn_pre = ComplexBatchNorm2d(in_channels, eps=1e-4)
+        self.bn_pre = _make_complex_batch_norm(
+            in_channels, pre_bn_mode, eps=1e-4
+        )
         
         # 2. 二值化激活 (Sign)
         if is_binary:
@@ -92,7 +112,9 @@ class BiRealComplexResidualBlock(nn.Module):
             )
         
         # 4. 卷积后 BN (用于消除二值累加造成的尺度爆炸)
-        self.bn_post = ComplexBatchNorm2d(out_channels, eps=1e-4)
+        self.bn_post = _make_complex_batch_norm(
+            out_channels, post_bn_mode, eps=1e-4
+        )
 
         # 5. Projection (Shortcut) 模块
         # 当通道数改变或下采样时，使用全精度 1x1 卷积对齐维度
@@ -106,7 +128,9 @@ class BiRealComplexResidualBlock(nn.Module):
                     padding=0,
                     bias=False,
                 ),
-                ComplexBatchNorm2d(out_channels, eps=1e-4)
+                _make_complex_batch_norm(
+                    out_channels, post_bn_mode, eps=1e-4
+                )
             )
         else:
             self.proj = None
@@ -154,6 +178,8 @@ class BinaryComplexResNet(nn.Module):
         lut_tau_init=0.5,
         lut_training_mode="anneal",
         lut_kernel_mode="auto",
+        pre_bn_mode="covariance",
+        post_bn_mode="covariance",
     ):
         super().__init__()
         if phase not in ACTIVE_PHASES:
@@ -174,6 +200,15 @@ class BinaryComplexResNet(nn.Module):
         self.lut_tau_init = lut_tau_init
         self.lut_training_mode = lut_training_mode
         self.lut_kernel_mode = lut_kernel_mode
+        self.pre_bn_mode = pre_bn_mode
+        self.post_bn_mode = post_bn_mode
+
+        for mode in (pre_bn_mode, post_bn_mode):
+            if mode not in _BN_MODES:
+                raise ValueError(
+                    f"Unknown complex BatchNorm mode {mode!r}; "
+                    f"expected one of {_BN_MODES}"
+                )
 
         # 仅针对非复数输入(如光学图像)保留虚部学习模块
         if not self.is_sar_input:
@@ -229,7 +264,9 @@ class BinaryComplexResNet(nn.Module):
                 is_binary=self.is_binary, phase=self.phase,
                 lut_logit_init=self.lut_logit_init, lut_tau_init=self.lut_tau_init,
                 lut_training_mode=self.lut_training_mode,
-                lut_kernel_mode=self.lut_kernel_mode
+                lut_kernel_mode=self.lut_kernel_mode,
+                pre_bn_mode=self.pre_bn_mode,
+                post_bn_mode=self.post_bn_mode,
             )
         )
         # Stage 的后续 Blocks 保持维度不变
@@ -242,7 +279,9 @@ class BinaryComplexResNet(nn.Module):
                     is_binary=self.is_binary, phase=self.phase,
                     lut_logit_init=self.lut_logit_init, lut_tau_init=self.lut_tau_init,
                     lut_training_mode=self.lut_training_mode,
-                    lut_kernel_mode=self.lut_kernel_mode
+                    lut_kernel_mode=self.lut_kernel_mode,
+                    pre_bn_mode=self.pre_bn_mode,
+                    post_bn_mode=self.post_bn_mode,
                 )
             )
         return nn.ModuleList(layers)

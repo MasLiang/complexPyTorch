@@ -911,3 +911,49 @@ post-BN 也不能直接与下一层 pre-BN 完全相消，因为二者之间夹�
 ### 文件记录
 
 本条只通过 `scripts/append_experiment_log.py` 更新 `EXPERIMENT_LOG.md`，没有修改模型代码。
+
+<!-- experiment-entry:bn-mode-ablation-20260730 -->
+## 2026-07-30 - Configurable residual pre/post BatchNorm ablation
+
+### 目标与实验假设
+
+当前 complex Bi-Real residual block 同时包含 convolution 前的 pre-BN 和 convolution 后的 post-BN；二者默认均为 real/imag covariance whitening。为区分训练不动究竟来自额外 pre-normalization、real/imag cross coupling，还是 post-BN 本身，本次将 pre/post normalization 解耦为独立开关。
+
+每个位置支持三种模式：
+
+- covariance：原有 ComplexBatchNorm2d，执行 real/imag 2x2 covariance whitening 和交叉 affine。
+- naive：NaiveComplexBatchNorm2d，real/imag 分别执行普通 BatchNorm，不发生交叉耦合。
+- none：nn.Identity，完全移除该位置的归一化。
+
+默认仍为 pre=covariance、post=covariance，因此不带新参数的旧命令、当前 GPU0 基线以及旧 checkpoint 架构均保持原行为。post 模式同时作用于 main path 的 bn_post 和 projection shortcut 的 BN，确保每个 post-BN 消融配置定义完整。stem 的 bn1 暂时保持 covariance，不混入本轮 residual-block 消融。
+
+### 修改文件
+
+- complexPyTorch/complexBinaryResNet.py：新增统一 BN factory；BiRealComplexResidualBlock 和 BinaryComplexResNet 接收 pre_bn_mode/post_bn_mode；所有 stage block 透传开关；projection BN 跟随 post 模式。
+- training.py：新增 --pre-bn-mode 与 --post-bn-mode CLI，choices 为 covariance/naive/none；build_model 透传到网络。
+- run_phase3.sh：新增 PRE_BN_MODE/POST_BN_MODE 环境变量、CLI 透传和启动时配置打印。
+- run_phase3_real_compatible.sh：显式保留 covariance/covariance 默认，同时允许外部环境变量覆盖。
+- tests/test_phase12_route.py：覆盖默认值、全部九种结构组合、projection 路由、naive/none 前后向以及非法模式拒绝。
+- README.md：加入用户入口、模式说明和示例。
+- CURRENT_TECHNICAL_ROUTE.md：记录开关语义、projection 约束和 stem 不参与本轮切换。
+- EXPERIMENT_LOG.md：由 scripts/append_experiment_log.py 追加本条结构化记录。
+
+### 验证
+
+- python -m py_compile complexPyTorch/complexBinaryResNet.py training.py tests/test_phase12_route.py：通过。
+- bash -n run_phase3.sh run_phase3_real_compatible.sh：通过。
+- git diff --check：通过。
+- CUDA_VISIBLE_DEVICES=8 conda run -n lut_net python -m unittest discover -s tests -v：25 tests 全部通过，包括 binary/floating LUT CUDA forward/backward equality。
+- 默认 start_filter=11、num_blocks=3 的 Phase 3 参数量：cov/cov 2,031,663；none/cov 2,029,518；naive/cov 2,031,234；cov/naive 2,031,124；naive/naive 2,030,695；cov/none 2,028,968。
+
+### 并行实验矩阵
+
+GPU0 已有的 phase3_pair_lut_real_aligned_binary_clean 是 covariance/covariance 基线，继续保留。
+
+- GPU1：none/covariance。回答额外 pre-BN 是否阻碍 hard pair-LUT scratch。
+- GPU2：naive/covariance。与 GPU1 联合判断 pre-BN 的作用来自归一化本身还是 covariance cross coupling。
+- GPU3：covariance/naive。单独检验 post-BN cross coupling，同时保留累加尺度归一化。
+- GPU4：naive/naive。硬件友好的完整候选，pre 可折叠为独立阈值，post 为独立定点 scale/offset。
+- covariance/none 风险最高：post-BN 负责 LUT 累加和 residual branch 的尺度校准，因此暂不列入第一批，除非前四组提示 post-BN 本身有害。
+
+所有实验必须使用唯一 WORKDIR，防止 checkpoint 和日志覆盖；其余 real-compatible 参数与 GPU0 基线完全相同，使用相同默认 seed，便于单变量比较。

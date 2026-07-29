@@ -48,6 +48,17 @@ the real-domain Bi-Real input-gradient convention. Since that split uses test
 accuracy for model selection, it is intended as a training-mechanism comparison
 rather than an unbiased final test report.
 
+Residual-block normalization is independently configurable before and after
+the main convolution with `PRE_BN_MODE` and `POST_BN_MODE`. Each accepts
+`covariance`, `naive`, or `none`; defaults remain `covariance`. The post mode
+also controls normalization on projection shortcuts. For example:
+
+```bash
+GPU_ID=1 PRE_BN_MODE=naive POST_BN_MODE=naive \
+  WORKDIR=runs/phase3_pair_lut_bn_naive_naive \
+  ./run_phase3_real_compatible.sh
+```
+
 `LR`, `BATCH_SIZE`, `NUM_EPOCHS`, and `SCHEDULE` are explicit launcher
 inputs and are never silently replaced. Phase-specific best and last
 checkpoints are saved under each workdir's `chkpts/` directory.

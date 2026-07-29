@@ -24,5 +24,7 @@ export LUT_BIMODAL_POSITIVE_STD=${LUT_BIMODAL_POSITIVE_STD:-0.1}
 export AUGMENTATION=${AUGMENTATION:-real_lut}
 export LABEL_SMOOTHING=${LABEL_SMOOTHING:-0.1}
 export NO_VALIDATION=${NO_VALIDATION:-1}
+export PRE_BN_MODE=${PRE_BN_MODE:-covariance}
+export POST_BN_MODE=${POST_BN_MODE:-covariance}
 
 exec "$ROOT_DIR/run_phase3.sh" "$@"

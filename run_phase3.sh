@@ -41,6 +41,8 @@ AUGMENTATION=${AUGMENTATION:-complex_default}
 LABEL_SMOOTHING=${LABEL_SMOOTHING:-0.0}
 SPECTRAL_POOL_SCHEME=${SPECTRAL_POOL_SCHEME:-none}
 BINARY_WEIGHT_SCALE=${BINARY_WEIGHT_SCALE:-channel}
+PRE_BN_MODE=${PRE_BN_MODE:-covariance}
+POST_BN_MODE=${POST_BN_MODE:-covariance}
 
 ARGS=(
   --phase 3
@@ -71,6 +73,8 @@ ARGS=(
   --weight-decay "$WEIGHT_DECAY"
   --spectral-pool-scheme "$SPECTRAL_POOL_SCHEME"
   --binary-weight-scale "$BINARY_WEIGHT_SCALE"
+  --pre-bn-mode "$PRE_BN_MODE"
+  --post-bn-mode "$POST_BN_MODE"
   --augmentation "$AUGMENTATION"
   --label-smoothing "$LABEL_SMOOTHING"
 )
@@ -101,6 +105,8 @@ fi
 printf 'Workdir: %s\n' "$WORKDIR"
 printf 'LUT training mode: %s\n' "$LUT_TRAINING_MODE"
 printf 'LUT kernel mode: %s\n' "$LUT_KERNEL_MODE"
+printf 'Residual BN modes: pre=%s, post=%s\n' \
+  "$PRE_BN_MODE" "$POST_BN_MODE"
 if [[ "$LUT_TRAINING_MODE" == "anneal" ]]; then
   printf 'Annealing: %s soft epochs + %s hard-transition epochs\n' \
     "$LUT_ANNEAL_EPOCHS" "$LUT_HARD_TRANSITION_EPOCHS"
