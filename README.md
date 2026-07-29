@@ -2,6 +2,62 @@
 
 A high-level toolbox for using complex valued neural networks in PyTorch.
 
+## Current Training Route
+
+The active research route now exposes:
+
+- Phase 1: full-precision complex Bi-Real ResNet.
+- Phase 2: binary complex activations and binary complex convolution weights.
+- Phase 3: LUT-as-neuron convolutions. Each 4-input LUT consumes two binary
+  complex activations and emits one real or imaginary output bit.
+
+Run them with:
+
+```bash
+GPU_ID=0 WORKDIR=runs/phase1 ./run_phase1.sh
+GPU_ID=1 WORKDIR=runs/phase2 \
+  CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase1.pt \
+  ./run_phase2.sh
+GPU_ID=2 WORKDIR=runs/phase3_pair_lut \
+  CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase2.pt \
+  ./run_phase3.sh
+```
+
+Phase 3 can also initialize the entire network and all LUT logits randomly:
+
+```bash
+GPU_ID=2 TRAIN_FROM_SCRATCH=1 LUT_LOGIT_INIT=1.0 LR=0.01 \
+  WORKDIR=runs/phase3_pair_lut_scratch ./run_phase3.sh
+```
+
+For a controlled comparison with the real-valued LUT-BiReal implementation,
+use the dedicated recipe:
+
+```bash
+GPU_ID=1 WORKDIR=runs/phase3_pair_lut_real_compatible \
+  ./run_phase3_real_compatible.sh
+```
+
+This keeps the complex 4-input/2-output pair-LUT architecture, but matches the
+real implementation's bimodal logits, hard-forward identity STE, Adam,
+unclipped gradients, linear learning-rate decay, CIFAR-10 AutoAugment,
+normalization, label smoothing, and 50k-image training split. Since that split
+uses test accuracy for model selection, it is intended as a training-mechanism
+comparison rather than an unbiased final test report.
+
+`LR`, `BATCH_SIZE`, `NUM_EPOCHS`, and `SCHEDULE` are explicit launcher
+inputs and are never silently replaced. Phase-specific best and last
+checkpoints are saved under each workdir's `chkpts/` directory.
+
+The complete active-route contract is in
+[CURRENT_TECHNICAL_ROUTE.md](CURRENT_TECHNICAL_ROUTE.md). All Phase 2.1+,
+LUT5/LUT6, C8, MLP, magnitude, dominance, and fixed-analytic experiments
+were preserved under
+[`backup/route_reset_phase12_20260729/`](backup/route_reset_phase12_20260729/).
+The generic LUT complex layers and CUDA backends remain available in the
+active source tree. Phase 1/2 do not instantiate LUTs; Phase 3 uses only the
+new pair-LUT neuron path.
+
 Before version 1.7 of PyTroch, complex tensor were not supported. 
 The initial version of **complexPyTorch** represented complex tensor using two tensors, one for the real and one for the imaginary part.
 Since version 1.7, compex tensors of type `torch.complex64` are allowed, but only a limited number of operation are supported.

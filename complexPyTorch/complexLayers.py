@@ -1021,6 +1021,529 @@ def binary_annealing(logits, tau=1.0, hard=False):
     return hard_sample if hard else soft_sample
 
 
+def annealed_binary_table(
+    logits,
+    tau,
+    hard_ratio,
+    training_mode="anneal",
+):
+    """Return annealed entries or hard entries with an identity logit STE."""
+    if training_mode == "real_compatible":
+        hard = (logits >= 0.0).to(logits.dtype)
+        return (hard - logits).detach() + logits
+    if training_mode != "anneal":
+        raise ValueError(
+            "Unknown pair-LUT training mode: {}".format(training_mode)
+        )
+    soft = (torch.tanh(logits * tau) + 1.0) / 2.0
+    hard = (logits >= 0.0).to(logits.dtype)
+    ratio = torch.as_tensor(
+        hard_ratio,
+        dtype=logits.dtype,
+        device=logits.device,
+    ).clamp(0.0, 1.0)
+    return soft + ratio * (hard - soft).detach()
+
+
+class PairLUTNeuronConv2d(Module):
+    """LUT-as-neuron convolution consuming two binary complex activations."""
+
+    LUT_K = 4
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias=False,
+        per_channel=True,
+        logit_init=1.0,
+        tau_init=0.5,
+        training_mode="anneal",
+    ):
+        super().__init__()
+        if not isinstance(kernel_size, int):
+            raise TypeError("PairLUTNeuronConv2d requires an integer kernel_size")
+        if groups != 1:
+            raise ValueError("PairLUTNeuronConv2d currently supports groups=1")
+        if dilation != 1:
+            raise ValueError("PairLUTNeuronConv2d currently supports dilation=1")
+        if bias:
+            raise ValueError("PairLUTNeuronConv2d does not use convolution bias")
+        if logit_init <= 0.0:
+            raise ValueError("logit_init must be positive")
+        if tau_init <= 0.0:
+            raise ValueError("tau_init must be positive")
+        if training_mode not in ("anneal", "real_compatible"):
+            raise ValueError(
+                "Unknown pair-LUT training mode: {}".format(training_mode)
+            )
+
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.kernel_size = int(kernel_size)
+        self.stride = int(stride)
+        self.padding = int(padding)
+        self.dilation = int(dilation)
+        self.groups = int(groups)
+        self.per_channel = bool(per_channel)
+        self.logit_init = float(logit_init)
+        self.training_mode = training_mode
+        self.logical_positions = (
+            self.in_channels * self.kernel_size * self.kernel_size
+        )
+        self.pair_num = (self.logical_positions + 1) // 2
+
+        table_shape = (self.pair_num, 1 << self.LUT_K, self.out_channels)
+        self.lut_r = Parameter(torch.zeros(table_shape))
+        self.lut_i = Parameter(torch.zeros(table_shape))
+        self.register_buffer(
+            "initial_lut_r_sign",
+            torch.zeros(table_shape, dtype=torch.bool),
+        )
+        self.register_buffer(
+            "initial_lut_i_sign",
+            torch.zeros(table_shape, dtype=torch.bool),
+        )
+        self.register_buffer(
+            "output_scale",
+            torch.ones(self.out_channels, dtype=torch.float32),
+        )
+        self.register_buffer("tau", torch.tensor(float(tau_init)))
+        self.register_buffer("hard_ratio", torch.tensor(0.0))
+        self.register_buffer(
+            "initialized",
+            torch.tensor(False, dtype=torch.bool),
+        )
+
+        state_ids = torch.arange(1 << self.LUT_K, dtype=torch.long)
+        state_bits = torch.stack(
+            [
+                ((state_ids >> shift) & 1).to(torch.float32)
+                for shift in (3, 2, 1, 0)
+            ],
+            dim=1,
+        )
+        self.register_buffer("state_bits", state_bits)
+
+        kernel_area = self.kernel_size * self.kernel_size
+        positions = torch.arange(self.logical_positions, dtype=torch.long)
+        channels = positions // kernel_area
+        spatial = positions % kernel_area
+        dy = spatial // self.kernel_size
+        dx = spatial % self.kernel_size
+
+        if self.logical_positions % 2:
+            channels = torch.cat(
+                [channels, torch.tensor([-1], dtype=torch.long)]
+            )
+            dy = torch.cat([dy, torch.tensor([0], dtype=torch.long)])
+            dx = torch.cat([dx, torch.tensor([0], dtype=torch.long)])
+
+        pair_channels = channels.view(self.pair_num, 2)
+        pair_dy = dy.view(self.pair_num, 2)
+        pair_dx = dx.view(self.pair_num, 2)
+        dummy_r = 2 * self.in_channels
+        dummy_i = dummy_r + 1
+        input_channels = torch.empty(
+            self.pair_num,
+            self.LUT_K,
+            dtype=torch.long,
+        )
+        input_dy = torch.empty_like(input_channels)
+        input_dx = torch.empty_like(input_channels)
+        for pair_index in range(self.pair_num):
+            for item_index in range(2):
+                channel = int(pair_channels[pair_index, item_index])
+                bit_base = item_index * 2
+                if channel < 0:
+                    input_channels[pair_index, bit_base] = dummy_r
+                    input_channels[pair_index, bit_base + 1] = dummy_i
+                else:
+                    input_channels[pair_index, bit_base] = channel
+                    input_channels[pair_index, bit_base + 1] = (
+                        self.in_channels + channel
+                    )
+                input_dy[pair_index, bit_base:bit_base + 2] = pair_dy[
+                    pair_index,
+                    item_index,
+                ]
+                input_dx[pair_index, bit_base:bit_base + 2] = pair_dx[
+                    pair_index,
+                    item_index,
+                ]
+
+        unfold_indices = (
+            input_channels * kernel_area
+            + input_dy * self.kernel_size
+            + input_dx
+        )
+        self.register_buffer("input_channels", input_channels.to(torch.int32))
+        self.register_buffer("input_dy", input_dy.to(torch.int32))
+        self.register_buffer("input_dx", input_dx.to(torch.int32))
+        self.register_buffer("unfold_indices", unfold_indices)
+
+    def initialize_from_phase2_weights(
+        self,
+        weight_r,
+        weight_i,
+        logit_init=None,
+    ):
+        expected_shape = (
+            self.out_channels,
+            self.in_channels,
+            self.kernel_size,
+            self.kernel_size,
+        )
+        if tuple(weight_r.shape) != expected_shape:
+            raise ValueError(
+                "Unexpected real weight shape {}; expected {}".format(
+                    tuple(weight_r.shape),
+                    expected_shape,
+                )
+            )
+        if tuple(weight_i.shape) != expected_shape:
+            raise ValueError(
+                "Unexpected imaginary weight shape {}; expected {}".format(
+                    tuple(weight_i.shape),
+                    expected_shape,
+                )
+            )
+        magnitude = self.logit_init if logit_init is None else float(logit_init)
+        if magnitude <= 0.0:
+            raise ValueError("logit_init must be positive")
+
+        with torch.no_grad():
+            complex_weight = torch.complex(weight_r, weight_i)
+            scale = binary_scale_weight_complex(
+                complex_weight,
+                per_channel=self.per_channel,
+            )
+            if self.per_channel:
+                scale = scale.reshape(self.out_channels)
+            else:
+                scale = scale.reshape(1).expand(self.out_channels)
+            weight_r_bits = torch.where(
+                weight_r >= 0.0,
+                torch.ones_like(weight_r),
+                -torch.ones_like(weight_r),
+            ).reshape(self.out_channels, self.logical_positions)
+            weight_i_bits = torch.where(
+                weight_i >= 0.0,
+                torch.ones_like(weight_i),
+                -torch.ones_like(weight_i),
+            ).reshape(self.out_channels, self.logical_positions)
+            zero_components = int(
+                (weight_r == 0.0).sum().item()
+                + (weight_i == 0.0).sum().item()
+            )
+
+            if self.logical_positions % 2:
+                zero_column = torch.zeros(
+                    self.out_channels,
+                    1,
+                    dtype=weight_r.dtype,
+                    device=weight_r.device,
+                )
+                weight_r_bits = torch.cat([weight_r_bits, zero_column], dim=1)
+                weight_i_bits = torch.cat([weight_i_bits, zero_column], dim=1)
+
+            pair_wr = weight_r_bits.view(
+                self.out_channels,
+                self.pair_num,
+                2,
+            )
+            pair_wi = weight_i_bits.view(
+                self.out_channels,
+                self.pair_num,
+                2,
+            )
+            activation = self.state_bits.to(
+                device=weight_r.device,
+                dtype=weight_r.dtype,
+            ) * 2.0 - 1.0
+            x0r = activation[:, 0].view(1, 1, -1)
+            x0i = activation[:, 1].view(1, 1, -1)
+            x1r = activation[:, 2].view(1, 1, -1)
+            x1i = activation[:, 3].view(1, 1, -1)
+
+            w0r = pair_wr[:, :, 0].unsqueeze(-1)
+            w0i = pair_wi[:, :, 0].unsqueeze(-1)
+            w1r = pair_wr[:, :, 1].unsqueeze(-1)
+            w1i = pair_wi[:, :, 1].unsqueeze(-1)
+            sum_r = (
+                x0r * w0r
+                - x0i * w0i
+                + x1r * w1r
+                - x1i * w1i
+            )
+            sum_i = (
+                x0r * w0i
+                + x0i * w0r
+                + x1r * w1i
+                + x1i * w1r
+            )
+            table_r = (sum_r >= 0.0).permute(1, 2, 0)
+            table_i = (sum_i >= 0.0).permute(1, 2, 0)
+            positive = torch.tensor(
+                magnitude,
+                dtype=self.lut_r.dtype,
+                device=self.lut_r.device,
+            )
+            self.lut_r.copy_(
+                torch.where(table_r.to(self.lut_r.device), positive, -positive)
+            )
+            self.lut_i.copy_(
+                torch.where(table_i.to(self.lut_i.device), positive, -positive)
+            )
+            self.initial_lut_r_sign.copy_(table_r.to(self.lut_r.device))
+            self.initial_lut_i_sign.copy_(table_i.to(self.lut_i.device))
+            self.output_scale.copy_(
+                scale.to(
+                    device=self.output_scale.device,
+                    dtype=self.output_scale.dtype,
+                )
+            )
+            self.initialized.fill_(True)
+
+        return {
+            "mode": "phase2_truth_table",
+            "logical_positions": self.logical_positions,
+            "pairs": self.pair_num,
+            "odd_tail": bool(self.logical_positions % 2),
+            "zero_weight_components": zero_components,
+            "real_ones": int(table_r.sum().item()),
+            "imag_ones": int(table_i.sum().item()),
+            "table_entries_per_output": self.pair_num * (1 << self.LUT_K),
+        }
+
+    def initialize_random(self, logit_std=None):
+        """Initialize an independent random truth-table logit distribution."""
+        std = self.logit_init if logit_std is None else float(logit_std)
+        if std <= 0.0:
+            raise ValueError("logit_std must be positive")
+        with torch.no_grad():
+            self.lut_r.normal_(mean=0.0, std=std)
+            self.lut_i.normal_(mean=0.0, std=std)
+            self.initial_lut_r_sign.copy_(self.lut_r >= 0.0)
+            self.initial_lut_i_sign.copy_(self.lut_i >= 0.0)
+            self.output_scale.fill_(1.0)
+            self.initialized.fill_(True)
+        return {
+            "mode": "random_normal",
+            "logical_positions": self.logical_positions,
+            "pairs": self.pair_num,
+            "odd_tail": bool(self.logical_positions % 2),
+            "logit_mean": float(
+                torch.cat([self.lut_r.flatten(), self.lut_i.flatten()])
+                .mean()
+                .item()
+            ),
+            "logit_std": float(
+                torch.cat([self.lut_r.flatten(), self.lut_i.flatten()])
+                .std(unbiased=False)
+                .item()
+            ),
+            "real_ones": int(self.initial_lut_r_sign.sum().item()),
+            "imag_ones": int(self.initial_lut_i_sign.sum().item()),
+            "table_entries_per_output": self.pair_num * (1 << self.LUT_K),
+        }
+
+    def initialize_bimodal(
+        self,
+        negative_mean=-1.0,
+        negative_std=0.2,
+        positive_mean=1.0,
+        positive_std=0.1,
+    ):
+        """Initialize logits from the real LUT-BiReal bimodal mixture."""
+        if negative_std <= 0.0 or positive_std <= 0.0:
+            raise ValueError("Bimodal standard deviations must be positive")
+
+        with torch.no_grad():
+            for logits in (self.lut_r, self.lut_i):
+                positive_mask = torch.rand_like(logits) >= 0.5
+                negative = torch.empty_like(logits).normal_(
+                    mean=float(negative_mean),
+                    std=float(negative_std),
+                )
+                positive = torch.empty_like(logits).normal_(
+                    mean=float(positive_mean),
+                    std=float(positive_std),
+                )
+                logits.copy_(torch.where(positive_mask, positive, negative))
+            self.initial_lut_r_sign.copy_(self.lut_r >= 0.0)
+            self.initial_lut_i_sign.copy_(self.lut_i >= 0.0)
+            self.output_scale.fill_(1.0)
+            self.initialized.fill_(True)
+
+        combined = torch.cat([self.lut_r.flatten(), self.lut_i.flatten()])
+        return {
+            "mode": "bimodal",
+            "logical_positions": self.logical_positions,
+            "pairs": self.pair_num,
+            "odd_tail": bool(self.logical_positions % 2),
+            "logit_mean": float(combined.mean().item()),
+            "logit_std": float(combined.std(unbiased=False).item()),
+            "real_ones": int(self.initial_lut_r_sign.sum().item()),
+            "imag_ones": int(self.initial_lut_i_sign.sum().item()),
+            "table_entries_per_output": self.pair_num * (1 << self.LUT_K),
+        }
+
+    def hard_sign_diff(self):
+        current_r = self.lut_r.detach() >= 0.0
+        current_i = self.lut_i.detach() >= 0.0
+        diff_r = int((current_r != self.initial_lut_r_sign).sum().item())
+        diff_i = int((current_i != self.initial_lut_i_sign).sum().item())
+        total_per_part = self.lut_r.numel()
+        return {
+            "real": diff_r,
+            "imag": diff_i,
+            "total": diff_r + diff_i,
+            "entries": total_per_part * 2,
+        }
+
+    def hard_tables(self):
+        return {
+            "real": (self.lut_r.detach() >= 0.0).to(torch.uint8).cpu(),
+            "imag": (self.lut_i.detach() >= 0.0).to(torch.uint8).cpu(),
+        }
+
+    def _reference_forward(self, x_prob, table):
+        patches = F.unfold(
+            x_prob,
+            kernel_size=self.kernel_size,
+            dilation=1,
+            padding=self.padding,
+            stride=self.stride,
+        )
+        batch_size, _, locations = patches.shape
+        values = patches[:, self.unfold_indices.reshape(-1), :].view(
+            batch_size,
+            self.pair_num,
+            self.LUT_K,
+            locations,
+        )
+        bits = self.state_bits.view(
+            1,
+            1,
+            1 << self.LUT_K,
+            self.LUT_K,
+            1,
+        ).to(device=values.device, dtype=values.dtype)
+        basis = torch.where(
+            bits > 0.5,
+            values.unsqueeze(2),
+            1.0 - values.unsqueeze(2),
+        ).prod(dim=3)
+        output = torch.einsum("bpsl,pso->bol", basis, table)
+        height = (
+            x_prob.size(2)
+            + 2 * self.padding
+            - self.kernel_size
+        ) // self.stride + 1
+        width = (
+            x_prob.size(3)
+            + 2 * self.padding
+            - self.kernel_size
+        ) // self.stride + 1
+        return output.view(batch_size, self.out_channels, height, width)
+
+    def _lut_forward(self, x_prob, table):
+        if not x_prob.is_cuda:
+            return self._reference_forward(x_prob, table)
+        padded_width = x_prob.size(3) + 2 * self.padding
+        offsets = (
+            (
+                self.input_dy * padded_width
+                + self.input_dx
+            ) * x_prob.size(1)
+            + self.input_channels
+        ).reshape(-1)
+        return LUTFloatingConvFunction.apply(
+            x_prob,
+            table,
+            offsets,
+            self.groups,
+            self.LUT_K,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+        )
+
+    def forward(self, inp):
+        if not bool(self.initialized):
+            raise RuntimeError(
+                "PairLUTNeuronConv2d must be initialized before forward"
+            )
+        hard_r = torch.where(
+            inp.real >= 0.0,
+            torch.ones_like(inp.real),
+            -torch.ones_like(inp.real),
+        )
+        hard_i = torch.where(
+            inp.imag >= 0.0,
+            torch.ones_like(inp.imag),
+            -torch.ones_like(inp.imag),
+        )
+        signed_r = inp.real + (hard_r - inp.real).detach()
+        signed_i = inp.imag + (hard_i - inp.imag).detach()
+        dummy = torch.zeros(
+            inp.size(0),
+            2,
+            inp.size(2),
+            inp.size(3),
+            dtype=inp.real.dtype,
+            device=inp.device,
+        )
+        x_prob = torch.cat(
+            [
+                (signed_r + 1.0) / 2.0,
+                (signed_i + 1.0) / 2.0,
+                dummy,
+            ],
+            dim=1,
+        )
+        table_r = annealed_binary_table(
+            self.lut_r,
+            self.tau,
+            self.hard_ratio,
+            self.training_mode,
+        )
+        table_i = annealed_binary_table(
+            self.lut_i,
+            self.tau,
+            self.hard_ratio,
+            self.training_mode,
+        )
+        count_r = self._lut_forward(x_prob, table_r)
+        count_i = self._lut_forward(x_prob, table_i)
+        scale = self.output_scale.view(1, -1, 1, 1)
+        output_r = (count_r - self.pair_num / 2.0) * 4.0 * scale
+        output_i = (count_i - self.pair_num / 2.0) * 4.0 * scale
+        return torch.complex(output_r, output_i)
+
+    def extra_repr(self):
+        return (
+            "in_channels={}, out_channels={}, kernel_size={}, stride={}, "
+            "padding={}, pairs={}, per_channel={}, training_mode={}, entries={}"
+        ).format(
+            self.in_channels,
+            self.out_channels,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.pair_num,
+            self.per_channel,
+            self.training_mode,
+            self.lut_r.numel() + self.lut_i.numel(),
+        )
+
+
 # =====================================================================
 # 3. 终极硬件感知复数 LUT 卷积层 (5-Phase Architecture)
 # =====================================================================

@@ -1,0 +1,692 @@
+<!-- experiment-entry:route-reset-phase12-20260729 -->
+## 2026-07-29 - Phase 1/2 route reset and legacy-route archive
+
+### 1. 本次路线切换的目标与结论
+
+本次不是在旧实验树上继续修补，而是对活动代码做一次基线重置：
+
+- 活动训练路线只保留 Phase 1 和 Phase 2。
+- Phase 1 是 full-precision complex Bi-Real ResNet。
+- Phase 2 是 binary complex activation + binary complex convolution weight。
+- Phase 2 默认从 Phase 1 checkpoint 初始化，也可显式使用 `--train-from-scratch`。
+- Phase 2.1、Phase 3/3.1/3.2/3.5/3.6、Phase 4/4.2/5，以及 LUT5、LUT6、C8、magnitude、dominance、MLP/NIN、fixed-analytic 等旧路线全部退出活动入口。
+- 按用户要求，`complexPyTorch/complexLayers.py`、`complexPyTorch/lut_backend.py` 和 `lut_cuda/` 中的 LUT complex layer 与后端实现继续保留，但 Phase 1/2 模型不会实例化 LUT module。
+- 旧代码、日志、报告、checkpoint 和运行结果均归档，不做删除。
+
+### 2. 归档前仍在运行的任务
+
+清理开始时发现 fixed-analytic dominance 任务仍在运行：
+
+- Workdir: `runs/fixed_analytic_dominance_from_phase1_cmpbeta1_e200`
+- 计划 epoch: 200
+- epoch 174 时先写入 `route_reset_snapshot.md`
+- 终止信号生效前，正在执行的 epoch 175 完整写入日志
+- 最终状态：175/200，incomplete
+- 最佳 validation accuracy：0.6250，epoch 173
+- epoch 173 对应 test accuracy：0.6217
+- 独立最佳 test accuracy：0.6242，epoch 166
+- epoch 175：train 0.6031，validation 0.6164，test 0.6187
+- epoch 174 快照统计：8/8 code occupied，dominance ratio 0.4982，occupancy entropy 0.9857，三个 bit 的记录梯度均非零
+
+任务已通过进程组 SIGTERM 停止，并确认没有旧 trainer/launcher 进程继续运行。最终摘要由
+`scripts/analyze_training_run.py` 生成到
+`backup/route_reset_phase12_20260729/fixed_analytic_final_summary.md`。
+
+### 3. 主归档内容
+
+归档根目录：
+
+`backup/route_reset_phase12_20260729/`
+
+机器可读清单：
+
+`backup/route_reset_phase12_20260729/archive_manifest.json`
+
+旧目录树：
+
+`backup/route_reset_phase12_20260729/legacy_tree/`
+
+主归档工具移动了以下 42 个 repository-relative path，并在 manifest 中记录目标路径、文件数量、总字节数；小于 16 MiB 的单文件还记录 SHA-256：
+
+1. `training.py`
+2. `training.py.orig`
+3. `training_direct_lut5.py`
+4. `training_dual_lut6.py`
+5. `training_fixed_analytic.py`
+6. `training_mlp_flow.py`
+7. `complexPyTorch/complexBinaryResNet.py`
+8. `complexPyTorch/complexBinaryResNet.py.orig`
+9. `complexPyTorch/complexLayers.py.orig`
+10. `complexPyTorch/directLut5Flow.py`
+11. `complexPyTorch/dualLut6Flow.py`
+12. `complexPyTorch/fixedAnalyticDominanceFlow.py`
+13. `complexPyTorch/mlpFlow.py`
+14. `run_all_phases.py`
+15. `run_direct_lut5.sh`
+16. `run_dual_lut6.sh`
+17. `run_fixed_analytic.sh`
+18. `run_magnitude_lut5.sh`
+19. `run_mlp_flow.sh`
+20. `run_phase2p1.sh`
+21. `run_phase3p1.sh`
+22. `run_phase3p5.sh`
+23. `run_phase3p6.sh`
+24. `run_phase4.sh`
+25. `run_phase5.sh`
+26. `PHASE4_LUT_EXPERIMENT_LOG.md`
+27. `scripts/`：34 个旧脚本
+28. `tests/`：37 个旧测试文件
+29. `reports/`：22 个旧报告文件
+30. `runs/`：655 个旧运行文件
+31. `logs/`：2 个根日志文件
+32. `chkpts/`：20 个根 checkpoint 文件
+33. `bi_workdir/`：旧完整工作目录
+34. `train_acc.txt`
+35. `train_loss.txt`
+36. `val_acc.txt`
+37. `val_loss.txt`
+38. `test_acc.txt`
+39. `test_loss.txt`
+40. `pixel_mean.pt`
+41. `__pycache__/`
+42. `complexPyTorch/__pycache__/`
+
+主归档完成后的静态扫描又发现 `build/` 是旧源码的 generated package 副本，仍含旧 Phase 3/4/5 内容。因此：
+
+- `archive_legacy_routes.py` 增加可复用的 `--supplement` 机制。
+- `build/` 被作为 supplement 移至 `legacy_tree/build/`。
+- supplement 同样写入 `archive_manifest.json`。
+- 活动树不再存在这份陈旧 generated source。
+
+目录型记录内部的每个文件均按原相对路径原样移动；完整逐文件定位以 manifest 和 `legacy_tree/` 为准。
+
+### 4. 归档支持文件
+
+- `backup/route_reset_phase12_20260729/archive_legacy_routes.py`
+  - dry-run-first 的归档工具。
+  - 支持首次归档和后续 `--supplement`。
+  - 新增路径规范化，拒绝绝对路径和 `..` 越界。
+- `backup/route_reset_phase12_20260729/archive_manifest.json`
+  - 记录 42 个主路径、retained snapshots、恢复的 Phase 1/2 资产和 `build/` supplement。
+- `backup/route_reset_phase12_20260729/README.md`
+  - 说明归档结构、旧任务最终状态、重要路径和恢复方法。
+- `backup/route_reset_phase12_20260729/restore_legacy_path.py`
+  - 可选择单文件或目录恢复。
+  - 默认 dry run。
+  - 只复制，不删除归档内容。
+  - 目标存在时拒绝覆盖。
+- `backup/route_reset_phase12_20260729/fixed_analytic_final_summary.md`
+  - 由统一日志分析脚本生成的中断任务最终摘要。
+- `backup/route_reset_phase12_20260729/legacy_tree/runs/fixed_analytic_dominance_from_phase1_cmpbeta1_e200/route_reset_snapshot.md`
+  - epoch 174 时的停止前现场记录。
+- `retained_snapshots/`
+  - 保存重置前的 `README.md`、`CHANGELOG.md`、`run_training.sh`、`complexLayers.py` 和 `lut_backend.py` 快照。
+
+此前已有的 `backup/magnitude_lut5_20260714/` 保持原样，没有覆盖或搬动。
+
+### 5. 保留并恢复的 Phase 1/2 资产
+
+从归档的旧 `bi_workdir/` 中复制回活动树：
+
+- `bi_workdir/chkpts/Bestmodel_phase1.pt`
+- `bi_workdir/chkpts/Bestmodel_phase2.pt`
+- `bi_workdir/pixel_mean.pt`
+- `bi_workdir/phase_metrics.json`
+
+`phase_metrics.json` 已过滤为只含 `phase1` 和 `phase2`。
+
+保留基线：
+
+- Phase 1：best validation 0.9092，test 0.8948，epoch 170
+- Phase 2：best validation 0.8310，test 0.8221，epoch 126
+
+### 6. 活动代码逐文件变更
+
+- `complexPyTorch/complexBinaryResNet.py`
+  - 从旧多路线 router 重建为 Phase 1/2-only model。
+  - `ACTIVE_PHASES=(1, 2)`。
+  - Phase 1 block 使用 `ComplexReLU + ComplexConv2d`。
+  - Phase 2 block 使用 `BinaryComplexActivation + BinaryComplexConv2d`。
+  - Phase 1/2 保持相同 state-dict key 和 tensor shape。
+  - Phase 3+ 构造会直接报错。
+  - 删除活动模型对 C8、MLP、LUT5/LUT6 和实验 flow module 的依赖。
+
+- `training.py`
+  - 从旧 4800+ 行多路线 trainer 重建为 Phase 1/2-only trainer。
+  - CLI 的 `--phase` choices 只有 1 和 2。
+  - 删除 LUT/C8/MLP/Phase 3+ 参数与调度入口。
+  - 删除 `bireal_tune` 隐式参数覆盖。
+  - `batch_size`、`num_epochs`、`lr`、optimizer 和 schedule 始终服从外部参数。
+  - schedule 只保留 `bireal`、`cosine`、`constant`。
+  - warmup 只增长到用户设置的 base LR，不会放大到另一个固定值。
+  - cosine 对数值误差做上限钳制，严格不超过 base LR。
+  - Phase 2 默认要求 Phase 1 checkpoint；支持显式 `--checkpoint` 和 `--train-from-scratch`。
+  - checkpoint loader 去除 `module.`/`_orig_mod.` wrapper，按 key 和 shape 映射，并要求所有 trainable parameters 成功加载。
+  - 每个 epoch 原子保存 `Lastmodel_phaseN.pt`。
+  - best 保存为 `Bestmodel_phaseN.pt`，不会再使用跨 phase 的共享名字。
+  - history 文件也增加 phase 前缀。
+  - DDP rank 0 使用 unwrapped model 做验证，避免单 rank 进入 DDP forward 同步。
+  - compile 请求仍支持；complex operator 下将 inductor 路由到 `aot_eager`。
+  - CIFAR10/CIFAR100/SVHN、validation split、no-validation、pixel mean 和 augmentation 基线保留。
+
+- `run_training.sh`
+  - 保留为通用 Phase 1/2 launcher。
+  - 默认 dataset/workdir 改为 repository-relative 明确目录。
+  - DDP 统一使用选定 `PYTHON_BIN -m torch.distributed.run`。
+  - compile 默认关闭。
+  - 使用 `exec` 让退出码和信号正确传递。
+
+- `run_phase1.sh`
+  - 新增 Phase 1 专用入口。
+  - 支持 `GPU_ID`、`WORKDIR`、`DATADIR`、`NUM_EPOCHS`、`BATCH_SIZE`、`LR`、`SCHEDULE`、`WEIGHT_DECAY` 等环境变量。
+  - 可选显式 Phase 1 warm-start checkpoint。
+
+- `run_phase2.sh`
+  - 新增 Phase 2 专用入口。
+  - 默认 checkpoint 为 `bi_workdir/chkpts/Bestmodel_phase1.pt`。
+  - 支持 `CHECKPOINT` 覆盖和 `TRAIN_FROM_SCRATCH=1`。
+  - 支持 binary weight scale 配置。
+  - 默认 workdir 与 Phase 1 分离。
+
+- `scripts/analyze_training_run.py`
+  - 新增统一训练日志分析器。
+  - 解析 epoch train/validation/test 指标、配置、完成状态、best validation、best test 和 last。
+  - 同一个日志含多次 invocation 时，只分析最后一次运行。
+  - 支持 Markdown/JSON 和 `--output`。
+
+- `scripts/append_experiment_log.py`
+  - 新增统一日志追加工具。
+  - 支持 body/body-file/stdin、日期和 dedupe key。
+  - 本条记录即通过该脚本写入。
+
+- `scripts/audit_active_route.py`
+  - 新增活动路线审计。
+  - 检查训练 phase 集合、活动 phase launcher、实验 module 是否退出活动树。
+  - 检查 Phase 1/2 model 不实例化 LUT。
+  - 同时检查保留的 LUT layer 仍可导入。
+
+- `scripts/__init__.py`
+  - 将新维护脚本目录定义为可测试的 Python package。
+
+- `tests/test_phase12_route.py`
+  - 覆盖 Phase choices、实验 CLI 清理、model layer 类型、state key 一致性、checkpoint 全量映射、Phase 1/2 前后向、LR 上限和 LUT layer 保留。
+
+- `tests/test_log_tools.py`
+  - 覆盖最新 invocation 日志解析和实验日志 dedupe。
+
+- `tests/__init__.py`
+  - 定义当前测试 package。
+
+- `README.md`
+  - 首页增加当前 Phase 1/2 路线、运行命令、归档入口和 LUT layer 保留说明。
+
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - 新增当前技术路线契约。
+  - 记录 phase 定义、转换规则、默认参数、输出文件、并发 workdir 约束、基线、归档和验证命令。
+
+- `EXPERIMENT_LOG.md`
+  - 新建活动路线实验总日志。
+  - 旧完整历史保存在归档的 `PHASE4_LUT_EXPERIMENT_LOG.md`，不再继续向旧日志追加。
+
+### 7. 明确保留且本次未改写的实现
+
+以下文件在进入清理前已有用户/前序实验改动。本次没有回退、没有重写，只按要求继续保留：
+
+- `complexPyTorch/complexLayers.py`
+- `complexPyTorch/lut_backend.py`
+- `lut_cuda/` 下的 source、binary 和 build artifacts
+
+这些文件仍可能包含 LUT4/LUT5/LUT6/C8 等实现，但它们现在只是未接入活动 Phase 1/2 的 building blocks。活动 router、trainer 和 launcher 均没有相应入口。
+
+导入 LUT backend 时会出现 PyTorch 关于 `torch.cuda.amp.custom_fwd/custom_bwd` 的 FutureWarning。该警告来自保留代码，不影响本次 Phase 1/2 路线审计，因此本次未顺手改动。
+
+### 8. 验证结果
+
+在 `lut_net` conda 环境中完成：
+
+- `python -m py_compile`：新的 trainer、model、分析脚本、审计脚本、归档与恢复脚本全部通过。
+- `bash -n`：`run_training.sh`、`run_phase1.sh`、`run_phase2.sh` 全部通过。
+- `python -m unittest discover -s tests -v`：10/10 tests passed。
+- Phase 1 和 Phase 2 model state-dict key 集合完全相同。
+- retained canonical Phase 1 checkpoint 含 258 个 tensor；258/258 全部映射到新的 Phase 2 model，0 unmatched、0 shape mismatch、0 missing buffer。
+- canonical model Phase 1/2 参数量均为 261,719。
+- 小模型 Phase 1/2 forward 和 backward 均成功。
+- route audit：
+  - active route exposes only Phase 1/2
+  - Phase 1/2 models instantiate no LUT modules
+  - retained LUT complex layers remain importable
+- selective restore tool dry-run 成功，未写入目标。
+- reusable analyzer 成功读取旧中断任务并识别 incomplete。
+- 进程扫描确认没有 retired experiment trainer/launcher 继续运行。
+- 验证过程生成的活动 `__pycache__` 已清除；历史 cache 仍保存在 archive 中。
+
+本次没有重新执行 200 epoch 的完整 Phase 1/2 训练；完整训练成本较高，兼容性由 canonical checkpoint 全量映射、前后向测试和已有基线指标覆盖。下一次真正训练后，应先运行 `scripts/analyze_training_run.py`，再基于生成摘要追加实验结论。
+
+### 9. 新路线的运行与分析规则
+
+Phase 1：
+
+```bash
+GPU_ID=0 WORKDIR=runs/phase1 ./run_phase1.sh
+```
+
+Phase 2：
+
+```bash
+GPU_ID=1 \
+WORKDIR=runs/phase2 \
+CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase1.pt \
+./run_phase2.sh
+```
+
+并发实验必须使用不同 `WORKDIR`。Phase-specific 文件名可避免 Phase 1 与 Phase 2 互相覆盖，但两个相同 phase 的并发任务如果共用同一 workdir，仍会覆盖各自的 best/last checkpoint。
+
+后续任何新技术路线应作为新的、显式命名的 flow 加入，并先与当前 Phase 1/2 baseline 对比；不要重新把旧实验分支塞回 Phase 1/2 router。每次修改文件均继续追加本日志，每次分析新 run 先调用统一分析脚本。
+
+<!-- experiment-entry:route-reset-phase12-final-verification -->
+## 2026-07-29 - Route-reset final verification supplement
+
+### 补充文件变更
+
+- `.gitignore`
+  - 新增 Python `__pycache__`、`*.pyc`、pytest/coverage cache 和 `*.egg-info` 忽略规则。
+  - 新增仅针对 repository root 的 `/build/`、`/runs/`、`/logs/`、`/chkpts/` 忽略规则。
+  - 不忽略 `backup/`、`bi_workdir/`、`*.pt`、LUT CUDA source 或现有二进制，因此归档与保留基线仍清晰可见。
+  - 目的：完成本次提交后，运行测试和训练不会再次用 generated cache/build output 污染活动源码状态。
+
+- `backup/route_reset_phase12_20260729/archive_legacy_routes.py` 与
+  `restore_legacy_path.py`
+  - 已设置 executable bit；所有 root launcher 和三个维护脚本也均确认可执行。
+
+### 最终补充验证
+
+- Phase 1 launcher 使用 `PYTHON_BIN=echo` dry-run：
+  - `GPU_ID=7`
+  - `NUM_EPOCHS=3`
+  - `BATCH_SIZE=16`
+  - `LR=0.007`
+  - `SCHEDULE=constant`
+  - 所有值原样进入 `training.py`，未发生覆盖。
+- Phase 2 launcher 使用 `PYTHON_BIN=echo` dry-run：
+  - `GPU_ID=6`
+  - `CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase1.pt`
+  - `NUM_EPOCHS=4`
+  - `BATCH_SIZE=32`
+  - `LR=0.009`
+  - `SCHEDULE=cosine`
+  - phase、checkpoint 与全部数值原样进入 `training.py`。
+- 最终 manifest JSON 可解析：
+  - primary moved paths：42
+  - supplement：`build/`，6 files，81,857 bytes
+  - restored Phase 1/2 assets：4
+- 活动 entrypoint retired-route 关键词扫描无结果。
+- 除 `legacy_tree/` 中有意保留的历史 cache 外，活动树没有 `__pycache__`。
+- 本次修改文件的 `git diff --check` 通过。
+- 全 worktree `git diff --check` 仍报告
+  `lut_cuda/lut_conv_binary_cuda_backend.cu` 第 290、327 行的既有 trailing whitespace；该文件属于用户此前保留的 LUT CUDA 改动，本次没有修改或回退。
+- 最终进程扫描无旧训练任务。
+
+<!-- experiment-entry:pair-lut-neuron-phase3-implementation -->
+## 2026-07-29 - LUT-as-neuron Phase 3 implementation
+
+### 1. 路线目标
+
+本次在保留 Phase 1/2 和旧 LUT building blocks 的前提下，新增全新的 Phase 3：从“LUT as operator + spatial weight 协同优化”切换为“LUT as neuron”。
+
+每个输出 channel 的 Phase 2 二值复数卷积核按 `[input_channel, ky, kx]` flatten，每两个复数权重组成一个 neuron。该 neuron 接收两个二值复数 activation，即 4 个输入 bit `[x0_r, x0_i, x1_r, x1_i]`，并通过共享输入的两张 4-LUT 分别输出 real/imag 1 bit。每个 output channel 和每个 flatten pair 都有独立、可学习的 real/imag truth table。
+
+### 2. Phase 2 到 Phase 3 初始化
+
+对每一对固定的 Phase 2 二值复数权重，遍历全部 16 种输入状态，直接计算：
+
+```text
+sum_r = x0_r*w0_r - x0_i*w0_i + x1_r*w1_r - x1_i*w1_i
+sum_i = x0_r*w0_i + x0_i*w0_r + x1_r*w1_i + x1_i*w1_r
+lut_r = 1[sum_r >= 0]
+lut_i = 1[sum_i >= 0]
+```
+
+Phase 2 latent weight 先按原 `complex_binary_weight` 语义取 sign；其 complex magnitude mean alpha 作为 Phase 3 固定 `output_scale` buffer。硬 LUT 输出按 `(count - pair_count/2) * 4 * alpha` 恢复为对称累加尺度。
+
+当 `C * K * K` 为奇数时，最后一组的第二个复数输入连接固定-low dummy bit，初始化时第二个数学权重为 0。因此这一尾组只有 4 个可达输入状态，不额外引入 spatial weight。
+
+canonical `bi_workdir/chkpts/Bestmodel_phase2.pt` 转换结果：
+
+- 18 个 residual main-path conv 全部转换成功。
+- 1934 个 flatten pair LUT neuron。
+- 7 层存在 odd tail。
+- 2,022,592 个 real+imag LUT entries。
+- source weight exact-zero component 为 0。
+- 初始化后 sign diff 为 0。
+- Phase 3 主干中没有 `conv_r/conv_i` spatial weight 参数。
+- Phase 3 总参数量为 2,031,663；增加来自独立 LUT logits，不是保留旧主卷积权重。
+
+### 3. 可微 LUT 与退火
+
+LUT logits 通过 `(tanh(logit * tau) + 1) / 2` 得到 soft entry。渐进 hard 使用：
+
+```text
+forward = soft + hard_ratio * stop_gradient(hard - soft)
+hard = 1[logit >= 0]
+```
+
+因此 forward 从 soft 连续混合到 hard，而 backward 在包括 `hard_ratio=1` 的 fully-hard 阶段仍沿 soft derivative 更新 LUT。输入 activation 在 forward 使用二值 bit，backward 使用 STE 回传到前层。
+
+默认 200 epoch：
+
+- epoch 1-160：`hard_ratio=0`，tau 从 0.5 几何退火到 10。
+- epoch 161-200：tau 固定 10，`hard_ratio` 从 1/40 逐步增加到 1。
+- epoch 200 是第一个 fully-hard training/evaluation epoch。
+- Phase 3 的 epoch 数若不足以到达 fully hard，会在训练开始前拒绝运行。
+- 只有 fully-hard epoch 可以更新 `Bestmodel_phase3.pt`；`Lastmodel_phase3.pt` 每个 epoch 正常保存。
+- checkpoint 额外保存显式 uint8 hard real/imag truth tables、初始化转换报告和 LUT sign-diff。
+- 每 10 epoch及 hard 阶段记录 tau、hard ratio、real/imag sign diff。
+
+LUT 参数使用独立 optimizer group，无 weight decay。默认 network LR 为 0.001 cosine，LUT LR 为 0.01 constant；两者均可从外部配置。
+
+### 4. 文件修改总结
+
+- `complexPyTorch/complexLayers.py`
+  - 新增 `annealed_binary_table`。
+  - 新增 `PairLUTNeuronConv2d`，包含 Phase2 truth-table 初始化、pair connection、odd-tail dummy、CPU reference、CUDA K=4 backend、soft/hard STE、sign diff 和 hard table 导出。
+  - 保留原有 `ComplexLUTConv2d`、`LUTAwareComplexBinaryConv2d` 等旧 building blocks。
+
+- `complexPyTorch/complexBinaryResNet.py`
+  - active phases 更新为 1/2/3。
+  - Phase 3 residual main conv 路由到 `PairLUTNeuronConv2d`。
+  - Phase 1/2 路由保持 full precision / binary；直接构造模型时默认根据 phase 推导 `is_binary`。
+  - 增加 LUT logit/tau 构造参数，不恢复旧实验 flow 参数。
+
+- `training.py`
+  - 新增严格的 Phase2-to-Phase3 converter。
+  - 新增 LUT optimizer group、独立 LR schedule、tau/hard-ratio scheduler、sign-diff 聚合和 hard table capture。
+  - Phase 3 禁止 from scratch，要求 Phase 2 checkpoint。
+  - 只允许 fully-hard 指标选择 best checkpoint。
+  - 增加全部 Phase 3 CLI 参数及启动前校验。
+
+- `run_phase3.sh`
+  - 新增可执行 launcher。
+  - 默认 canonical Phase2 checkpoint、200 epochs、160+40 annealing、network cosine LR 与 LUT constant LR。
+  - 所有关键配置均可由环境变量覆盖。
+
+- `tests/test_phase12_route.py`
+  - active route 断言更新为 Phase 1/2/3。
+  - 保留 Phase1/2 state-key 和 checkpoint 兼容测试。
+  - 新增 Phase3 类型及“无 spatial weight”断言。
+
+- `tests/test_pair_lut_phase3.py`
+  - 新增 16 状态 truth-table exact test。
+  - 新增 odd-tail dummy independence test。
+  - 新增 soft 与 fully-hard STE 下输入/LUT 双向梯度测试。
+  - 新增 Phase2 checkpoint 全层转换和默认退火终点测试。
+
+- `scripts/audit_active_route.py`
+  - 路线审计更新为仅暴露 Phase 1/2/3。
+  - 验证 Phase1/2 无 LUT，Phase3 仅使用 pair-LUT 且无主干 spatial weight，旧 LUT building blocks 仍可导入。
+
+- `README.md`
+  - 增加 Phase3 路线说明与启动命令。
+
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - 详细记录 pair-LUT 数学定义、flatten 顺序、odd-tail、尺度、退火、checkpoint 和命令契约。
+
+- `EXPERIMENT_LOG.md`
+  - 通过 `scripts/append_experiment_log.py` 追加本条，作为后续 Phase3 实验分析基线。
+
+### 5. 验证结果
+
+- Python 语法检查通过。
+- `run_phase3.sh`、`run_phase2.sh`、`run_training.sh` 的 `bash -n` 通过。
+- launcher dry-run 确认所有默认参数原样进入 `training.py`。
+- exhaustive 16-state truth table 与直接两次复数乘加+阈值结果完全一致，最大误差 0。
+- canonical full model 在 GPU 上 forward/backward 成功，输出 shape `(2, 10)` 且 finite。
+- 36 个 real/imag LUT parameter tensor 全部获得梯度，LUT gradient sum 约 1071.24。
+- CPU reference 与 CUDA K=4 kernel 对比：最大绝对误差约 `5.86e-6`，平均绝对误差约 `9.02e-7`。
+- 完整单元测试 15/15 passed。
+- active route audit passed。
+
+本次没有启动 200 epoch CIFAR-10 正式训练，因此尚无 Phase 3 accuracy 结论。第一组正式结果出来后，应先运行：
+
+```bash
+python scripts/analyze_training_run.py runs/phase3_pair_lut
+```
+
+再基于本条中的 sign diff、soft/hard transition 和 hard checkpoint 指标分析 LUT neuron 是否真正改变 truth table并带来收益。
+
+<!-- experiment-entry:pair-lut-phase3-random-scratch -->
+## 2026-07-29 - Phase 3 random initialization from scratch
+
+### 目标与行为
+
+按新实验要求，Phase 3 现在允许完全不读取 Phase 1/2 checkpoint，直接随机初始化整网训练。默认 checkpoint truth-table 初始化仍保留，只有显式设置 `--train-from-scratch` 或 launcher 环境变量 `TRAIN_FROM_SCRATCH=1` 时才使用新路径。
+
+scratch 模式下：
+
+- stem、projection、BN affine、classifier 等普通参数使用 PyTorch 原生随机初始化。
+- 每个 pair-LUT neuron 的 real/imag entry logits 独立采样自 `Normal(0, LUT_LOGIT_INIT)`。
+- 默认 `LUT_LOGIT_INIT=1.0`，此时它表示随机分布标准差，不是 Phase2 truth-table 模式下固定的绝对 logit magnitude。
+- 初始 hard truth table 由随机 logit sign 决定，理论上 0/1 各约 50%。
+- 随机初始 sign 被保存为 sign-diff baseline，因此 epoch 0 的 sign diff 为 0，后续统计仍表示相对本次随机起点发生的真值表变化。
+- 没有 Phase2 alpha 时，固定 `output_scale=1.0`。
+- soft-to-hard 的 160+40 默认退火、独立 LUT LR、hard-only best checkpoint 规则不变。
+- checkpoint 中使用 `phase3_initialization.mode=random_normal` 记录该实验来源，不会与 Phase2 truth-table 初始化混淆。
+
+### 文件修改
+
+- `complexPyTorch/complexLayers.py`
+  - `PairLUTNeuronConv2d` 新增 `initialize_random(logit_std)`。
+  - 随机初始化同步设置 logits、初始 sign、output scale 和 initialized buffer。
+  - Phase2 初始化报告增加 `mode=phase2_truth_table`，使两条路径可区分。
+
+- `training.py`
+  - 新增 `initialize_phase3_random`，遍历并初始化全部 pair-LUT 层。
+  - Phase3 的 `--train-from-scratch` 不再被禁止。
+  - 无 checkpoint 时必须显式初始化 LUT，避免零 logits 或未初始化 layer。
+  - checkpoint metadata 统一改为 `phase3_initialization`。
+
+- `run_phase3.sh`
+  - 新增 `TRAIN_FROM_SCRATCH=1` 分支。
+  - scratch 分支只传 `--train-from-scratch`，不再传 `--checkpoint`。
+  - 启动信息打印 random-normal 标准差，避免误认实验来源。
+
+- `tests/test_pair_lut_phase3.py`
+  - 新增随机分布均值/标准差、初始化状态、sign-diff baseline 和前后向测试。
+  - 新增 Phase3 scratch checkpoint resolver 测试。
+
+- `README.md`
+  - 增加随机从头训练的最短命令。
+
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - 将 Phase3 定义更新为 Phase2 truth-table 与 random-normal 两种显式初始化模式。
+  - 记录 scratch 参数和 output scale 语义。
+
+- `EXPERIMENT_LOG.md`
+  - 使用 `scripts/append_experiment_log.py` 追加本条。
+
+### 建议首轮命令
+
+```bash
+GPU_ID=0 \
+TRAIN_FROM_SCRATCH=1 \
+LUT_LOGIT_INIT=1.0 \
+LUT_LR=0.01 \
+LR=0.001 \
+WORKDIR=runs/phase3_pair_lut_scratch_std1 \
+./run_phase3.sh
+```
+
+这是结构变化较大的实验：不再继承 Phase2 的 82% 左右起点，早期准确率明显更低属于预期。判断价值时应重点观察训练是否持续上升、LUT sign diff 是否增长、以及最终 fully-hard epoch 是否恢复，而不能用最初几个 epoch 直接与 checkpoint fine-tuning 比较。
+
+<!-- experiment-entry:pair-lut-phase3-random-scratch-verification -->
+## 2026-07-29 - Phase 3 random scratch verification supplement
+
+### LR 补充
+
+完整从头训练不再沿用 checkpoint fine-tuning 的 network LR。run_phase3.sh 现在按模式选择默认值：
+
+- TRAIN_FROM_SCRATCH=1：network LR=0.01。
+- Phase2 checkpoint 初始化：network LR=0.001。
+- 两种模式的 LUT LR 默认均为 0.01 constant。
+- 外部显式设置 LR 时始终覆盖上述默认值。
+
+因此 scratch 首轮正式命令以 LR=0.01 为准；上一条记录命令中的 LR=0.001 已被本补充替代。
+
+### 最终验证
+
+- canonical-size 随机 Phase3：18 层、1934 个 pair-LUT neuron 全部成功初始化。
+- GPU full-model batch-2 forward/backward 成功，输出 shape (2, 10) 且全部 finite。
+- LUT gradient sum 约 281.15。
+- 完整测试 17/17 passed。
+- active route audit passed。
+- scratch launcher dry-run 确认参数包含 --train-from-scratch，不包含 --checkpoint，network LR 为 0.01，LUT LR 为 0.01。
+- 本次相关文件 git diff --check 通过。
+
+最终建议命令：
+
+```bash
+GPU_ID=0 \
+TRAIN_FROM_SCRATCH=1 \
+LUT_LOGIT_INIT=1.0 \
+LUT_LR=0.01 \
+LR=0.01 \
+WORKDIR=runs/phase3_pair_lut_scratch_std1 \
+./run_phase3.sh
+```
+
+<!-- experiment-entry:real-versus-complex-pair-lut-comparison -->
+## 2026-07-29 - Real LUT-BiReal versus complex pair-LUT comparison
+
+### 对比对象
+
+读取并对照了实数工程 ~/workspace/LutNet/cifar10_bireal 中的 train.py、lut_birealnet.py 和实际存在的 lut_layer_main_compile.py，并使用新脚本解析 log_2x.txt、log_2x_baseline.txt、log_2x_baseline_3values.txt、log_lr0p01.txt。用户提到的 lut_layer_main_compiler.py 实际文件名是 lut_layer_main_compile.py。
+
+### 实数 LUT-BiReal 的关键训练机制
+
+- 每个 residual block 使用 BinaryActivation -> lut_conv_group -> BatchNorm -> residual add。
+- activation forward 是 0/1 hard bit，backward 是 Bi-Real piecewise surrogate。
+- 每个 LUT 默认 6 输入、1 输出，64-entry；一个 3x3 patch flatten 后每 6 个 scalar bit 分组，各 LUT 输出求和。
+- LUT logits 使用双峰初始化：50% 来自 Normal(-1, 0.2)，50% 来自 Normal(+1, 0.1)。这使初始 hard table 约 50/50，但 entry 几乎都远离 0。
+- BasicBlock 构造后立即 hard.fill_(1)，所以从第一个 epoch 开始 forward 就是物理 0/1 truth table。
+- hard LUT backward 使用 (hard - logits).detach() + logits，对 logit 的代理导数恒等于 1；没有 tanh 饱和。
+- optimizer 是 Adam，LUT 和其他参数共用 LR；默认无 weight decay。
+- 没有 clip_grad_norm 或 clip_grad_value。
+- LR 使用线性衰减；训练 256 epoch。
+- 使用全部 50k CIFAR-10 train、标准 mean/std normalize、RandomCrop、flip、CIFAR10 AutoAugment 和 label smoothing 0.1。
+
+### 历史曲线
+
+可复用脚本 scripts/analyze_real_lut_bireal_log.py 的结果：
+
+- log_2x.txt（LUT）：epoch 1/5/10/20/50/100/150/256 为 23.02/34.68/41.76/48.83/69.34/76.59/80.39/83.47%，best 83.47%。
+- log_lr0p01.txt（LUT，未完整结束）：epoch 1/5/10/20/50/100 为 23.17/34.60/46.63/55.46/74.79/85.06%，epoch 132 best 87.50%。
+- log_2x_baseline.txt：best 81.45%。
+
+当前复数 random scratch run runs/phase3_pair_lut_scratch_std1 在 epoch 20：train 31.78%，val 34.66%，test 33.76%。它并非完全没有学习，但明显慢于实数 LUT 同期 48.83%-55.46%。
+
+### 最关键差异与诊断
+
+1. 优化器不一致。
+   实数 LUT 使用 Adam；当前复数 run 使用 SGD。LUT 有 2,022,592 个独立 entry，单 batch 对 entry 的更新具有稀疏、尺度不均特性，Adam 的 per-entry 自适应步长比 SGD 更匹配。
+
+2. 全局 gradient clipping 严重压缩 LUT 更新。
+   当前复数训练默认 clipnorm=1、clipval=1，实数版本完全不裁剪。canonical-size batch-16 诊断得到：LUT raw L2=1.769，其他参数 L2=23.878，全局 L2=23.944，因此 clip coefficient 仅 0.04176。LUT mean |grad|=3.28e-4，经 clipping 和 SGD LR=0.01 后，典型单步更新约 1.37e-7。这个量级无法让 Normal(0,1) logits 有效跨 0。
+
+3. 当前 LUT 的离散 truth table 几乎没有学习。
+   epoch 1 sign diff 29/2,022,592；epoch 11 仅 278/2,022,592，即 0.0137%。准确率上升主要可能来自 stem、projection、BN 和 classifier 对近似随机 LUT feature 的适配，而不是 LUT operation 本身改变。
+
+4. hard/soft 和代理梯度完全不同。
+   实数版本从 epoch 1 就 hard-forward，部署目标与训练 forward 一致，同时 logit backward 恒等于 1。当前复数版本前 160 epoch soft-forward，之后才渐进 hard，并且即使 fully hard，backward 仍是 tanh soft derivative。tau 增大后，远离 0 的 logits 会梯度饱和。这会重现此前“LUT sign 不动”的问题。
+
+5. 初始化不同。
+   实数版本是稳定的 bimodal ±1 初始化；当前复数是 Normal(0,1)，约 38% entry 落在 |logit|<0.5。若切 hard identity STE，后者可能产生过多早期翻转；若保持 soft+tanh，又会形成长期连续 surrogate 与最终 hard table 的目标错位。
+
+6. 数据和训练 recipe 也更强。
+   实数版本有 Adam、256 epoch、全 50k train、AutoAugment、标准差 normalize、label smoothing；当前复数是 45k train、200 epoch、较弱 augmentation、无 label smoothing。这能解释部分 generalization gap，但不能解释 sign diff 几乎为 0；LUT 更新机制仍是第一优先级。
+
+### 判断与下一步优先级
+
+当前 run 可以继续用于证明 soft-SGD 路径的上限，但不适合作为“随机 LUT 能否从头训练”的公平结论。最优先应做一个 real-compatible controlled branch，而不是先改复数数学结构：
+
+1. LUT 和普通参数改用 Adam，先用统一 LR=0.001 或对 LUT 单独 0.001。
+2. 关闭 global clipnorm/clipval，或至少将 LUT 排除在普通参数的全局裁剪之外。
+3. 增加 bimodal random init：Normal(-1,0.2)/Normal(+1,0.1)。
+4. 增加 hard-forward + identity-logit-STE 模式，第一 epoch 就使用 hard table，不做 tau annealing。
+5. 保持当前 4-input/2-output complex pair-LUT 结构不变，先隔离训练 recipe 的影响。
+6. 记录每 epoch LUT grad norm、update norm、sign diff；若这条 real-compatible 模式仍失败，再检查复数双输出、ComplexBN 或 pair grouping 的结构影响。
+
+建议下一组实验与当前 run 并行，而不是立刻覆盖：一组严格复现实数 recipe（Adam + no clipping + bimodal + hard identity STE），一组只改 Adam + no clipping，以做消融。
+
+### 文件修改
+
+- scripts/analyze_real_lut_bireal_log.py：新增可复用实数 LUT 日志解析器，输出 epoch 数、best/last、LR 首尾和固定 milestone accuracy。
+- EXPERIMENT_LOG.md：使用 scripts/append_experiment_log.py 追加本次对比分析。
+
+本次只做分析和日志工具，没有修改当前正在运行的 Phase3 数学或训练行为，也没有停止现有 run。
+
+<!-- experiment-entry:phase3-real-compatible-20260729 -->
+## 2026-07-29 - Phase3 real-compatible 训练机制对照分支
+
+### 动机与可检验假设
+
+对照 ~/workspace/LutNet/cifar10_bireal 后，当前复数 pair-LUT 从头训练较慢不能直接归因于复数 4-input/2-output 结构。现有 run 同时存在 SGD、全局 clipnorm=1、Normal(0,1)、长 soft annealing 等配方差异。一次 canonical-size 梯度诊断中，LUT raw L2=1.769、其他参数 L2=23.878、全局 L2=23.944，因此全局裁剪系数约为 0.04176；SGD LR=0.01 下典型 LUT entry 更新只有约 1.37e-7。epoch 11 的 sign diff 也只有 278/2,022,592（0.0137%）。
+
+本次新增隔离的 real-compatible 分支。假设是：如果训练不动主要来自优化配方，那么 hard-forward identity STE + Adam + no clipping 应显著增加 LUT sign diff，并加快前 20-50 epoch 的准确率增长；如果 sign diff 已明显增加但准确率仍低，下一步才应优先检查复数双输出、pair grouping、ComplexBN 或累加尺度等结构差异。
+
+### 对照模式的数学行为
+
+- 复数结构保持不变：每个 pair-LUT neuron 仍接收两个二值复数 activation，即 4 bit，共享地址并分别输出 real/imag 两个 bit。
+- LUT 前向从 epoch 1 起严格 hard：entry 为 1[logit >= 0]。
+- LUT 反向使用 identity-logit STE：(hard - logit).detach() + logit，因此 LUT entry 对自身 logit 的局部导数恒为 1，不再经过 tanh 饱和。
+- real-compatible 模式不使用 tau annealing 或 hard transition；所有 epoch 都满足硬件可部署 forward，可参与 best checkpoint 选择。
+- scratch LUT 初始化为 50/50 双峰混合：N(-1,0.2) 与 N(+1,0.1)。原 Normal(0,std) 与原 annealing 模式保留为默认，不受影响。
+
+### 专用训练配方
+
+run_phase3_real_compatible.sh 默认参数：
+
+- train from scratch，256 epochs，单卡全局 batch size 256；
+- Adam；普通参数 LR=0.01，LUT LR=0.01；
+- 两组 LR 都使用从 base LR 开始、逐 epoch 线性下降的 schedule；
+- weight decay=0，clipnorm=0，clipval=0；
+- CIFAR-10 RandomCrop + horizontal flip + AutoAugment，标准 mean/std normalize；
+- label smoothing=0.1；
+- 使用全部 50k train，不设 validation，以复现实数代码的数据协议。
+
+命令：
+
+```bash
+GPU_ID=1 \
+WORKDIR=runs/phase3_pair_lut_real_compatible \
+./run_phase3_real_compatible.sh
+```
+
+注意：no-validation 模式使用 test accuracy 选择 best checkpoint，只适合训练机制复现实验，不能作为无偏最终 test 报告。真正架构比较仍应另跑保留 validation 的版本。
+
+### 观察指标
+
+1. 每 10 epoch 的 Pair-LUT Sign Diff 数量与比例，必须明显高于 annealing+SGD run 的 0.0137%（epoch 11）。
+2. epoch 10/20/50 accuracy 与实数 LUT 日志 milestone 46.63%/55.46%/74.79% 对照，但只作为优化速度参考，因为网络拓扑和复数双输出不同。
+3. hard forward 从 epoch 1 开始，因此不存在 soft accuracy 与部署 hard accuracy 的转换落差。
+4. 若 sign diff 仍接近 0，检查 Adam 实际 update norm 和地址 occupancy；若 sign diff 大量变化但 accuracy 剧烈波动，优先降低 LUT_LR，而不是重新引入全局 clipping。
+
+### 文件修改
+
+- complexPyTorch/complexLayers.py：为 PairLUTNeuronConv2d 增加 real_compatible hard identity STE；增加可配置双峰初始化；保留原 annealed_binary_table 默认行为。
+- complexPyTorch/complexBinaryResNet.py：将 lut_training_mode 从模型入口传递到所有 Phase3 pair-LUT 层。
+- training.py：增加 LUT init/training mode 参数、双峰配置、linear 普通/LUT schedule、label smoothing、real_lut CIFAR-10 augmentation；real-compatible 从 epoch 1 标记 fully hard；scratch initializer 记录具体初始化元数据。
+- run_phase3.sh：暴露 optimizer、clipping、augmentation、label smoothing、LUT training/init mode 和双峰参数；支持 NO_VALIDATION。
+- run_phase3_real_compatible.sh：新增一键对齐实数 LUT-BiReal 配方的独立启动器。
+- tests/test_pair_lut_phase3.py：新增 hard 0/1 forward、identity gradient、双峰统计、首轮 fully-hard 和 linear LR 测试。
+- tests/test_phase12_route.py：将 linear schedule 纳入不超过 base LR 的回归检查。
+- scripts/audit_active_route.py：将新的合法 Phase3 recipe wrapper 纳入 active-route 白名单。
+- README.md：增加对照模式命令、行为和 test-selection 风险说明。
+- CURRENT_TECHNICAL_ROUTE.md：记录 normal/bimodal 初始化、anneal/real-compatible 两条 Phase3 训练路径及完整配方。
+- EXPERIMENT_LOG.md：通过 scripts/append_experiment_log.py 追加本条详细记录。
+
+### 验证
+
+- conda run -n lut_net python -m unittest discover -s tests -v：21/21 通过。
+- conda run -n lut_net python scripts/audit_active_route.py：通过。
+- bash -n run_phase3.sh run_phase3_real_compatible.sh：通过。
+- 使用 PYTHON_BIN=/bin/echo dry run 核对，完整参数包含 Adam、LR/LUT_LR=0.01、linear、no clipping、bimodal、real_lut、label smoothing=0.1、no-validation 和 train-from-scratch。
+- git diff --check 的唯一告警来自用户此前保留的 lut_cuda/lut_conv_binary_cuda_backend.cu 两处尾随空格，本次没有修改该文件。

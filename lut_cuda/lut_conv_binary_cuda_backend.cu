@@ -287,6 +287,7 @@ torch::Tensor forward_implicit_ultimate(
     
     switch (K) {
         DISPATCH_BINARY_FW(2) 
+        DISPATCH_BINARY_FW(3) 
         DISPATCH_BINARY_FW(4) 
         DISPATCH_BINARY_FW(5) 
         DISPATCH_BINARY_FW(6)
@@ -323,6 +324,7 @@ std::vector<torch::Tensor> backward_ultimate(
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, grad_y_c.scalar_type(), "lut_bw", [&] {
         switch(K) {
             DISPATCH_BINARY_BW(2) 
+            DISPATCH_BINARY_BW(3) 
             DISPATCH_BINARY_BW(4) 
             DISPATCH_BINARY_BW(5) 
             DISPATCH_BINARY_BW(6)

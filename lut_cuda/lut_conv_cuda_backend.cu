@@ -259,6 +259,7 @@ torch::Tensor forward_implicit(torch::Tensor x, torch::Tensor w, torch::Tensor o
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, x_cl.scalar_type(), "lut_fw", [&] {
         switch (K) {
             DISPATCH_FP32_FW(2)
+            DISPATCH_FP32_FW(3)
             DISPATCH_FP32_FW(4)
             DISPATCH_FP32_FW(5)
             DISPATCH_FP32_FW(6)
@@ -285,6 +286,7 @@ std::vector<torch::Tensor> backward_implicit(torch::Tensor grad_y, torch::Tensor
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, grad_y_cl.scalar_type(), "lut_bw", [&] {
         switch (K) {
             DISPATCH_FP32_BW(2)
+            DISPATCH_FP32_BW(3)
             DISPATCH_FP32_BW(4)
             DISPATCH_FP32_BW(5)
             DISPATCH_FP32_BW(6)

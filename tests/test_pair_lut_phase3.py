@@ -1,0 +1,258 @@
+import argparse
+import tempfile
+import unittest
+from pathlib import Path
+
+import torch
+
+import training
+from complexPyTorch.complexBinaryResNet import BinaryComplexResNet
+from complexPyTorch.complexLayers import (
+    PairLUTNeuronConv2d,
+    annealed_binary_table,
+)
+
+
+class PairLUTNeuronTests(unittest.TestCase):
+    def test_random_initialization_is_trainable_and_records_baseline(self):
+        torch.manual_seed(11)
+        model = BinaryComplexResNet(
+            in_channels=3,
+            num_blocks=1,
+            start_filters=2,
+            num_classes=10,
+            is_sar_input=False,
+            phase=3,
+        )
+        report = training.initialize_phase3_random(model, logit_std=0.7)
+        self.assertEqual(report["mode"], "random_normal")
+        self.assertEqual(report["layers"], 6)
+        self.assertEqual(training.pair_lut_sign_diff(model)["total"], 0)
+        logits = torch.cat(
+            [
+                parameter.detach().flatten()
+                for name, parameter in model.named_parameters()
+                if name.endswith(("lut_r", "lut_i"))
+            ]
+        )
+        self.assertAlmostEqual(logits.mean().item(), 0.0, delta=0.08)
+        self.assertAlmostEqual(
+            logits.std(unbiased=False).item(),
+            0.7,
+            delta=0.08,
+        )
+        model(torch.randn(1, 3, 32, 32)).square().mean().backward()
+
+    def test_phase3_train_from_scratch_needs_no_checkpoint(self):
+        args = training.parse_args(
+            ["--phase", "3", "--train-from-scratch"]
+        )
+        self.assertEqual(training._resolve_initial_checkpoint(args), (None, None))
+
+    def test_bimodal_initialization_matches_real_lut_recipe(self):
+        torch.manual_seed(17)
+        layer = PairLUTNeuronConv2d(8, 8, kernel_size=3)
+        report = layer.initialize_bimodal()
+        logits = torch.cat([layer.lut_r.flatten(), layer.lut_i.flatten()])
+        negative = logits[logits < 0.0]
+        positive = logits[logits >= 0.0]
+        self.assertEqual(report["mode"], "bimodal")
+        self.assertAlmostEqual(negative.mean().item(), -1.0, delta=0.03)
+        self.assertAlmostEqual(
+            negative.std(unbiased=False).item(),
+            0.2,
+            delta=0.03,
+        )
+        self.assertAlmostEqual(positive.mean().item(), 1.0, delta=0.03)
+        self.assertAlmostEqual(
+            positive.std(unbiased=False).item(),
+            0.1,
+            delta=0.03,
+        )
+        self.assertAlmostEqual(
+            positive.numel() / float(logits.numel()),
+            0.5,
+            delta=0.03,
+        )
+
+    def test_real_compatible_table_is_hard_with_identity_logit_ste(self):
+        logits = torch.tensor([-2.0, -0.1, 0.0, 3.0], requires_grad=True)
+        table = annealed_binary_table(
+            logits,
+            tau=100.0,
+            hard_ratio=0.0,
+            training_mode="real_compatible",
+        )
+        torch.testing.assert_close(
+            table,
+            torch.tensor([0.0, 0.0, 1.0, 1.0]),
+        )
+        table.sum().backward()
+        torch.testing.assert_close(logits.grad, torch.ones_like(logits))
+
+    def test_initialized_truth_table_matches_two_complex_products(self):
+        layer = PairLUTNeuronConv2d(2, 1, kernel_size=1)
+        weight_r = torch.tensor([[[[1.0]], [[-1.0]]]])
+        weight_i = torch.tensor([[[[1.0]], [[1.0]]]])
+        layer.initialize_from_phase2_weights(weight_r, weight_i)
+        layer.hard_ratio.fill_(1.0)
+
+        bits = torch.tensor(
+            [
+                [((state >> shift) & 1) * 2 - 1 for shift in (3, 2, 1, 0)]
+                for state in range(16)
+            ],
+            dtype=torch.float32,
+        )
+        inputs = torch.complex(
+            bits[:, (0, 2)].reshape(16, 2, 1, 1),
+            bits[:, (1, 3)].reshape(16, 2, 1, 1),
+        )
+        output = layer(inputs)
+        sum_r = bits[:, 0] - bits[:, 1] - bits[:, 2] - bits[:, 3]
+        sum_i = bits[:, 0] + bits[:, 1] + bits[:, 2] - bits[:, 3]
+        alpha = torch.tensor(2.0 ** 0.5)
+        expected = torch.complex(
+            torch.where(sum_r >= 0, 2 * alpha, -2 * alpha),
+            torch.where(sum_i >= 0, 2 * alpha, -2 * alpha),
+        ).reshape(16, 1, 1, 1)
+        torch.testing.assert_close(output, expected)
+
+    def test_odd_tail_uses_constant_low_dummy_input(self):
+        layer = PairLUTNeuronConv2d(1, 1, kernel_size=1)
+        layer.initialize_from_phase2_weights(
+            torch.ones(1, 1, 1, 1),
+            torch.ones(1, 1, 1, 1),
+        )
+        real = layer.initial_lut_r_sign[0]
+        imag = layer.initial_lut_i_sign[0]
+        for state in range(4):
+            values = list(range(state * 4, state * 4 + 4))
+            self.assertTrue(
+                torch.equal(real[values, 0], real[values[0], 0].expand(4))
+            )
+            self.assertTrue(
+                torch.equal(imag[values, 0], imag[values[0], 0].expand(4))
+            )
+
+    def test_soft_and_hard_ste_reach_inputs_and_entries(self):
+        for hard_ratio in (0.0, 1.0):
+            with self.subTest(hard_ratio=hard_ratio):
+                layer = PairLUTNeuronConv2d(2, 1, kernel_size=1)
+                layer.initialize_from_phase2_weights(
+                    torch.randn(1, 2, 1, 1),
+                    torch.randn(1, 2, 1, 1),
+                )
+                layer.hard_ratio.fill_(hard_ratio)
+                real = torch.randn(2, 2, 2, 2, requires_grad=True)
+                imag = torch.randn(2, 2, 2, 2, requires_grad=True)
+                output = layer(torch.complex(real, imag))
+                output.abs().mean().backward()
+                self.assertGreater(real.grad.abs().sum().item(), 0.0)
+                self.assertGreater(imag.grad.abs().sum().item(), 0.0)
+                self.assertGreater(layer.lut_r.grad.abs().sum().item(), 0.0)
+                self.assertGreater(layer.lut_i.grad.abs().sum().item(), 0.0)
+
+    def test_phase2_checkpoint_converts_every_main_convolution(self):
+        phase2 = BinaryComplexResNet(
+            in_channels=3,
+            num_blocks=1,
+            start_filters=2,
+            num_classes=10,
+            is_sar_input=False,
+            phase=2,
+        )
+        phase3 = BinaryComplexResNet(
+            in_channels=3,
+            num_blocks=1,
+            start_filters=2,
+            num_classes=10,
+            is_sar_input=False,
+            phase=3,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "phase2.pt"
+            torch.save({"phase": 2, "model": phase2.state_dict()}, path)
+            _, report = training.initialize_phase3_from_phase2(phase3, path)
+        self.assertEqual(report["layers"], 6)
+        self.assertTrue(
+            all(
+                bool(module.initialized)
+                for module in phase3.modules()
+                if isinstance(module, PairLUTNeuronConv2d)
+            )
+        )
+        self.assertEqual(training.pair_lut_sign_diff(phase3)["total"], 0)
+        phase3(torch.randn(1, 3, 32, 32)).abs().mean().backward()
+
+    def test_annealing_reaches_fully_hard_on_final_default_epoch(self):
+        model = BinaryComplexResNet(
+            in_channels=3,
+            num_blocks=1,
+            start_filters=2,
+            num_classes=10,
+            is_sar_input=False,
+            phase=3,
+        )
+        args = argparse.Namespace(
+            phase=3,
+            lut_anneal_epochs=160,
+            lut_hard_transition_epochs=40,
+            lut_tau_min=0.5,
+            lut_tau_max=10.0,
+        )
+        start = training.update_pair_lut_annealing(model, 0, args)
+        transition = training.update_pair_lut_annealing(model, 160, args)
+        final = training.update_pair_lut_annealing(model, 199, args)
+        self.assertEqual(start["hard_ratio"], 0.0)
+        self.assertAlmostEqual(transition["hard_ratio"], 1.0 / 40.0)
+        self.assertTrue(final["fully_hard"])
+        self.assertAlmostEqual(final["tau"], 10.0)
+
+    def test_real_compatible_mode_is_fully_hard_from_epoch_one(self):
+        model = BinaryComplexResNet(
+            in_channels=3,
+            num_blocks=1,
+            start_filters=2,
+            num_classes=10,
+            is_sar_input=False,
+            phase=3,
+            lut_training_mode="real_compatible",
+        )
+        args = argparse.Namespace(
+            phase=3,
+            lut_training_mode="real_compatible",
+            lut_tau_max=10.0,
+        )
+        state = training.update_pair_lut_annealing(model, 0, args)
+        self.assertTrue(state["fully_hard"])
+        self.assertEqual(state["hard_ratio"], 1.0)
+        self.assertTrue(
+            all(
+                module.hard_ratio.item() == 1.0
+                for module in model.modules()
+                if isinstance(module, PairLUTNeuronConv2d)
+            )
+        )
+
+    def test_linear_learning_rates_decay_without_warmup(self):
+        args = argparse.Namespace(
+            lr=0.01,
+            lut_lr=0.02,
+            num_epochs=100,
+            schedule="linear",
+            lut_schedule="linear",
+        )
+        self.assertEqual(training.learning_rate_for_epoch(0, args), 0.01)
+        self.assertAlmostEqual(
+            training.learning_rate_for_epoch(50, args),
+            0.005,
+        )
+        self.assertAlmostEqual(
+            training.lut_learning_rate_for_epoch(99, args),
+            0.0002,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
