@@ -817,3 +817,30 @@ scheduler 只有 epoch 编号上的一个极小边界差异，不足以解释 35
 2. **优化器消融**：若 checkpoint 初始化可行，再给当前 K4 pair-LUT 增加与旧复数训练完全一致的 LUT-follow-base bireal schedule，即 SGD base LR 0.1、前五 epoch 0.02->0.1、batch 128。当前代码的 LUT schedule 尚不支持 bireal/follow-base，不能只靠现有环境变量严格复现。
 3. **结构消融**：保持 K4/2-output 硬件约束，单独提供 real-style block：去掉 bn_pre、post 改为 real/imag 独立 BN、shortcut 使用 AvgPool+1x1。与当前 covariance-BN block 并行比较，避免把 LR 和拓扑同时改变。
 4. Adam LR=0.02 可以作为低优先级对照，但不应作为主实验；当前 sign flip 已经足够多，主要矛盾不是 entry 无法越零。
+
+<!-- experiment-entry:lut6-compression-prebn-correction-20260730 -->
+## 2026-07-30 - LUT6 压缩与 pre-BN 来源的结论修正
+
+### 对“6 输入压成 1 bit”的修正
+
+上一条记录把 LUT6 的六变量高阶交互能力直接表述成比当前 LUT4 更强，容易误导。正确比较必须拆成两个维度：
+
+1. **输出带宽/压缩率**：实数局部 LUT6 是 6 scalar input bits -> 1 bit，压缩率确实高；当前 pair-LUT 是两个复数，即 4 scalar input bits -> 2 bits，局部输出带宽更高、压缩更弱。从这个角度，不能说当前结构天然具有更严重的信息瓶颈。
+2. **单个布尔函数的交互阶数**：一个 LUT6 的单输出表有 64 entries，可表达任意六变量布尔函数；当前每个 real/imag LUT4 只有 16 entries，各自表达任意四变量函数。LUT6 可以直接建模六个输入之间的高阶交互，而当前只能在固定“两复数一组”内建模四变量交互。
+3. **层级输出并非最终 1 bit**：实数卷积 patch 被分成多个六输入组，每组各输出 1 bit，随后这些局部 bits 求和并进入 BN；不是整个 patch 被一个 LUT 压成 1 bit。当前也对多个 pair 的 real/imag bits 分别求和。因此两者都是“分组布尔函数 + 多组整数累加”，只是在组大小和每组输出数上不同。
+4. **结论**：LUT6 有更强的单组非线性交互但更窄的局部输出；LUT4 pair 有更宽的局部输出但更低的单组交互阶数。仅凭 6->1 与 4->2 不能判断哪个总体表达瓶颈更大，更不能把当前 49% 平台直接归因于表达能力。后续应优先用 Phase2 truth-table 初始化测试结构上限，再区分表达瓶颈与随机 hard-LUT 优化失败。
+
+### pre-BN 的历史来源
+
+Git 历史显示：
+
+- `complexPyTorch/complexBinaryResNet.py` 首次出现在 commit `228fb43 add binary`，从第一版起，单卷积 `BiRealComplexResidualBlock` 就是 `ComplexBN(pre) -> Sign -> BinaryComplexConv -> ComplexBN(post) -> residual add`。
+- 原始同期的全精度 `ComplexResidualBlock` 是两卷积 pre-activation 结构：`BN1 -> ReLU -> Conv1 -> BN2 -> ReLU -> Conv2 -> residual add`。它确实在每个卷积前使用 BN，但第二个卷积后、残差相加前没有额外 post-BN。
+- 二值改写把每个传统两卷积 block 展开成两个单卷积 Bi-Real blocks，同时既保留了每个单卷积前的 pre-BN，又新增 post-BN 来控制二值累加尺度。因此当前每个单卷积的双 BN 不是原始全精度 complex block 的严格等价展开，而是二值路线的主动设计。
+- 当前 Phase1/2/3 共用这个 block；Phase1 只把 Sign/BinaryConv 换成 ReLU/ComplexConv，仍保留 pre+post BN。旧 Phase1/2 的高精度已经证明 pre-BN 并不会让普通 complex/BNN 必然训崩。
+- 实数 LUT-BiReal block 没有 pre-BN，只有 `BinaryActivation -> LUT -> BatchNorm -> residual add`。因此 pre-BN 仍是 scratch pair-LUT 与实数参考的真实差异，可能通过持续重排 truth-table 地址和 complex covariance statistics 增加联合优化难度，但不能在没有消融实验时认定它是唯一原因。
+- pre-BN 对 Bi-Real surrogate 也有潜在正面作用：它把 sign 前输入拉回约单位尺度，使 `2(1-|x|)` 的非零梯度窗口得到更多覆盖。直接删除 pre-BN 可能减少梯度，必须作为独立开关消融，不能无条件删除。
+
+### 文件记录
+
+本条仅通过 `scripts/append_experiment_log.py` 更新 `EXPERIMENT_LOG.md`；没有修改模型、训练器或启动命令。
