@@ -758,3 +758,62 @@ WORKDIR=runs/phase3_pair_lut_real_aligned_binary_clean \
 ### 文件记录
 
 本条仅通过 `scripts/append_experiment_log.py` 更新 `EXPERIMENT_LOG.md`，记录验证和运行交接；没有修改模型数学、训练配置或 CUDA 实现。
+
+<!-- experiment-entry:phase3-pair-lut-stall-reference-diff-20260730 -->
+## 2026-07-30 - Phase3 pair-LUT 109 epoch 停滞与实数参考差异复核
+
+### 当前 run 的事实
+
+使用 `scripts/analyze_training_run.py` 预处理 `runs/phase3_pair_lut_real_aligned_binary_clean`。分析时任务仍在运行，已完成 109/256 epoch：
+
+- best test 49.12%（epoch 92）；
+- epoch 109：train 40.40%，test 49.04%；
+- epoch 20/50/75/100 test 分别为 47.86%/43.91%/48.07%/46.69%，已经形成长期平台，不是单纯收敛较慢；
+- LUT sign diff 从 epoch 1 的 0.0603% 增长到 epoch 20 的 8.2916%、epoch 50 的 15.0882%、epoch 100 的 20.0208%、epoch 104 的 20.2569%。
+
+因此“训不动”不是 LUT 参数没有更新。约五分之一 truth-table entry 已越过零点，但这些大量布尔变化没有形成更好的表示；继续降低 LR 的剩余 epoch 不太可能从 49% 自动跃迁到 80% 以上。
+
+### 0.02 的来源复核
+
+旧路线中表现较好的复数实验 `phase2p1_c8_octants_semantic_phase_beta2_bireal_lr01` 的真实 invocation 是：
+
+```
+--optimizer sgd --lr 0.1 --schedule bireal --batch-size 128
+```
+
+旧 bireal schedule 使用 5 epoch warmup，所以 epoch 1 打印 0.02，之后为 0.04、0.06、0.08，并从 epoch 5 起达到配置的 base LR 0.1。故记忆中的“初始 LR=0.02”是 SGD base LR=0.1 的首个 warmup 值，不是 Adam 固定 LR、LUT LR，也不是 bimodal logit 初始化尺度。
+
+实数 LUT-BiReal 的最好现存日志 `log_lr0p01.txt` 明确从 Adam LR=0.01 开始：epoch 1/5/10/20/50/100 为 23.17%/34.60%/46.63%/55.46%/74.79%/85.06%，best 87.50%。当前 run 已经正确复现了这个 0.01 Adam 配方。因此直接将当前 Adam LR 和 LUT LR 都翻倍到 0.02 不是“修正遗漏”，只是新的超参数实验；鉴于当前已有 20% sign flip，它也可能加剧无序翻转。
+
+### 已经对齐的部分
+
+- Adam，betas 0.9/0.999；
+- network/LUT 初始 LR 0.01，256 epoch 线性下降；
+- weight decay 0、无 gradient clipping；
+- batch size 256，对应每 epoch 196 batch；
+- CIFAR-10 RandomCrop、horizontal flip、AutoAugment、标准 mean/std；
+- label smoothing 0.1，全部 50k train、test selection；
+- bimodal logits：50/50 的 N(-1,0.2) 和 N(+1,0.1)；
+- hard forward + identity logit STE；
+- binary CUDA 对 LUT entry 和 activation 使用 neighboring-entry difference gradient。
+
+scheduler 只有 epoch 编号上的一个极小边界差异，不足以解释 35 个百分点的差距。weight decay 为 0 时，两边参数分组差异也不产生实际影响。
+
+### 尚未对齐且可能重要的部分
+
+1. **LUT 函数阶数不同**：实数实现每个 LUT 是 6 independent scalar bits -> 1 bit，有 64-entry 任意布尔函数；当前是两个完整复数 activation，即 4 correlated scalar bits -> real/imag 各 1 bit，每张表只有 16 entries。当前模型只能在固定两复数组内表达四变量交互，无法复现实数 LUT6 的六变量高阶交互。这是最大的表达能力差异。
+2. **Block 顺序不同**：实数 block 是 `BinaryActivation -> LUT -> BatchNorm -> residual add`；当前是 `ComplexBatchNorm(pre) -> BinaryComplexActivation -> pair-LUT -> ComplexBatchNorm(post) -> residual add`。额外 pre-BN 会改变每层 truth-table 地址分布。
+3. **BN 数学不同**：实数使用普通标量 BatchNorm（eps 1e-5，gamma 初始 1）；当前 post-BN 做 real/imag 2x2 协方差白化和交叉仿射，eps 1e-4，仿射对角初始 sqrt(2)。随机 hard truth table 不断翻转时，复数协方差统计和 LUT 同时移动，优化面明显更复杂。
+4. **下采样 shortcut 不同**：实数为 AvgPool2d(stride=2) 后接 stride-1 1x1 conv；当前直接使用 stride-2 complex 1x1 conv。两者不是等价采样。
+5. **输入和 stem 不同**：实数 RGB 直接进入实数 conv；当前先由 LearnImagBlock 生成虚部，再经全精度 complex stem。最后分类器也拼接 real/imag。这个结构保留了复数模型本身，但不能称为完全复制实数网络。
+6. **尾部 padding 不同**：实数 LUT6 分组不足时重复输入 bit；当前奇数个 complex spatial position 时使用固定 low dummy bit。影响范围较小，但仍是差异。
+7. **优化历史不同**：旧成功复数模型通常从 Phase1 checkpoint 开始，用 SGD+bireal schedule、batch 128；当前直接从随机 hard pair-LUT 开始，用 Adam+linear、batch 256。当前既不是旧复数训练路径，也只对齐了实数实现的训练 recipe，而没有对齐实数 LUT6 拓扑。
+
+### 判断与下一步优先级
+
+当前 run 可以停止；继续到 256 epoch 的信息增益很低。下一步不要先把所有 LR 机械改成 0.02，而应先回答“结构有能力、只是 scratch 难，还是 pair-LUT 压缩本身损失太大”：
+
+1. **首选诊断**：从最佳 Phase2 checkpoint 枚举初始化 pair-LUT，第一 epoch 就 hard-forward，然后观察转换后的 epoch-0/1 accuracy。如果一开始接近 Phase2，说明 pair-LUT 表达能力够，问题主要在随机 scratch 优化；如果立即降到很低，说明两复数压成一复数的局部表示本身是瓶颈。
+2. **优化器消融**：若 checkpoint 初始化可行，再给当前 K4 pair-LUT 增加与旧复数训练完全一致的 LUT-follow-base bireal schedule，即 SGD base LR 0.1、前五 epoch 0.02->0.1、batch 128。当前代码的 LUT schedule 尚不支持 bireal/follow-base，不能只靠现有环境变量严格复现。
+3. **结构消融**：保持 K4/2-output 硬件约束，单独提供 real-style block：去掉 bn_pre、post 改为 real/imag 独立 BN、shortcut 使用 AvgPool+1x1。与当前 covariance-BN block 并行比较，避免把 LR 和拓扑同时改变。
+4. Adam LR=0.02 可以作为低优先级对照，但不应作为主实验；当前 sign flip 已经足够多，主要矛盾不是 entry 无法越零。
