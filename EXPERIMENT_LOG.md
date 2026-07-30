@@ -1053,3 +1053,61 @@ GPU_ID=2 TRAIN_FROM_SCRATCH=0 CHECKPOINT=runs/phase2_scratch_real_recipe_nopre_c
 - 有结构先验的 LUT 初始化能否避开随机 hard LUT 的 50% 平台。
 
 若初始化后立即显著高于随机版本并能继续恢复，短期路线采用 Phase2 -> Phase3。若仍迅速降到约 50%，则 4-bit pairwise local function 本身是主要表示瓶颈，应转向 flatten scalar bits 后的 5-input/2-output LUT6_2 neuron。
+
+<!-- experiment-entry:phase2-pairlut-non-equivalence-20260730 -->
+## 2026-07-30 - Correction: Phase 2 to pair-LUT is not an equivalent conversion
+
+### 对上一条归因的修正
+
+Phase 2 checkpoint 可以为 Phase 3 提供有结构的 truth-table 初始化，但 Phase 2 与当前 pair-LUT Phase 3 的 forward 并不等价，不能将该转换描述为保持 Phase 2 表达。
+
+Phase 2 BinaryComplexConv2d 先在完整 kernel 范围内累加所有二值复乘：
+
+Y_r = alpha * sum_j (x_rj*w_rj - x_ij*w_ij)
+Y_i = alpha * sum_j (x_rj*w_ij + x_ij*w_rj)
+
+每个复乘的实部/虚部分量属于 {-2,0,2}，但完整卷积会保留所有位置累加后的多比特整数值，随后才进入 post-BN。
+
+当前 PairLUTNeuronConv2d 先将位置按两个复数 activation 分组。每组先计算两个复乘之和：
+
+s_p,r / s_p,i 属于 {-4,-2,0,2,4}
+
+随后初始化 truth table 时立即执行 >=0，分别压成 real/imag 1 bit。hard forward 中每个 pair 对每个输出分量只贡献 +/-2*alpha，最终再累加所有 pair：
+
+Y'_r = 4*alpha*(sum_p bit_p,r - P/2)
+Y'_i = 4*alpha*(sum_p bit_p,i - P/2)
+
+因此局部映射发生不可逆合并：
+
+- -4 与 -2 都映射到负 bit；
+- 0、2、4 都映射到正 bit；
+- tie=0 固定归入正侧；
+- 每组贡献的原始 magnitude 和 zero state 在全局累加前已经丢失。
+
+post-BN 只能重新校准最终 count 的均值和尺度，不能恢复每个 pair 被丢掉的 magnitude/zero 信息。Phase 2 -> Phase 3 checkpoint conversion 的含义只是使用 Phase 2 weight signs 构造一个合理的 Boolean 起点，不是无损编译。
+
+### 正确的判别实验
+
+直接运行 Phase 2 checkpoint 初始化的 Phase 3 仍有价值，但它同时混合了两个因素：
+
+1. random hard LUT optimization 是否困难；
+2. pairwise local 2-bit truncation 是否具有足够表示能力。
+
+要将二者拆开，需要新增一个固定解析算子的控制分支：
+
+- 保留可训练 BinaryComplexConv2d latent weights；
+- forward 对 activation/weight 做与 Phase 2 相同的二值化；
+- 每两个复数位置计算两次复乘并求和；
+- 对 pair sum 的 real/imag 分别执行 >=0 hard bit，并给 comparator 配置 STE；
+- 再像 PairLUTNeuronConv2d 一样对所有 pair bit count 做中心化累加；
+- 不使用任何可学习 LUT entries。
+
+该 analytic pair-comparator forward 与由当前 weight signs 枚举得到的 hard pair-LUT truth tables逐状态严格一致，同时优化变量仍是稳定的 latent spatial weights。
+
+判据：
+
+- analytic pair-comparator 从头也只能约 50%：主要瓶颈是局部 2-bit 截断/4-bit fan-in 的表示损失；
+- analytic 分支能到约 80%，随机 pair-LUT 约 50%：主要瓶颈是自由 truth-table 的离散优化；
+- analytic 分支高，但转换到同权重 hard LUT 后不一致：说明 LUT grouping、bit ordering、padding 或 scaling 实现存在 bug。
+
+因此下一步最干净的工作不是继续调 BN，而是实现这一 analytic pair-comparator 控制开关，并增加逐状态及整层 forward equality test。
