@@ -1011,3 +1011,45 @@ GPU_ID=1 TRAIN_FROM_SCRATCH=1 NUM_EPOCHS=256 BATCH_SIZE=256 LR=0.01 SCHEDULE=lin
 
 - 若 Phase 2 scratch 也约 50%，先解决 complex backbone scratch optimization，不能继续归因于 pair-LUT。
 - 若 Phase 2 scratch 达到约 80%，则主要瓶颈就是 LUT4 pair grouping。下一版优先考虑将全部 real/imag scalar bits flatten 后每 5 bit 一组，用一块 LUT6_2 实现两个独立 LUT5 outputs。这样每个物理单元拥有 32+32=64 entries，与实数 LUT6 的 64 个布尔自由度相当，同时 physical neuron 数比当前 4-bit grouping 更少；输出仍可解释为一个复数的 real/imag 两个 bit。
+
+<!-- experiment-entry:phase2-scratch-control-20260730 -->
+## 2026-07-30 - Phase 2 scratch control reaches 80.96 percent
+
+### 完成结果
+
+使用 scripts/analyze_training_run.py 解析 runs/phase2_scratch_real_recipe_nopre_covpost：
+
+- 状态：complete，256 epochs。
+- best test accuracy：80.96%，epoch 255。
+- final test accuracy：80.18%。
+- best epoch augmented train accuracy：75.26%。
+- 配置：Phase 2、train from scratch、pre-BN=none、post-BN=covariance、Adam、LR=0.01 linear decay、batch size 256、weight decay=0、无 gradient clipping、real_lut augmentation、label smoothing 0.1、50k train/no-validation。
+
+### 归因更新
+
+该控制组与随机 hard pair-LUT 的最佳 51.33% 相差 29.63 个百分点，而 backbone、数据、optimizer、schedule、activation surrogate、stem/projection 和 BN 模式保持一致。由此可以排除以下主因：
+
+- complex backbone 无法从头训练；
+- no-pre/cov-post 结构本身错误；
+- Adam 0.01 linear 配方不适用于复数网络；
+- 数据增强或 label smoothing 导致约 50% 平台。
+
+问题已经收敛到 BinaryComplexConv2d 被随机 4-input/2-output PairLUTNeuronConv2d 替换后的表示与优化：
+
+1. 随机 hard LUT sign 在前几十个 epoch 快速大规模翻转，缺少二值卷积提供的连续 latent spatial-weight 参数化和结构先验。
+2. 每个输出分量只有 4-bit interaction；实数成功路线是 6-bit interaction。
+3. 当前每个物理双输出单元只有两张 LUT4，共 32 个 entry bits；实数 LUT6 为 64。
+4. 当前 pair grouping 的 truth tables 完全独立，参数空间维度高但缺少相邻 spatial position 或 complex multiplication 的共享约束，因此 identity STE 的离散搜索难度大。
+
+### 下一步实验
+
+先使用本次最佳 Phase 2 checkpoint 初始化 Phase 3 pair-LUT，而不是随机 bimodal：
+
+GPU_ID=2 TRAIN_FROM_SCRATCH=0 CHECKPOINT=runs/phase2_scratch_real_recipe_nopre_covpost/chkpts/Bestmodel_phase2.pt PRE_BN_MODE=none POST_BN_MODE=covariance WORKDIR=runs/phase3_pair_from_phase2_scratch80_hard ./run_phase3_real_compatible.sh
+
+该实验保持 hard-forward identity STE，但初始真值表来自已达到 80.96% 的二值卷积。它回答两个问题：
+
+- pairwise local threshold 编译本身造成多少即时 accuracy 损失；
+- 有结构先验的 LUT 初始化能否避开随机 hard LUT 的 50% 平台。
+
+若初始化后立即显著高于随机版本并能继续恢复，短期路线采用 Phase2 -> Phase3。若仍迅速降到约 50%，则 4-bit pairwise local function 本身是主要表示瓶颈，应转向 flatten scalar bits 后的 5-input/2-output LUT6_2 neuron。
