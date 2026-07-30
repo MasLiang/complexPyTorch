@@ -1045,6 +1045,16 @@ def annealed_binary_table(
     return soft + ratio * (hard - soft).detach()
 
 
+class _HardForwardProxyBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hard_output, proxy_output):
+        return hard_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return None, grad_output
+
+
 class PairLUTNeuronConv2d(Module):
     """LUT-as-neuron convolution consuming two binary complex activations."""
 
@@ -1065,6 +1075,7 @@ class PairLUTNeuronConv2d(Module):
         tau_init=0.5,
         training_mode="anneal",
         kernel_mode="auto",
+        trainable_entries=True,
     ):
         super().__init__()
         if not isinstance(kernel_size, int):
@@ -1103,14 +1114,19 @@ class PairLUTNeuronConv2d(Module):
         self.logit_init = float(logit_init)
         self.training_mode = training_mode
         self.kernel_mode = kernel_mode
+        self.trainable_entries = bool(trainable_entries)
         self.logical_positions = (
             self.in_channels * self.kernel_size * self.kernel_size
         )
         self.pair_num = (self.logical_positions + 1) // 2
 
         table_shape = (self.pair_num, 1 << self.LUT_K, self.out_channels)
-        self.lut_r = Parameter(torch.zeros(table_shape))
-        self.lut_i = Parameter(torch.zeros(table_shape))
+        if self.trainable_entries:
+            self.lut_r = Parameter(torch.zeros(table_shape))
+            self.lut_i = Parameter(torch.zeros(table_shape))
+        else:
+            self.register_buffer("lut_r", torch.zeros(table_shape))
+            self.register_buffer("lut_i", torch.zeros(table_shape))
         self.register_buffer(
             "initial_lut_r_sign",
             torch.zeros(table_shape, dtype=torch.bool),
@@ -1577,7 +1593,7 @@ class PairLUTNeuronConv2d(Module):
         return (
             "in_channels={}, out_channels={}, kernel_size={}, stride={}, "
             "padding={}, pairs={}, per_channel={}, training_mode={}, "
-            "kernel_mode={}, entries={}"
+            "kernel_mode={}, trainable_entries={}, entries={}"
         ).format(
             self.in_channels,
             self.out_channels,
@@ -1588,8 +1604,147 @@ class PairLUTNeuronConv2d(Module):
             self.per_channel,
             self.training_mode,
             self.kernel_mode,
+            self.trainable_entries,
             self.lut_r.numel() + self.lut_i.numel(),
         )
+
+
+class AnalyticPairComparatorConv2d(BinaryComplexConv2d):
+    """
+    Train latent binary-complex weights with the exact hard pair-LUT forward.
+
+    The hard output is regenerated from the current weight signs. Backward
+    uses the identity-STE pair comparator, whose summed proxy is twice the
+    corresponding binary complex convolution.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias=False,
+        per_channel=True,
+        weight_grad_mode="ste",
+        kernel_mode="auto",
+    ):
+        if not isinstance(kernel_size, int):
+            raise TypeError(
+                "AnalyticPairComparatorConv2d requires an integer kernel_size"
+            )
+        if dilation != 1:
+            raise ValueError(
+                "AnalyticPairComparatorConv2d currently supports dilation=1"
+            )
+        if groups != 1:
+            raise ValueError(
+                "AnalyticPairComparatorConv2d currently supports groups=1"
+            )
+        if bias:
+            raise ValueError(
+                "AnalyticPairComparatorConv2d does not use convolution bias"
+            )
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=False,
+            per_channel=per_channel,
+            weight_grad_mode=weight_grad_mode,
+        )
+        self.pair_lut = PairLUTNeuronConv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=False,
+            per_channel=per_channel,
+            training_mode="real_compatible",
+            kernel_mode=kernel_mode,
+            trainable_entries=False,
+        )
+        self.pair_lut.hard_ratio.fill_(1.0)
+
+    @staticmethod
+    def _hard_identity(value):
+        hard = torch.where(
+            value >= 0.0,
+            torch.ones_like(value),
+            -torch.ones_like(value),
+        )
+        return value + (hard - value).detach()
+
+    def _binary_weight_proxy(self):
+        weight_r = self.conv_r.weight
+        weight_i = self.conv_i.weight
+        complex_weight = torch.complex(weight_r, weight_i)
+        alpha = binary_scale_weight_complex(
+            complex_weight,
+            per_channel=self.per_channel,
+        )
+        proxy_r = binary_sign(
+            weight_r,
+            grad_mode=self.weight_grad_mode,
+        )
+        proxy_i = binary_sign(
+            weight_i,
+            grad_mode=self.weight_grad_mode,
+        )
+        hard_r = torch.where(
+            weight_r >= 0.0,
+            torch.ones_like(weight_r),
+            -torch.ones_like(weight_r),
+        )
+        hard_i = torch.where(
+            weight_i >= 0.0,
+            torch.ones_like(weight_i),
+            -torch.ones_like(weight_i),
+        )
+        signed_r = proxy_r + (hard_r - proxy_r).detach()
+        signed_i = proxy_i + (hard_i - proxy_i).detach()
+        return signed_r * alpha, signed_i * alpha
+
+    def _identity_comparator_proxy(self, inp):
+        input_r = self._hard_identity(inp.real)
+        input_i = self._hard_identity(inp.imag)
+        if self.padding:
+            padding = (self.padding,) * 4
+            input_r = F.pad(input_r, padding, value=-1.0)
+            input_i = F.pad(input_i, padding, value=-1.0)
+
+        weight_r, weight_i = self._binary_weight_proxy()
+        conv_kwargs = {
+            "stride": self.stride,
+            "padding": 0,
+            "dilation": self.dilation,
+            "groups": self.groups,
+        }
+        output_r = F.conv2d(input_r, weight_r, **conv_kwargs)
+        output_r = output_r - F.conv2d(input_i, weight_i, **conv_kwargs)
+        output_i = F.conv2d(input_r, weight_i, **conv_kwargs)
+        output_i = output_i + F.conv2d(input_i, weight_r, **conv_kwargs)
+        return 2.0 * torch.complex(output_r, output_i)
+
+    def forward(self, inp):
+        with torch.no_grad():
+            self.pair_lut.initialize_from_phase2_weights(
+                self.conv_r.weight,
+                self.conv_i.weight,
+            )
+            hard_output = self.pair_lut(inp)
+        proxy_output = self._identity_comparator_proxy(inp)
+        return _HardForwardProxyBackward.apply(hard_output, proxy_output)
 
 
 # =====================================================================

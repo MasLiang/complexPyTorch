@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from .complexFunctions import complex_avg_pool2d, complex_relu
 from .complexLayers import (
+    AnalyticPairComparatorConv2d,
     BinaryComplexActivation,
     BinaryComplexConv2d,
     ComplexBatchNorm2d,
@@ -62,6 +63,7 @@ class BiRealComplexResidualBlock(nn.Module):
         lut_tau_init=0.5,
         lut_training_mode="anneal",
         lut_kernel_mode="auto",
+        phase3_mode="lut",
         pre_bn_mode="covariance",
         post_bn_mode="covariance",
     ):
@@ -82,19 +84,36 @@ class BiRealComplexResidualBlock(nn.Module):
         if is_binary:
             self.act = BinaryComplexActivation(grad_mode=act_grad_mode)
             if phase == 3:
-                self.conv = PairLUTNeuronConv2d(
-                    in_channels,
-                    out_channels,
-                    kernel_size,
-                    stride=stride,
-                    padding=padding,
-                    bias=False,
-                    per_channel=per_channel,
-                    logit_init=lut_logit_init,
-                    tau_init=lut_tau_init,
-                    training_mode=lut_training_mode,
-                    kernel_mode=lut_kernel_mode,
-                )
+                if phase3_mode == "lut":
+                    self.conv = PairLUTNeuronConv2d(
+                        in_channels,
+                        out_channels,
+                        kernel_size,
+                        stride=stride,
+                        padding=padding,
+                        bias=False,
+                        per_channel=per_channel,
+                        logit_init=lut_logit_init,
+                        tau_init=lut_tau_init,
+                        training_mode=lut_training_mode,
+                        kernel_mode=lut_kernel_mode,
+                    )
+                elif phase3_mode == "analytic_pair":
+                    self.conv = AnalyticPairComparatorConv2d(
+                        in_channels,
+                        out_channels,
+                        kernel_size,
+                        stride=stride,
+                        padding=padding,
+                        bias=False,
+                        per_channel=per_channel,
+                        weight_grad_mode=weight_grad_mode,
+                        kernel_mode=lut_kernel_mode,
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown Phase 3 mode: {phase3_mode}"
+                    )
             else:
                 self.conv = BinaryComplexConv2d(
                     in_channels, out_channels, kernel_size, stride=stride, padding=padding,
@@ -178,6 +197,7 @@ class BinaryComplexResNet(nn.Module):
         lut_tau_init=0.5,
         lut_training_mode="anneal",
         lut_kernel_mode="auto",
+        phase3_mode="lut",
         pre_bn_mode="covariance",
         post_bn_mode="covariance",
     ):
@@ -200,6 +220,7 @@ class BinaryComplexResNet(nn.Module):
         self.lut_tau_init = lut_tau_init
         self.lut_training_mode = lut_training_mode
         self.lut_kernel_mode = lut_kernel_mode
+        self.phase3_mode = phase3_mode
         self.pre_bn_mode = pre_bn_mode
         self.post_bn_mode = post_bn_mode
 
@@ -209,6 +230,8 @@ class BinaryComplexResNet(nn.Module):
                     f"Unknown complex BatchNorm mode {mode!r}; "
                     f"expected one of {_BN_MODES}"
                 )
+        if phase3_mode not in ("lut", "analytic_pair"):
+            raise ValueError(f"Unknown Phase 3 mode: {phase3_mode}")
 
         # 仅针对非复数输入(如光学图像)保留虚部学习模块
         if not self.is_sar_input:
@@ -265,6 +288,7 @@ class BinaryComplexResNet(nn.Module):
                 lut_logit_init=self.lut_logit_init, lut_tau_init=self.lut_tau_init,
                 lut_training_mode=self.lut_training_mode,
                 lut_kernel_mode=self.lut_kernel_mode,
+                phase3_mode=self.phase3_mode,
                 pre_bn_mode=self.pre_bn_mode,
                 post_bn_mode=self.post_bn_mode,
             )
@@ -280,6 +304,7 @@ class BinaryComplexResNet(nn.Module):
                     lut_logit_init=self.lut_logit_init, lut_tau_init=self.lut_tau_init,
                     lut_training_mode=self.lut_training_mode,
                     lut_kernel_mode=self.lut_kernel_mode,
+                    phase3_mode=self.phase3_mode,
                     pre_bn_mode=self.pre_bn_mode,
                     post_bn_mode=self.post_bn_mode,
                 )

@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 import training
 from complexPyTorch.complexBinaryResNet import BinaryComplexResNet
 from complexPyTorch.complexLayers import (
+    AnalyticPairComparatorConv2d,
     ComplexLUTConv2d,
     LUTAwareComplexBinaryConv2d,
     PairLUTNeuronConv2d,
@@ -34,6 +35,7 @@ def audit(root):
         "run_phase1.sh",
         "run_phase2.sh",
         "run_phase3.sh",
+        "run_phase3_pair_analytic.sh",
         "run_phase3_real_compatible.sh",
     ]:
         failures.append(
@@ -95,6 +97,35 @@ def audit(root):
         failures.append("Phase 3 instantiates legacy LUT layers: {}".format(legacy_active))
     if any(".conv.conv_" in name for name, _ in phase3.named_parameters()):
         failures.append("Phase 3 pair-LUT path retains spatial convolution weights")
+
+    analytic = BinaryComplexResNet(
+        in_channels=3,
+        num_blocks=1,
+        start_filters=2,
+        num_classes=10,
+        is_sar_input=False,
+        phase=3,
+        phase3_mode="analytic_pair",
+    )
+    analytic_layers = [
+        module
+        for module in analytic.modules()
+        if isinstance(module, AnalyticPairComparatorConv2d)
+    ]
+    if not analytic_layers:
+        failures.append(
+            "Phase 3 analytic mode instantiates no comparator layers"
+        )
+    analytic_parameters = dict(analytic.named_parameters())
+    if any(
+        name.endswith(("pair_lut.lut_r", "pair_lut.lut_i"))
+        for name in analytic_parameters
+    ):
+        failures.append("Phase 3 analytic mode has trainable LUT entries")
+    if not any(".conv.conv_r.weight" in name for name in analytic_parameters):
+        failures.append("Phase 3 analytic mode has no latent real weights")
+    if not any(".conv.conv_i.weight" in name for name in analytic_parameters):
+        failures.append("Phase 3 analytic mode has no latent imaginary weights")
     if not issubclass(ComplexLUTConv2d, nn.Module):
         failures.append("ComplexLUTConv2d is unavailable")
     if not issubclass(LUTAwareComplexBinaryConv2d, nn.Module):
@@ -114,6 +145,7 @@ def main(argv=None):
     print("PASS: active route exposes only Phase 1/2/3")
     print("PASS: Phase 1/2 models instantiate no LUT modules")
     print("PASS: Phase 3 replaces spatial weights with pair-LUT neurons")
+    print("PASS: analytic Phase 3 retains latent weights without trainable LUT entries")
     print("PASS: retained LUT complex layers remain importable")
 
 

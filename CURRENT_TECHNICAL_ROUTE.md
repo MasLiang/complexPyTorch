@@ -89,6 +89,32 @@ real network's `0/1` activation. Binary and floating backends are regression
 tested for exact forward and backward equality at hard Boolean corners,
 including channel counts that cross both 32-bit packing boundaries.
 
+### Analytic Pair-Comparator Control
+
+`--phase3-mode analytic_pair` is an isolated diagnostic for the current
+pairwise local truncation. It retains trainable latent binary-complex spatial
+weights. On every forward, each two-position weight group is converted into
+the same hard real/imag truth tables used by `PairLUTNeuronConv2d`; packed
+binary lookup therefore produces the exact deployable 4-input/2-output
+forward, including fixed-low padding and odd-tail behavior.
+
+The hard result is returned exactly. Backward does not optimize free LUT
+entries: it follows the identity-STE comparator proxy through the latent
+weights and activations. Since each pair comparator contributes
+`2 * alpha * sign(pair_sum)`, its identity proxy reduces to twice the
+corresponding binary complex convolution with the same fixed-low padding.
+
+This mode distinguishes two failure sources:
+
+- If it remains near the random pair-LUT result, the local two-bit truncation
+  or four-input grouping is the representation bottleneck.
+- If it approaches Phase 2 while free pair-LUT training remains poor, the
+  bottleneck is direct truth-table optimization.
+
+The dedicated launcher `run_phase3_pair_analytic.sh` uses the same scratch
+Adam/0.01/linear/real-LUT data recipe as the completed Phase 2 control. The
+default `--phase3-mode lut` and all existing LUT commands are unchanged.
+
 Residual normalization is independently selectable with
 `--pre-bn-mode` and `--post-bn-mode` (or launcher variables `PRE_BN_MODE` and
 `POST_BN_MODE`). Both accept `covariance`, `naive`, and `none`, and default to

@@ -23,6 +23,7 @@ LUT_LR=${LUT_LR:-0.01}
 LUT_SCHEDULE=${LUT_SCHEDULE:-constant}
 LUT_TRAINING_MODE=${LUT_TRAINING_MODE:-anneal}
 LUT_KERNEL_MODE=${LUT_KERNEL_MODE:-auto}
+PHASE3_MODE=${PHASE3_MODE:-lut}
 LUT_INIT_MODE=${LUT_INIT_MODE:-normal}
 LUT_LOGIT_INIT=${LUT_LOGIT_INIT:-1.0}
 LUT_BIMODAL_NEGATIVE_MEAN=${LUT_BIMODAL_NEGATIVE_MEAN:--1.0}
@@ -60,6 +61,7 @@ ARGS=(
   --lut-schedule "$LUT_SCHEDULE"
   --lut-training-mode "$LUT_TRAINING_MODE"
   --lut-kernel-mode "$LUT_KERNEL_MODE"
+  --phase3-mode "$PHASE3_MODE"
   --lut-init-mode "$LUT_INIT_MODE"
   --lut-logit-init "$LUT_LOGIT_INIT"
   --lut-bimodal-negative-mean "$LUT_BIMODAL_NEGATIVE_MEAN"
@@ -92,7 +94,9 @@ fi
 
 printf 'Running Phase 3 pair-LUT neurons on GPU %s\n' "$GPU_ID"
 if [[ "${TRAIN_FROM_SCRATCH:-0}" == "1" ]]; then
-  if [[ "$LUT_INIT_MODE" == "bimodal" ]]; then
+  if [[ "$PHASE3_MODE" == "analytic_pair" ]]; then
+    printf 'Initialization: random latent complex weights\n'
+  elif [[ "$LUT_INIT_MODE" == "bimodal" ]]; then
     printf 'Initialization: bimodal N(%s,%s) / N(%s,%s)\n' \
       "$LUT_BIMODAL_NEGATIVE_MEAN" "$LUT_BIMODAL_NEGATIVE_STD" \
       "$LUT_BIMODAL_POSITIVE_MEAN" "$LUT_BIMODAL_POSITIVE_STD"
@@ -103,12 +107,17 @@ else
   printf 'Checkpoint: %s\n' "$CHECKPOINT"
 fi
 printf 'Workdir: %s\n' "$WORKDIR"
-printf 'LUT training mode: %s\n' "$LUT_TRAINING_MODE"
+printf 'Phase 3 mode: %s\n' "$PHASE3_MODE"
 printf 'LUT kernel mode: %s\n' "$LUT_KERNEL_MODE"
 printf 'Residual BN modes: pre=%s, post=%s\n' \
   "$PRE_BN_MODE" "$POST_BN_MODE"
-if [[ "$LUT_TRAINING_MODE" == "anneal" ]]; then
-  printf 'Annealing: %s soft epochs + %s hard-transition epochs\n' \
-    "$LUT_ANNEAL_EPOCHS" "$LUT_HARD_TRANSITION_EPOCHS"
+if [[ "$PHASE3_MODE" == "lut" ]]; then
+  printf 'LUT training mode: %s\n' "$LUT_TRAINING_MODE"
+  if [[ "$LUT_TRAINING_MODE" == "anneal" ]]; then
+    printf 'Annealing: %s soft epochs + %s hard-transition epochs\n' \
+      "$LUT_ANNEAL_EPOCHS" "$LUT_HARD_TRANSITION_EPOCHS"
+  fi
+else
+  printf 'Comparator: hard forward with latent-weight identity STE\n'
 fi
 exec "$ROOT_DIR/run_training.sh" "${ARGS[@]}" "$@"

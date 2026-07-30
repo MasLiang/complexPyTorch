@@ -1111,3 +1111,84 @@ post-BN 只能重新校准最终 count 的均值和尺度，不能恢复每个 p
 - analytic 分支高，但转换到同权重 hard LUT 后不一致：说明 LUT grouping、bit ordering、padding 或 scaling 实现存在 bug。
 
 因此下一步最干净的工作不是继续调 BN，而是实现这一 analytic pair-comparator 控制开关，并增加逐状态及整层 forward equality test。
+
+<!-- experiment-entry:analytic-pair-control-20260730 -->
+## 2026-07-30 - Analytic pair-comparator control implementation
+
+### 目标
+
+新增一个不学习自由 truth-table 的 Phase 3 控制分支，单独测试“每两个二值复数乘法求和后，real/imag 各截断为 1 bit，再累加”的表示能力。默认 Phase 3 LUT 路径保持不变。
+
+### 数学与梯度
+
+AnalyticPairComparatorConv2d 保留与 BinaryComplexConv2d 相同的 latent conv_r/conv_i weights。每次 forward：
+
+1. 对 latent weights 和 complex activation 的 real/imag 分别 hard sign。
+2. 按 [input channel, ky, kx] flatten 后每两个 complex positions 分组。
+3. 每组计算两个 complex products 的和。
+4. real/imag pair sum 分别执行 >=0，得到 +/-1。
+5. 每个 pair 乘 2*alpha 后跨 pair 累加。
+
+hard forward 通过由当前 weight signs 即时生成的 frozen pair truth tables执行，复用 packed binary backend，只是计算实现，不包含 trainable LUT entries。它与部署时的 PairLUTNeuronConv2d hard forward逐状态一致，包括 padding 的 fixed-low bit 和 odd-tail dummy。
+
+backward 使用解析 identity-STE comparator。因为每个 pair output 为 2*alpha*STE_sign(pair_sum)，且 d STE_sign / d pair_sum = 1，跨 pair 求和后的代理梯度等价于两倍的 binary complex convolution。实现使用自定义 _HardForwardProxyBackward：forward 原样返回 hard LUT output，backward 只将梯度传给 latent-weight analytic proxy。这样避免普通 detach 加减表达式产生约 2.7e-7 forward rounding error。
+
+### 新增开关与命令
+
+- --phase3-mode lut：原有默认路径。
+- --phase3-mode analytic_pair：新控制路径。
+- run_phase3_pair_analytic.sh：默认 train from scratch、256 epochs、batch 256、Adam、LR 0.01 linear、weight decay/clipping 0、real_lut augmentation、label smoothing 0.1、50k train、pre-BN none、post-BN covariance、packed binary hard forward。
+
+运行命令：
+
+GPU_ID=2 WORKDIR=runs/phase3_pair_analytic_scratch ./run_phase3_pair_analytic.sh
+
+### 修改文件
+
+- complexPyTorch/complexLayers.py：PairLUTNeuronConv2d 增加 trainable_entries；新增 hard-forward/proxy-backward autograd bridge 和 AnalyticPairComparatorConv2d。
+- complexPyTorch/complexBinaryResNet.py：Phase 3 block 根据 phase3_mode 选择自由 PairLUTNeuronConv2d 或 AnalyticPairComparatorConv2d；默认 lut 不变。
+- training.py：新增 CLI 并透传；analytic 模式跳过 LUT 初始化、退火校验、LUT LR 日志、sign diff 和 hard-table checkpoint 字段；普通 checkpoint/best 保存仍工作。
+- run_phase3.sh：透传 PHASE3_MODE，并按模式打印准确的初始化/训练语义。
+- run_phase3_pair_analytic.sh：新增独立的一键控制实验入口。
+- tests/test_pair_lut_phase3.py：新增含 padding+odd tail 的 exact hard-forward equality、input/latent-weight gradient、无 trainable LUT entries 和训练路由测试。
+- README.md：新增用户命令与简要语义。
+- CURRENT_TECHNICAL_ROUTE.md：记录该控制分支的数学定义、用途与判据。
+- EXPERIMENT_LOG.md：由 scripts/append_experiment_log.py 追加本条。
+
+### 验证
+
+- 定向 3 tests：全部通过。
+- CUDA_VISIBLE_DEVICES=8 conda run -n lut_net python -m unittest discover -s tests -v：28 tests 全部通过。
+- 默认 start_filter=11、num_blocks=3、batch=2 的 GPU packed-binary analytic model forward/backward：output shape (2,10)，96 个 trainable parameters tensors 获得 gradient，总 trainable scalar parameters 259,574。
+- py_compile、bash -n、git diff --check：通过。
+- PYTHON_BIN=/bin/echo dry-run：确认完整 invocation 包含 phase3_mode=analytic_pair、binary kernel、Adam 0.01 linear、no-pre/cov-post、no-validation 和 train-from-scratch。
+
+### 结果判据
+
+- 若 analytic_pair 仍约 50%：局部 two-product -> two-bit 截断或 4-bit fan-in 是主要表示瓶颈。
+- 若 analytic_pair 接近 Phase 2 scratch 的 80.96%，而自由 pair-LUT 仍约 50%：直接优化独立 truth tables 是主要瓶颈。
+- 若 analytic hard forward 与单独转换的 PairLUT 出现偏差：属于 grouping/bit-order/padding/scale bug；现有 exact equality regression 已覆盖该风险。
+
+<!-- experiment-entry:analytic-pair-control-verification-20260730 -->
+## 2026-07-30 - Analytic pair control verification supplement
+
+### 审计脚本同步
+
+新增 run_phase3_pair_analytic.sh 后，scripts/audit_active_route.py 的旧启动器允许列表首先按预期失败。已更新可复用审计脚本：
+
+- 将 run_phase3_pair_analytic.sh 纳入 Phase 1/2/3 活动路线；
+- 验证 analytic_pair 模型实际包含 AnalyticPairComparatorConv2d；
+- 验证不存在 trainable pair_lut.lut_r/lut_i；
+- 验证 latent conv_r/conv_i weights 存在。
+
+在 lut_net 环境重新运行审计后全部通过。scripts/audit_active_route.py 是本次新增修改文件，补充到上一条文件记录。
+
+### 正式 batch size 显存检查
+
+在空闲 GPU8 上使用默认完整模型 start_filter=11、num_blocks=3、phase3_mode=analytic_pair、binary kernel、no-pre/cov-post 和随机 batch size 256，完成一次 forward/backward：
+
+- output shape：(256, 10)
+- peak torch CUDA allocated memory：1.701 GiB
+- 无 OOM 或 kernel error
+
+因此专用 launcher 默认 batch size 256 可直接作为第一组正式实验。

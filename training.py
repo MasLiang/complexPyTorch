@@ -657,6 +657,7 @@ def build_model(args, num_classes):
         lut_tau_init=args.lut_tau_min,
         lut_training_mode=args.lut_training_mode,
         lut_kernel_mode=args.lut_kernel_mode,
+        phase3_mode=args.phase3_mode,
         pre_bn_mode=args.pre_bn_mode,
         post_bn_mode=args.post_bn_mode,
     )
@@ -814,10 +815,10 @@ def set_optimizer_lr(optimizer, learning_rate, lut_learning_rate=None):
 
 
 def update_pair_lut_annealing(model, epoch, args):
-    if args.phase != 3:
+    if args.phase != 3 or getattr(args, "phase3_mode", "lut") != "lut":
         return {
-            "tau": None,
-            "hard_ratio": None,
+            "tau": 0.0,
+            "hard_ratio": 1.0,
             "fully_hard": True,
         }
     if getattr(args, "lut_training_mode", "anneal") == "real_compatible":
@@ -1005,7 +1006,7 @@ def checkpoint_payload(
         "args": vars(args),
         "metrics": metrics,
     }
-    if args.phase == 3:
+    if args.phase == 3 and getattr(args, "phase3_mode", "lut") == "lut":
         payload["hard_lut_tables"] = capture_pair_lut_tables(model)
     return payload
 
@@ -1072,7 +1073,7 @@ def train(args):
         raise ValueError("--min-lr-factor must be between 0 and 1")
     if not 0.0 <= args.label_smoothing < 1.0:
         raise ValueError("--label-smoothing must be in [0, 1)")
-    if args.phase == 3:
+    if args.phase == 3 and args.phase3_mode == "lut":
         if args.lut_lr <= 0.0:
             raise ValueError("--lut-lr must be positive")
         if args.lut_logit_init <= 0.0:
@@ -1186,7 +1187,7 @@ def train(args):
                     checkpoint_path
                 )
             )
-        if args.phase == 3:
+        if args.phase == 3 and args.phase3_mode == "lut":
             _, phase3_initialization = initialize_phase3_from_phase2(
                 model,
                 checkpoint_path,
@@ -1207,7 +1208,7 @@ def train(args):
                 checkpoint_path,
             )
     else:
-        if args.phase == 3:
+        if args.phase == 3 and args.phase3_mode == "lut":
             phase3_initialization = initialize_phase3_random(
                 model,
                 logit_std=args.lut_logit_init,
@@ -1272,7 +1273,7 @@ def train(args):
                 current_lr,
             )
         previous_lr = current_lr
-        if is_main and args.phase == 3 and (
+        if is_main and args.phase == 3 and args.phase3_mode == "lut" and (
             previous_lut_lr is None
             or not math.isclose(current_lut_lr, previous_lut_lr)
         ):
@@ -1281,7 +1282,7 @@ def train(args):
                 epoch + 1,
                 current_lut_lr,
             )
-        if is_main and args.phase == 3 and (
+        if is_main and args.phase == 3 and args.phase3_mode == "lut" and (
             epoch == 0
             or epoch % 10 == 0
             or annealing["fully_hard"]
@@ -1364,7 +1365,7 @@ def train(args):
             )
             sign_diff = (
                 pair_lut_sign_diff(evaluation_model)
-                if args.phase == 3
+                if args.phase == 3 and args.phase3_mode == "lut"
                 else None
             )
             if sign_diff is not None and (
@@ -1399,7 +1400,7 @@ def train(args):
                 "test_loss": float(test_loss),
                 "learning_rate": float(current_lr),
             }
-            if args.phase == 3:
+            if args.phase == 3 and args.phase3_mode == "lut":
                 epoch_metrics.update(
                     {
                         "lut_learning_rate": float(current_lut_lr),
@@ -1423,9 +1424,7 @@ def train(args):
                 args.workdir,
                 last_checkpoint_filename(args.phase),
             )
-            can_select_best = (
-                args.phase != 3 or annealing["fully_hard"]
-            )
+            can_select_best = annealing["fully_hard"]
             if can_select_best and metric_acc > best_acc:
                 best_acc = metric_acc
                 best_metrics = dict(epoch_metrics)
@@ -1597,6 +1596,12 @@ def parse_args(argv=None):
         "--lut-training-mode",
         default="anneal",
         choices=["anneal", "real_compatible"],
+    )
+    parser.add_argument(
+        "--phase3-mode",
+        default="lut",
+        choices=["lut", "analytic_pair"],
+        help="Phase 3 main-path operator",
     )
     parser.add_argument(
         "--lut-kernel-mode",

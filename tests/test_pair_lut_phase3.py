@@ -8,12 +8,86 @@ import torch
 import training
 from complexPyTorch.complexBinaryResNet import BinaryComplexResNet
 from complexPyTorch.complexLayers import (
+    AnalyticPairComparatorConv2d,
     PairLUTNeuronConv2d,
     annealed_binary_table,
 )
 
 
 class PairLUTNeuronTests(unittest.TestCase):
+    def test_analytic_pair_forward_matches_hard_lut_with_padding_and_tail(self):
+        torch.manual_seed(5)
+        analytic = AnalyticPairComparatorConv2d(
+            3,
+            2,
+            kernel_size=3,
+            padding=1,
+            kernel_mode="floating",
+        )
+        lut = PairLUTNeuronConv2d(
+            3,
+            2,
+            kernel_size=3,
+            padding=1,
+            training_mode="real_compatible",
+            kernel_mode="floating",
+        )
+        lut.initialize_from_phase2_weights(
+            analytic.conv_r.weight,
+            analytic.conv_i.weight,
+        )
+        real = torch.randn(2, 3, 5, 5)
+        imag = torch.randn(2, 3, 5, 5)
+        inputs = torch.complex(real, imag)
+        torch.testing.assert_close(
+            analytic(inputs),
+            lut(inputs),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_analytic_pair_uses_latent_weights_and_input_ste(self):
+        torch.manual_seed(7)
+        layer = AnalyticPairComparatorConv2d(
+            2,
+            2,
+            kernel_size=1,
+            kernel_mode="floating",
+        )
+        trainable_names = dict(layer.named_parameters())
+        self.assertIn("conv_r.weight", trainable_names)
+        self.assertIn("conv_i.weight", trainable_names)
+        self.assertNotIn("pair_lut.lut_r", trainable_names)
+        self.assertNotIn("pair_lut.lut_i", trainable_names)
+
+        real = torch.randn(2, 2, 3, 3, requires_grad=True)
+        imag = torch.randn(2, 2, 3, 3, requires_grad=True)
+        output = layer(torch.complex(real, imag))
+        output.abs().mean().backward()
+        self.assertGreater(real.grad.abs().sum().item(), 0.0)
+        self.assertGreater(imag.grad.abs().sum().item(), 0.0)
+        self.assertGreater(layer.conv_r.weight.grad.abs().sum().item(), 0.0)
+        self.assertGreater(layer.conv_i.weight.grad.abs().sum().item(), 0.0)
+
+    def test_phase3_analytic_mode_routes_without_lut_schedule(self):
+        args = training.parse_args(
+            [
+                "--phase",
+                "3",
+                "--phase3-mode",
+                "analytic_pair",
+                "--train-from-scratch",
+            ]
+        )
+        model = training.build_model(args, num_classes=10)
+        self.assertIsInstance(
+            model.stage2[0].conv,
+            AnalyticPairComparatorConv2d,
+        )
+        state = training.update_pair_lut_annealing(model, 0, args)
+        self.assertTrue(state["fully_hard"])
+        self.assertEqual(state["hard_ratio"], 1.0)
+
     def test_random_initialization_is_trainable_and_records_baseline(self):
         torch.manual_seed(11)
         model = BinaryComplexResNet(

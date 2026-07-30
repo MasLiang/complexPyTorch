@@ -30,6 +30,19 @@ GPU_ID=2 TRAIN_FROM_SCRATCH=1 LUT_LOGIT_INIT=1.0 LR=0.01 \
   WORKDIR=runs/phase3_pair_lut_scratch ./run_phase3.sh
 ```
 
+To isolate the information loss of pairwise local truncation from free-LUT
+optimization, run the analytic pair-comparator control:
+
+```bash
+GPU_ID=2 WORKDIR=runs/phase3_pair_analytic_scratch \
+  ./run_phase3_pair_analytic.sh
+```
+
+Its hard forward is exactly the same as regenerating the current 4-input,
+2-output pair LUTs from latent binary-complex weight signs on every step.
+There are no trainable LUT entries. Backpropagation uses an identity-STE local
+comparator proxy through the latent spatial weights.
+
 For a controlled comparison with the real-valued LUT-BiReal implementation,
 use the dedicated recipe:
 
