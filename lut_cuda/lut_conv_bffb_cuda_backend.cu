@@ -50,7 +50,7 @@ __global__ void pack_int8_to_uint32_warp_kernel(
 // 1.5. Fused Pre-processing Kernel: 一步完成 Padding + Permute + Bit-packing
 // 接收 NCHW int8, 输出 NHWC packed_C uint32_t
 // ============================================================================
-__global__ void binary_pad_permute_pack_kernel(
+__global__ void fused_pad_permute_pack_kernel(
     const int8_t* __restrict__ in_nchw, 
     uint32_t* __restrict__ out_nhwc_packed, 
     int B, int in_C, int H, int W, 
@@ -163,19 +163,21 @@ __global__ void lut_conv_forward_ultimate_kernel(
 }
 
 // ============================================================================
-// 3. Backward Kernel: 基于预计算偏移逆推倒数的寄存器级求导
+// 3. Backward Kernel: 1-Neighborhood Sparsemax (Top-7 极速动态稀疏路由)
 // ============================================================================
 template <typename scalar_t>
 __global__ void lut_conv_backward_ultimate_kernel(
     const scalar_t* __restrict__ grad_y, 
     const int8_t* __restrict__ x_padded,      
+    const float* __restrict__ x_float_nchw,  // 🚀 [新增] 连续浮点输入，用于计算 |x| 的汉明距离
     const uint64_t* __restrict__ w_lut, 
     const int32_t* __restrict__ offsets,
     const int32_t* __restrict__ shifts,
     float* __restrict__ grad_x_fp32,     
     float* __restrict__ grad_w_fp32,    
-    int B, int in_C, int packed_C, int padded_H, int padded_W, int out_C, int OH, int OW,
-    int stride, int lut_num)
+    int B, int in_C, int H, int W,           // 🚀 [新增] 原始 H, W 用于浮点张量逆向寻址
+    int packed_C, int padded_H, int padded_W, int out_C, int OH, int OW,
+    int stride, int lut_num, int padding, float tau)    // 🚀 [新增] padding 用于坐标逆向映射
 {
     const int lane_id = threadIdx.x; 
     const int warp_id = threadIdx.y; 
@@ -211,38 +213,95 @@ __global__ void lut_conv_backward_ultimate_kernel(
 
         int local_x_ptr = -1; 
         int local_bit = 0;
+        float f_val = 0.0f; // 存储连续的浮点值
 
         if (is_valid_spatial && lane_id < 6) {
             int flat_conn_idx = l * 6 + lane_id;
             int abs_offset = offsets[flat_conn_idx]; 
             int shift_val  = shifts[flat_conn_idx];
 
-            // 完美解码绝对物理偏移，将其逆映射回 int8 梯度的真实地址
             int spatial_off = abs_offset / packed_C;
             int c_word = abs_offset % packed_C;
             int c = c_word * 32 + shift_val;
 
             local_x_ptr = (spatial_base_ptr + spatial_off) * in_C + c;
             if (x_padded[local_x_ptr] > 0) local_bit = 1;
+
+            // 📍 极速逆向映射：从 padded 的 abs_offset 找回原始的 NCHW float 值
+            int ph = spatial_off / padded_W;
+            int pw = spatial_off % padded_W;
+            int h = ph - padding;
+            int w = pw - padding;
+            if (h >= 0 && h < H && w >= 0 && w < W && c < in_C) {
+                int nchw_idx = ((b * in_C + c) * H + h) * W + w;
+                f_val = x_float_nchw[nchw_idx];
+            }
         }
 
         int current_idx = __ballot_sync(0x3F, local_bit == 1);
         
         int x_indices[6];
+        float x_f[6];
         #pragma unroll
-        for (int j = 0; j < 6; ++j) x_indices[j] = __shfl_sync(0xFFFFFFFF, local_x_ptr, j);
-
-        if (is_valid_spatial && dy_val != 0.0f) {
-            atomicAdd(&s_grad_w[current_idx][lane_id], dy_val);
+        for (int j = 0; j < 6; ++j) {
+            // 瞬间将 6 个输入的地址和浮点值广播给整个 Warp 的 32 个线程
+            x_indices[j] = __shfl_sync(0xFFFFFFFF, local_x_ptr, j);
+            x_f[j] = __shfl_sync(0xFFFFFFFF, f_val, j);
         }
 
+        // ==============================================================
+        // 🚀 核心优化：Top-7 Sparsemax (1-Neighborhood) 计算与分发
+        // ==============================================================
+        if (is_valid_spatial && valid_oc && dy_val != 0.0f) {
+            float v[7]; 
+            // 1. 找出 6 个输入比特中的最大绝对值 (最大惩罚代价)
+            float max_mag = 1.0; // 给一个极小的底，防止全0
+            #pragma unroll
+            for (int k = 0; k < 6; ++k) {
+                max_mag = fmaxf(max_mag, fabsf(x_f[k]));
+            }
+
+            // 2. 引入退火因子 (从 Python 传入一个 0.0 到 1.0 的 schedule_ratio 即可)
+            // 训练初期 schedule_ratio = 1.0 (全盘探索)
+            // 训练末期 schedule_ratio = 0.0 (强制坍缩回 Top-1)
+            float S = 1.0f;
+            v[6] = 1.0f; // 中心点永远是 1.0
+
+            #pragma unroll
+            for (int k = 0; k < 6; ++k) {
+                // 自适应归一化：相对距离 (0.0 到 1.0 之间)
+                float rel_dist = fabsf(x_f[k]) / max_mag; 
+                
+                // 距离越远(接近1)，权重越小；距离越近(接近0)，权重越大
+                // 乘以 schedule_ratio 强制退火
+                float vk = (1.0f - rel_dist) * tau; 
+                
+                v[k] = vk;
+                S += vk;
+            }
+
+            float inv_S = 1.0f / S; // 安全归一化因子
+            
+            // 3. 完美无冲突写入：中心状态
+            atomicAdd(&s_grad_w[current_idx][lane_id], dy_val * (v[6] * inv_S));
+            
+            // 完美无冲突写入：6 个邻居
+            #pragma unroll
+            for (int k = 0; k < 6; ++k) {
+                if (v[k] > 0.0f) { // 末期 schedule_ratio为0时，邻居被完美剔除！
+                    int neighbor_idx = current_idx ^ (1 << k);
+                    atomicAdd(&s_grad_w[neighbor_idx][lane_id], dy_val * (v[k] * inv_S));
+                }
+            }
+        }
+
+        // Boolean Derivative (x 的梯度，保持完美简洁)
         if (is_valid_spatial && valid_oc) {
             #pragma unroll
             for (int k = 0; k < 6; ++k) {
                 int idx1 = current_idx | (1 << k);
                 int idx0 = current_idx & ~(1 << k);
                 
-                // 纯寄存器内求解 Boolean Derivative
                 int bit1 = (local_lut >> idx1) & 1;
                 int bit0 = (local_lut >> idx0) & 1;
                 float dx_val = dy_val * (bit1 - bit0);
@@ -252,7 +311,6 @@ __global__ void lut_conv_backward_ultimate_kernel(
                     dx_val += __shfl_down_sync(0xFFFFFFFF, dx_val, offset);
                 }
                 
-                // 规避原子锁风暴，单线程提交
                 if (lane_id == 0 && x_indices[k] != -1 && fabs(dx_val) > 1e-4) {
                     atomicAdd(&grad_x_fp32[x_indices[k]], dx_val);
                 }
@@ -260,7 +318,7 @@ __global__ void lut_conv_backward_ultimate_kernel(
         }
         __syncthreads();
 
-        // 统一提交 STE 浮点梯度
+        // 极速刷回 Global Memory
         for (int i = tid; i < 64 * TILE_OC; i += WARPS_PER_BLOCK * 32) {
             int bit = i / TILE_OC; int toc = i % TILE_OC; int c_act = oc_base + toc;
             if (c_act < out_C) {
@@ -351,21 +409,30 @@ torch::Tensor forward_implicit_ultimate(
 std::vector<torch::Tensor> backward_ultimate(
     torch::Tensor grad_y_nhwc, 
     torch::Tensor x_int8_padded, 
+    torch::Tensor x_float_nchw,   // 🚀 [新增参数] 
     torch::Tensor w_packed, 
     torch::Tensor offsets, 
     torch::Tensor shifts, 
-    int B, int padded_H, int padded_W, int OH, int OW, int stride) 
+    torch::Tensor tau_tensor,
+    int padding,                  // 🚀 [新增参数]
+    int B, int padded_H, int padded_W, int OH, int OW, int stride)
 {
     TORCH_CHECK(x_int8_padded.scalar_type() == torch::kInt8, "x_padded MUST be int8.");
     TORCH_CHECK(w_packed.scalar_type() == torch::kInt64, "w_packed MUST be int64.");
+    TORCH_CHECK(x_float_nchw.scalar_type() == torch::kFloat32, "x_float MUST be float32.");
     
     auto grad_y_c = grad_y_nhwc.contiguous();
     auto x_int8_c = x_int8_padded.contiguous();
+    auto x_float_c = x_float_nchw.contiguous();
 
+    float tau = tau_tensor.item<float>();
     int in_C = x_int8_c.size(3);
     int packed_C = CEIL_DIV(in_C, 32);
     int lut_num = w_packed.size(0);
     int out_C = w_packed.size(1);
+    
+    int H = x_float_c.size(2);
+    int W = x_float_c.size(3);
 
     auto grad_x_padded = torch::zeros_like(x_int8_c, x_int8_c.options().dtype(torch::kFloat32).memory_format(at::MemoryFormat::Contiguous));
     auto grad_w = torch::zeros({lut_num, 64, out_C}, w_packed.options().dtype(torch::kFloat32).memory_format(at::MemoryFormat::Contiguous));
@@ -377,20 +444,21 @@ std::vector<torch::Tensor> backward_ultimate(
         lut_conv_backward_ultimate_kernel<scalar_t><<<blocks, threads>>>(
             grad_y_c.data_ptr<scalar_t>(), 
             x_int8_c.data_ptr<int8_t>(), 
+            x_float_c.data_ptr<float>(), 
             reinterpret_cast<uint64_t*>(w_packed.data_ptr<int64_t>()), 
             offsets.data_ptr<int32_t>(), 
             shifts.data_ptr<int32_t>(),
             grad_x_padded.data_ptr<float>(), 
             grad_w.data_ptr<float>(),
-            B, in_C, packed_C, padded_H, padded_W, out_C, OH, OW, 
-            stride, lut_num
+            B, in_C, H, W, packed_C, padded_H, padded_W, out_C, OH, OW, 
+            stride, lut_num, padding, tau
         );
     });
 
     return {grad_x_padded, grad_w};
 }
 
-torch::Tensor binary_pre_process(
+torch::Tensor fused_pre_process(
     torch::Tensor x_nchw, 
     int pad_top, int pad_bottom, int pad_left, int pad_right) 
 {
@@ -415,7 +483,7 @@ torch::Tensor binary_pre_process(
     int threads_per_block = 128; // 4 Warps per block
     int blocks = CEIL_DIV(total_warps * 32, threads_per_block); 
     
-    binary_pad_permute_pack_kernel<<<blocks, threads_per_block>>>(
+    fused_pad_permute_pack_kernel<<<blocks, threads_per_block>>>(
         x_contig.data_ptr<int8_t>(), 
         reinterpret_cast<uint32_t*>(packed_x.data_ptr<int32_t>()), 
         B, in_C, H, W, 
@@ -430,8 +498,7 @@ torch::Tensor binary_pre_process(
 // 5. PyBind11 模块导出
 // ============================================================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("pack_padded_inputs", &pack_padded_inputs, "Warp-Level Parallel Bit-packing");
-    m.def("conv_binary_forward", &forward_implicit_ultimate, "Ultimate Zero-Branch Pipelined LUT Forward");
-    m.def("conv_binary_backward", &backward_ultimate, "Ultimate Pipelined LUT Backward");
-    m.def("binary_pre_process", &binary_pre_process, "F.pad+permute+pack_weights");
+    m.def("fused_pre_process", &fused_pre_process, "Pack Int8");
+    m.def("conv_bffb_forward", &forward_implicit_ultimate, "Ultimate Zero-Branch Pipelined LUT Forward");
+    m.def("conv_bffb_backward", &backward_ultimate, "Ultimate Pipelined LUT Backward");
 }

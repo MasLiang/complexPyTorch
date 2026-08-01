@@ -9,8 +9,10 @@ import torch
 
 import training
 from complexPyTorch.complexBinaryResNet import BinaryComplexResNet
+from complexPyTorch.complexFunctions import complex_binary_weight
 from complexPyTorch.complexLayers import (
     BinaryComplexConv2d,
+    ComplexAvgPool2d,
     ComplexBatchNorm2d,
     ComplexConv2d,
     ComplexLUTConv2d,
@@ -130,6 +132,89 @@ class ActiveRouteTests(unittest.TestCase):
             set(phase2.state_dict()),
         )
 
+    def test_standard_bireal_topology_keeps_cifar_complex_frontend(self):
+        defaults = training.parse_args([])
+        self.assertEqual(defaults.bireal_topology, "legacy")
+        parsed = training.parse_args(
+            ["--phase", "2", "--bireal-topology", "standard"]
+        )
+        self.assertEqual(parsed.bireal_topology, "standard")
+
+        model = BinaryComplexResNet(
+            in_channels=3,
+            num_blocks=1,
+            start_filters=2,
+            num_classes=10,
+            is_sar_input=False,
+            phase=2,
+            bireal_topology="standard",
+        )
+        self.assertTrue(hasattr(model, "learn_imag"))
+        self.assertIsInstance(model.stage2[0].bn_pre, torch.nn.Identity)
+        self.assertIsNone(model.stage2[0].proj)
+        self.assertEqual(
+            model.stage2[0].conv.weight_proxy_mode,
+            "bireal",
+        )
+
+        downsample = model.stage3[0].proj
+        self.assertIsInstance(downsample[0], ComplexAvgPool2d)
+        self.assertIsInstance(downsample[1], ComplexConv2d)
+        self.assertIsInstance(downsample[2], ComplexBatchNorm2d)
+        self.assertEqual(downsample[1].conv_r.stride, (1, 1))
+        self.assertEqual(model.stage3[0].conv.stride, 2)
+
+        output = model(torch.randn(2, 3, 32, 32))
+        self.assertEqual(tuple(output.shape), (2, 10))
+        output.square().mean().backward()
+
+    def test_standard_bireal_weight_proxy_matches_clipped_backward(self):
+        real = torch.tensor(
+            [[[[0.2, -0.4]]]],
+            requires_grad=True,
+        )
+        imag = torch.tensor(
+            [[[[0.3, -0.1]]]],
+            requires_grad=True,
+        )
+        weight = torch.complex(real, imag)
+        binary = complex_binary_weight(
+            weight,
+            per_channel=True,
+            proxy_mode="bireal",
+        )
+        alpha = weight.detach().abs().mean(
+            dim=(1, 2, 3),
+            keepdim=True,
+        )
+        expected = torch.complex(
+            alpha * real.detach().sign(),
+            alpha * imag.detach().sign(),
+        )
+        self.assertTrue(torch.allclose(binary.detach(), expected))
+
+        (binary.real.sum() + binary.imag.sum()).backward()
+        self.assertTrue(torch.equal(real.grad, torch.ones_like(real)))
+        self.assertTrue(torch.equal(imag.grad, torch.ones_like(imag)))
+
+    def test_standard_phase1_and_phase2_state_keys_match(self):
+        models = [
+            BinaryComplexResNet(
+                in_channels=3,
+                num_blocks=1,
+                start_filters=2,
+                num_classes=10,
+                is_sar_input=False,
+                phase=phase,
+                bireal_topology="standard",
+            )
+            for phase in (1, 2)
+        ]
+        self.assertEqual(
+            set(models[0].state_dict()),
+            set(models[1].state_dict()),
+        )
+
     def test_phase1_checkpoint_fully_initializes_phase2(self):
         phase1 = self.make_model(1)
         phase2 = self.make_model(2)
@@ -169,7 +254,13 @@ class ActiveRouteTests(unittest.TestCase):
             )
 
     def test_learning_rate_schedules_never_exceed_base_lr(self):
-        for schedule in ("constant", "cosine", "bireal", "linear"):
+        for schedule in (
+            "constant",
+            "cosine",
+            "bireal",
+            "bireal_reference",
+            "linear",
+        ):
             args = argparse.Namespace(
                 schedule=schedule,
                 lr=0.01,
@@ -182,6 +273,27 @@ class ActiveRouteTests(unittest.TestCase):
             ]
             self.assertLessEqual(max(rates), args.lr)
             self.assertGreaterEqual(min(rates), 0.0)
+
+    def test_reference_bireal_schedule_uses_original_milestones(self):
+        args = argparse.Namespace(
+            schedule="bireal_reference",
+            lr=0.001,
+            min_lr_factor=0.1,
+            num_epochs=256,
+        )
+        expected = {
+            0: 1e-3,
+            89: 1e-3,
+            90: 1e-4,
+            140: 1e-5,
+            180: 1e-6,
+            220: 1e-7,
+        }
+        for epoch, learning_rate in expected.items():
+            self.assertAlmostEqual(
+                training.learning_rate_for_epoch(epoch, args),
+                learning_rate,
+            )
 
     def test_retained_lut_layers_remain_available(self):
         self.assertTrue(issubclass(ComplexLUTConv2d, torch.nn.Module))

@@ -16,6 +16,7 @@ import training
 from complexPyTorch.complexBinaryResNet import BinaryComplexResNet
 from complexPyTorch.complexLayers import (
     AnalyticPairComparatorConv2d,
+    ComplexAvgPool2d,
     ComplexLUTConv2d,
     LUTAwareComplexBinaryConv2d,
     PairLUTNeuronConv2d,
@@ -34,6 +35,7 @@ def audit(root):
     if run_phase_scripts != [
         "run_phase1.sh",
         "run_phase2.sh",
+        "run_phase2_complex_bireal.sh",
         "run_phase3.sh",
         "run_phase3_pair_analytic.sh",
         "run_phase3_real_compatible.sh",
@@ -98,6 +100,40 @@ def audit(root):
     if any(".conv.conv_" in name for name, _ in phase3.named_parameters()):
         failures.append("Phase 3 pair-LUT path retains spatial convolution weights")
 
+    standard_bireal = BinaryComplexResNet(
+        in_channels=3,
+        num_blocks=1,
+        start_filters=2,
+        num_classes=10,
+        is_sar_input=False,
+        phase=2,
+        bireal_topology="standard",
+    )
+    if not hasattr(standard_bireal, "learn_imag"):
+        failures.append(
+            "standard complex Bi-Real CIFAR path has no LearnImagBlock"
+        )
+    if standard_bireal.stage2[0].proj is not None:
+        failures.append(
+            "standard complex Bi-Real Stage 2 has an unnecessary projection"
+        )
+    if not isinstance(standard_bireal.stage2[0].bn_pre, nn.Identity):
+        failures.append(
+            "standard complex Bi-Real block still has pre-activation BN"
+        )
+    stage3_projection = standard_bireal.stage3[0].proj
+    if (
+        stage3_projection is None
+        or not isinstance(stage3_projection[0], ComplexAvgPool2d)
+    ):
+        failures.append(
+            "standard complex Bi-Real downsample does not start with AvgPool"
+        )
+    if standard_bireal.stage2[0].conv.weight_proxy_mode != "bireal":
+        failures.append(
+            "standard complex Bi-Real does not use the reference weight proxy"
+        )
+
     analytic = BinaryComplexResNet(
         in_channels=3,
         num_blocks=1,
@@ -146,6 +182,8 @@ def main(argv=None):
     print("PASS: Phase 1/2 models instantiate no LUT modules")
     print("PASS: Phase 3 replaces spatial weights with pair-LUT neurons")
     print("PASS: analytic Phase 3 retains latent weights without trainable LUT entries")
+    print("PASS: standard complex Bi-Real retains the CIFAR LearnImagBlock")
+    print("PASS: standard complex Bi-Real residual topology matches the reference")
     print("PASS: retained LUT complex layers remain importable")
 
 

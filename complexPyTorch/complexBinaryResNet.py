@@ -9,6 +9,7 @@ from .complexLayers import (
     AnalyticPairComparatorConv2d,
     BinaryComplexActivation,
     BinaryComplexConv2d,
+    ComplexAvgPool2d,
     ComplexBatchNorm2d,
     ComplexConv2d,
     ComplexReLU,
@@ -20,6 +21,7 @@ from .complexResNet import LearnImagBlock, apply_spectral_pooling, _SPECTRAL_SCH
 
 ACTIVE_PHASES = (1, 2, 3)
 _BN_MODES = ("covariance", "naive", "none")
+_BIREAL_TOPOLOGIES = ("legacy", "standard")
 
 
 def _same_padding(kernel_size):
@@ -42,8 +44,11 @@ def _make_complex_batch_norm(num_features, mode, eps=1e-4):
 
 class BiRealComplexResidualBlock(nn.Module):
     """
-    标准的 Bi-Real 残差块 (单卷积极简拓扑 + 严格预激活)
-    结构: Shortcut + (BN -> Sign -> Conv -> BN)
+    Single-convolution complex Bi-Real residual block.
+
+    The legacy topology uses BN -> activation -> convolution -> BN. The
+    standard topology follows Bi-Real exactly after complex adaptation:
+    activation -> convolution -> BN.
     """
     def __init__(
         self,
@@ -66,19 +71,35 @@ class BiRealComplexResidualBlock(nn.Module):
         phase3_mode="lut",
         pre_bn_mode="covariance",
         post_bn_mode="covariance",
+        bireal_topology="legacy",
     ):
         super().__init__()
+        if bireal_topology not in _BIREAL_TOPOLOGIES:
+            raise ValueError(
+                "Unknown Bi-Real topology {!r}; expected one of {}".format(
+                    bireal_topology,
+                    _BIREAL_TOPOLOGIES,
+                )
+            )
         padding = _same_padding(kernel_size)
         self.projection = projection
         self.spectral_pool_scheme = spectral_pool_scheme
         self.spectral_pool_gamma = spectral_pool_gamma
         self.pre_bn_mode = pre_bn_mode
         self.post_bn_mode = post_bn_mode
-
-        # 1. 预激活 BN (用于拉平输入 x 的分布)
-        self.bn_pre = _make_complex_batch_norm(
-            in_channels, pre_bn_mode, eps=1e-4
+        self.bireal_topology = bireal_topology
+        weight_proxy_mode = (
+            "bireal"
+            if bireal_topology == "standard"
+            else "scaled_ste"
         )
+
+        if bireal_topology == "standard":
+            self.bn_pre = nn.Identity()
+        else:
+            self.bn_pre = _make_complex_batch_norm(
+                in_channels, pre_bn_mode, eps=1e-4
+            )
         
         # 2. 二值化激活 (Sign)
         if is_binary:
@@ -108,6 +129,7 @@ class BiRealComplexResidualBlock(nn.Module):
                         bias=False,
                         per_channel=per_channel,
                         weight_grad_mode=weight_grad_mode,
+                        weight_proxy_mode=weight_proxy_mode,
                         kernel_mode=lut_kernel_mode,
                     )
                 else:
@@ -118,6 +140,7 @@ class BiRealComplexResidualBlock(nn.Module):
                 self.conv = BinaryComplexConv2d(
                     in_channels, out_channels, kernel_size, stride=stride, padding=padding,
                     bias=False, per_channel=per_channel, weight_grad_mode=weight_grad_mode,
+                    weight_proxy_mode=weight_proxy_mode,
                 )
         else:
             self.act = ComplexReLU()
@@ -138,19 +161,29 @@ class BiRealComplexResidualBlock(nn.Module):
         # 5. Projection (Shortcut) 模块
         # 当通道数改变或下采样时，使用全精度 1x1 卷积对齐维度
         if projection or stride != 1 or in_channels != out_channels:
-            self.proj = nn.Sequential(
+            projection_layers = []
+            if bireal_topology == "standard" and stride != 1:
+                projection_layers.append(
+                    ComplexAvgPool2d(kernel_size=2, stride=stride)
+                )
+            projection_layers.extend([
                 ComplexConv2d(
                     in_channels,
                     out_channels,
                     kernel_size=1,
-                    stride=stride,
+                    stride=(
+                        1
+                        if bireal_topology == "standard"
+                        else stride
+                    ),
                     padding=0,
                     bias=False,
                 ),
                 _make_complex_batch_norm(
                     out_channels, post_bn_mode, eps=1e-4
-                )
-            )
+                ),
+            ])
+            self.proj = nn.Sequential(*projection_layers)
         else:
             self.proj = None
 
@@ -158,8 +191,8 @@ class BiRealComplexResidualBlock(nn.Module):
         identity = x
 
         # 主干分支：严格按照 BN -> Act -> Conv -> BN
-        out = self.bn_pre(x)
-        out = self.act(out)
+        # out = self.bn_pre(x)
+        out = self.act(x)
         
         if self.projection and self.spectral_pool_scheme == "proj":
             out = apply_spectral_pooling(out, self.spectral_pool_gamma)
@@ -200,6 +233,7 @@ class BinaryComplexResNet(nn.Module):
         phase3_mode="lut",
         pre_bn_mode="covariance",
         post_bn_mode="covariance",
+        bireal_topology="legacy",
     ):
         super().__init__()
         if phase not in ACTIVE_PHASES:
@@ -208,6 +242,13 @@ class BinaryComplexResNet(nn.Module):
             )
         if spectral_pool_scheme not in _SPECTRAL_SCHEMES:
             raise ValueError(f"Unknown spectral_pool_scheme: {spectral_pool_scheme}")
+        if bireal_topology not in _BIREAL_TOPOLOGIES:
+            raise ValueError(
+                "Unknown Bi-Real topology {!r}; expected one of {}".format(
+                    bireal_topology,
+                    _BIREAL_TOPOLOGIES,
+                )
+            )
         
         self.num_blocks = num_blocks
         self.actual_blocks_per_stage = num_blocks * 2 # 将标准的 2 层块展开为 2 个单层 Bi-Real 块
@@ -223,6 +264,7 @@ class BinaryComplexResNet(nn.Module):
         self.phase3_mode = phase3_mode
         self.pre_bn_mode = pre_bn_mode
         self.post_bn_mode = post_bn_mode
+        self.bireal_topology = bireal_topology
 
         for mode in (pre_bn_mode, post_bn_mode):
             if mode not in _BN_MODES:
@@ -241,11 +283,21 @@ class BinaryComplexResNet(nn.Module):
         if binary_stem:
             self.conv1 = BinaryComplexConv2d(
                 in_channels, start_filters, kernel_size=3, stride=1, padding=1, bias=False,
-                per_channel=per_channel, weight_grad_mode=weight_grad_mode
+                per_channel=per_channel, weight_grad_mode=weight_grad_mode,
+                weight_proxy_mode=(
+                    "bireal"
+                    if bireal_topology == "standard"
+                    else "scaled_ste"
+                ),
             )
         else:
             self.conv1 = ComplexConv2d(in_channels, start_filters, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = ComplexBatchNorm2d(start_filters, eps=1e-4)
+        if bireal_topology == "standard":
+            self.bn1 = _make_complex_batch_norm(
+                start_filters, post_bn_mode, eps=1e-4
+            )
+        else:
+            self.bn1 = ComplexBatchNorm2d(start_filters, eps=1e-4)
 
         # 构建三个特征提取阶段 (Stage 2, 3, 4)
         channels = start_filters
@@ -279,9 +331,15 @@ class BinaryComplexResNet(nn.Module):
         """辅助函数：构建单个 Stage"""
         layers = []
         # Stage 的第一个 Block 负责处理下采样和维度匹配
+        first_projection = (
+            self.bireal_topology == "legacy"
+            or stride != 1
+            or in_channels != out_channels
+        )
         layers.append(
             BiRealComplexResidualBlock(
-                in_channels, out_channels, stride=stride, projection=True,
+                in_channels, out_channels, stride=stride,
+                projection=first_projection,
                 spectral_pool_scheme=self.spectral_pool_scheme, spectral_pool_gamma=self.spectral_pool_gamma,
                 per_channel=per_channel, weight_grad_mode=weight_grad_mode, act_grad_mode=act_grad_mode,
                 is_binary=self.is_binary, phase=self.phase,
@@ -291,6 +349,7 @@ class BinaryComplexResNet(nn.Module):
                 phase3_mode=self.phase3_mode,
                 pre_bn_mode=self.pre_bn_mode,
                 post_bn_mode=self.post_bn_mode,
+                bireal_topology=self.bireal_topology,
             )
         )
         # Stage 的后续 Blocks 保持维度不变
@@ -307,6 +366,7 @@ class BinaryComplexResNet(nn.Module):
                     phase3_mode=self.phase3_mode,
                     pre_bn_mode=self.pre_bn_mode,
                     post_bn_mode=self.post_bn_mode,
+                    bireal_topology=self.bireal_topology,
                 )
             )
         return nn.ModuleList(layers)

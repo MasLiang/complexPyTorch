@@ -660,6 +660,7 @@ def build_model(args, num_classes):
         phase3_mode=args.phase3_mode,
         pre_bn_mode=args.pre_bn_mode,
         post_bn_mode=args.post_bn_mode,
+        bireal_topology=args.bireal_topology,
     )
 
 
@@ -758,6 +759,12 @@ def build_optimizer(args, model):
 def learning_rate_for_epoch(epoch, args):
     if args.schedule == "constant":
         return args.lr
+    if args.schedule == "bireal_reference":
+        decay_count = sum(
+            epoch >= milestone
+            for milestone in (90, 140, 180, 220)
+        )
+        return args.lr * (0.1 ** decay_count)
     if args.schedule == "cosine":
         progress = epoch / float(max(args.num_epochs - 1, 1))
         minimum = args.lr * args.min_lr_factor
@@ -1552,6 +1559,15 @@ def parse_args(argv=None):
         choices=["covariance", "naive", "none"],
         help="Complex normalization after main and projection convolutions",
     )
+    parser.add_argument(
+        "--bireal-topology",
+        default="legacy",
+        choices=["legacy", "standard"],
+        help=(
+            "Residual topology: legacy keeps the existing pre-BN path; "
+            "standard matches CIFAR Bi-Real after the LearnImagBlock"
+        ),
+    )
     parser.add_argument("--no-validation", action="store_true")
     parser.add_argument(
         "--augmentation",
@@ -1583,7 +1599,13 @@ def parse_args(argv=None):
     parser.add_argument(
         "--schedule",
         default="bireal",
-        choices=["bireal", "cosine", "constant", "linear"],
+        choices=[
+            "bireal",
+            "bireal_reference",
+            "cosine",
+            "constant",
+            "linear",
+        ],
     )
     parser.add_argument("--min-lr-factor", default=0.01, type=float)
     parser.add_argument("--lut-lr", default=0.01, type=float)

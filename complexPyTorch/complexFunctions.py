@@ -256,14 +256,41 @@ def binary_scale_weight_complex(weight, per_channel=True):
         
     return alpha
 
-def complex_binary_weight(weight, per_channel=True, grad_mode="ste"):
-    # 获取统一的缩放因子
+def complex_binary_weight(
+    weight,
+    per_channel=True,
+    grad_mode="ste",
+    proxy_mode="scaled_ste",
+):
+    """Binarize a complex weight with a selectable backward proxy."""
     alpha = binary_scale_weight_complex(weight, per_channel=per_channel)
-    
-    # 对实部和虚部进行符号二值化，并乘以相同的 alpha
+
+    if proxy_mode == "bireal":
+        # Match HardBinaryConv: hard scaled signs in forward, clipped latent
+        # weights in backward. The scale is deliberately detached.
+        alpha = alpha.detach()
+        clipped_real = weight.real.clamp(-1.0, 1.0)
+        clipped_imag = weight.imag.clamp(-1.0, 1.0)
+        hard_real = alpha * weight.real.sign()
+        hard_imag = alpha * weight.imag.sign()
+        real = (
+            hard_real.detach()
+            - clipped_real.detach()
+            + clipped_real
+        )
+        imag = (
+            hard_imag.detach()
+            - clipped_imag.detach()
+            + clipped_imag
+        )
+        return torch.complex(real, imag)
+    if proxy_mode != "scaled_ste":
+        raise ValueError(
+            "Unknown complex binary-weight proxy mode: {}".format(proxy_mode)
+        )
+
     real = binary_sign(weight.real, grad_mode=grad_mode) * alpha
     imag = binary_sign(weight.imag, grad_mode=grad_mode) * alpha
-    
     return torch.complex(real, imag)
 
 def complex_binary_activation(inp, grad_mode="bireal"):

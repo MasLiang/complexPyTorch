@@ -1192,3 +1192,185 @@ GPU_ID=2 WORKDIR=runs/phase3_pair_analytic_scratch ./run_phase3_pair_analytic.sh
 - 无 OOM 或 kernel error
 
 因此专用 launcher 默认 batch size 256 可直接作为第一组正式实验。
+
+<!-- experiment-entry:real-vs-complex-hard-lut-audit-20260730 -->
+## 2026-07-30 - Real-vs-complex hard-LUT function audit
+
+### 问题
+
+实数域 LUT-BiReal 使用局部硬 0/1 LUT 后可以从头训练，而当前复数 LUT-as-neuron 路线在硬局部输出下长期停在约 50%。本次不再只比较模块名称，而是逐项核对 forward、backward、局部函数族、残差拓扑和训练结果。
+
+### 对齐的函数
+
+1. **激活前向与代理梯度**
+   - 实数域 `BinaryActivation` 前向为 `x > 0` 的 0/1 bit，反向导数在 `|x| < 1` 内为 `1-|x|`。
+   - 复数自由 pair-LUT 路径先用 `BinaryComplexActivation` 产生 -1/+1，导数为 `2(1-|x|)`，再在 `PairLUTNeuronConv2d` 中映射 `(x+1)/2`。合成导数同样是 `1-|x|`。
+   - 因而自由 pair-LUT 的激活代理梯度与实数参考一致。
+
+2. **硬表项与 logit 梯度**
+   - 实数域和复数 `real_compatible` 都用 `logit >= 0` 得到硬 0/1 entry，并对 logit 使用 identity STE。
+   - Adam、初始 LR 0.01、线性衰减、无 LUT weight decay、bimodal `N(-1,0.2)` / `N(+1,0.1)` 初始化均已对齐。
+
+3. **LUT 输入与 entry backward**
+   - 两个 binary CUDA kernel 都给命中的 entry 累积上游梯度。
+   - 输入 bit 梯度都是相邻表项有限差分 `table(bit=1)-table(bit=0)`。
+   - 当前测试覆盖了 complex binary kernel 和浮点多线性参考的 forward/backward 一致性。因此暂未发现 CUDA backward 语义错误。
+
+4. **输出求和与 BN**
+   - 实数域先求和 0/1 LUT 输出，再由 post-BN 去均值和缩放。
+   - 复数域先做 `4*(count-P/2)` 再进入 post-BN。只要 post-BN 存在，常数平移和固定缩放在训练态原则上被 BN 消除。
+   - covariance/naive、pre-BN on/off 四组消融都约为 49%-51%，也说明 BN 类型不是主因。
+
+### 真正不等价的函数
+
+1. **局部函数容量不是由压缩比决定**
+   - 一个任意 LUT6->1 有 64 个独立 INIT bit，可表示 `2^64` 个 Boolean 函数，并产生六阶输入交互。
+   - 当前一个物理 pair neuron 是共享四个输入的两个 LUT4->1，一共只有 32 个独立 INIT bit，可表示 `2^32` 个双输出映射；每个输出只看到四个 bit。
+   - 所以 4->2 看似比 6->1 压缩轻，但局部函数族反而小了平方级。当前实现还留下了 LUT6_2 的输入/INIT 容量未使用。
+
+2. **解析复数 comparator 不是实数自由 LUT**
+   - 两个二值复数乘积的单个分量之和只可能为 `{-4,-2,0,2,4}`，概率分别为 `{1/16,4/16,6/16,4/16,1/16}`。
+   - 精确零占 `37.5%`；使用 `>=0` 后正 bit 占 `11/16=68.75%`。
+   - 枚举 checkpoint 得到 hard ones `0.6876`、Boolean sensitivity `0.3748`，与理论完全一致。
+   - 解析层的一个权重 sign 控制一批 truth-table entries；它跨零会同时改变大量地址。实数自由 LUT 则每个 entry 独立跨零。
+   - 当前解析层反向使用连续 binary complex convolution 作为 dense proxy；实数 LUT 的输入反向是硬表有限差分。两者并不相同。
+
+3. **自由实/虚 LUT 破坏了原复数结构**
+   - Phase 2 的实部和虚部由同一组 `w_r,w_i` 通过复数乘法共同约束，输出与后续 complex BN、complex projection、complex residual 的语义一致。
+   - 随机 pair-LUT 的实表和虚表完全独立，但网络其余位置仍使用受限的复数线性结构。模型必须同时学习分类函数和重新协调两个输出流。
+   - 最佳硬模型的实/虚表 Hamming 距离为 `0.5014`，说明训练后仍接近独立随机函数，没有形成明显的成对结构。
+
+4. **残差投影仍未完全复制实数网络**
+   - 实数参考下采样为 AvgPool -> unrestricted real 1x1 Conv -> BN。
+   - 当前复数网络为 stride-2 complex 1x1 Conv -> complex/naive BN。
+   - Phase 2 对照能达到 80.96%，所以这不是硬 LUT 失败的单一原因，但在 arbitrary paired LUT 输出已经不再遵守复数乘法时，这个结构约束可能成为重要放大器。
+
+### 关键结果
+
+- 实数参考 `log_lr0p01.txt`: best 87.50% at epoch 132；`log_2x.txt`: best/final 83.47% at epoch 256。
+- 对齐实数训练 recipe 的复数 Phase 2 scratch: best test 80.96%。
+- 硬随机 pair-LUT，no-pre/cov-post: best test 51.33%，final 50.12%，final train 41.78%。
+- 硬解析 pair-comparator scratch: best test 50.22%，final 49.70%，final train 40.59%。
+- 从 Phase 2 初始化的 soft pair-LUT 在 44 epoch 内 best 71.77%，但 hard sign diff 始终为 0；其提升来自连续 soft table，而不是学出了新硬函数。
+
+### Checkpoint 结构审计
+
+新增 `scripts/analyze_pair_lut_checkpoint.py` 后分析 no-pre/cov-post 最佳模型：
+
+- 126,412 个标量 Boolean 函数，2,022,592 个 entries。
+- sign flip `470202/2022592 = 23.25%`，说明 entry 确实在更新。
+- ones `0.5009`，常量函数约 0，平均 sensitivity `0.4972`。
+- 实/虚 Hamming `0.5014`。
+- 结论：表没有冻结或常量化，但整体 Boolean 结构仍与随机初始化极其相似，更新没有形成协调的局部特征族。
+
+新增 `scripts/analyze_pair_lut_states.py`，在最佳模型和 512 张测试图上统计地址：
+
+- 平均 entropy `3.3315/4 bit`，等效 `10.73/16` 个状态。
+- 平均观察到 `98.86%` 的地址。
+- 第一层相关性较强，但后层大多数 pair 的 16 个地址都被访问。
+- 结论：训练失败不能主要归因于大量 LUT entry 从未被访问。
+
+### 当前结论
+
+“复数域不能训练硬截断”并不准确。当前失败来自两个不同机制：
+
+- 解析路线保留复数语义，但局部多数比较器有 37.5% tie、强信息压缩、粗粒度权重 sign 跳变和不匹配的 dense proxy。
+- 自由 LUT 路线使用了正确的实数式 STE，却把 LUT6->1 换成容量更小的共享输入 LUT4x2，并让独立实/虚 Boolean 函数继续穿过受限复数骨架。它不是实数网络的逐函数复刻。
+
+### 下一步判别顺序
+
+1. **精确 scalarized LUT6 control**：把 real/imag 拼成 `2C` 个普通标量 channel，完全复制实数 LUT6->1、real BN、real projection 和 residual；输出 `2O` 后再成对解释。若该控制恢复到 80% 左右，根因就是当前 LUT4x2/复数骨架，而非硬 LUT 训练本身。
+2. **硬件候选 LUT5_2**：每个物理 LUT6_2 共享 5 个 activation bit，产生两个独立 5-input 输出。它有 64 个 INIT bit，与实数 LUT6->1 的参数容量相同，同时比当前 LUT4x2 使用更少的物理 cell group。
+3. 在完成上述 topology control 前，不再优先扫 LR、tau 或 BN；现有证据已经表明这些不是决定性变量。
+
+### 本次文件改动
+
+- `scripts/analyze_pair_lut_checkpoint.py`：可复用的 hard-table 结构、sign diff、Boolean sensitivity、实虚 Hamming 和 logit margin 分析。
+- `scripts/analyze_pair_lut_states.py`：可复用的真实数据 LUT 地址 occupancy、entropy 和 bit balance 分析。
+
+<!-- experiment-entry:standard-complex-bireal-learnimag-20260730 -->
+## 2026-07-30 - Standard complex Bi-Real baseline with CIFAR LearnImagBlock
+
+### Goal
+
+Establish a clean Phase 2 control that reproduces the standard CIFAR Bi-Real residual trunk in the complex domain before returning to the LUT comparison. Per the clarified requirement, CIFAR's real-valued image input must still pass through `LearnImagBlock`; only the trunk after that complex frontend is aligned to Bi-Real.
+
+### Design
+
+- Added `--bireal-topology {legacy,standard}`, defaulting to `legacy`. Existing commands, checkpoints, and Phase 3 experiments therefore retain their previous topology unless the new mode is requested explicitly.
+- The `standard` block is `BinaryComplexActivation -> BinaryComplexConv2d -> complex post-BN -> residual add`. It has no pre-BN.
+- Stage 2 has no projection when shape is unchanged. Stage 3/4 shortcuts use `ComplexAvgPool2d(2, stride=2) -> full-precision ComplexConv2d(1x1, stride=1) -> complex BN`, matching the real CIFAR Bi-Real topology.
+- `num_blocks=3` still expands to six one-convolution Bi-Real blocks per stage, matching the reference ResNet-20 layout.
+- The existing signed activation already matches the standard Bi-Real forward and proxy backward: `sign(x)` in forward and `2 * max(1 - abs(x), 0)` in backward.
+- Added the exact Bi-Real weight proxy for standard mode: forward uses detached `alpha * sign(w)`; backward passes through `clamp(w, -1, 1)` directly. This removes the extra `alpha` multiplier that the legacy STE applies to weight gradients.
+- Intentional complex-domain differences remain: `LearnImagBlock`, complex activation/weights, complex convolution arithmetic, complex BN, and concatenated real/imaginary features at the classifier. The dedicated launcher defaults to covariance complex BN, but `POST_BN_MODE` remains configurable.
+
+### Training Configuration
+
+Added `run_phase2_complex_bireal.sh`. Its defaults reproduce the real reference training setup where applicable:
+
+- Phase 2 from scratch; CIFAR `LearnImagBlock` enabled.
+- 256 epochs, batch size 128, start filters 16, three logical blocks (six Bi-Real blocks per stage).
+- Adam, initial LR `0.001`, weight decay 0, no gradient norm/value clipping.
+- New `bireal_reference` schedule with 0.1 decays at epochs 90, 140, 180, and 220.
+- CIFAR AutoAugment-compatible `real_lut` augmentation, label smoothing 0.1, and train/test-only evaluation via `--no-validation`.
+- Run command: `GPU_ID=1 WORKDIR=runs/phase2_complex_bireal_gpu1 ./run_phase2_complex_bireal.sh`.
+
+### Modified Files
+
+- `complexPyTorch/complexFunctions.py`: added the selectable `bireal` binary-weight forward/backward proxy while retaining `scaled_ste` as the default.
+- `complexPyTorch/complexLayers.py`: wired `weight_proxy_mode` into binary complex convolution and the analytic comparator without changing old defaults.
+- `complexPyTorch/complexBinaryResNet.py`: added the selectable standard topology, preserved `LearnImagBlock`, removed pre-BN only in standard mode, corrected Stage 2 projection, and implemented AvgPool-first downsample shortcuts.
+- `training.py`: exposed `--bireal-topology`, passed it into the model, and added the exact reference LR milestones.
+- `run_phase2_complex_bireal.sh`: added the executable standard-baseline launcher.
+- `tests/test_phase12_route.py`: added topology, frontend, shortcut, state-key, weight-gradient, schedule, and forward/backward coverage.
+- `scripts/audit_active_route.py`: added the launcher to the active-route inventory and structural checks for the standard complex Bi-Real route.
+- `EXPERIMENT_LOG.md`: recorded this implementation, rationale, command, and verification.
+
+### Verification
+
+- `bash -n run_phase2_complex_bireal.sh`: passed.
+- Python compilation of all changed Python files: passed.
+- `conda run -n lut_net python -m unittest tests.test_phase12_route`: 14 tests passed.
+- `conda run -n lut_net python -m unittest tests.test_pair_lut_phase3`: 16 tests passed, confirming the legacy Phase 3 path remains intact.
+- `conda run -n lut_net python scripts/audit_active_route.py`: passed all route and topology checks.
+- `conda run -n lut_net ./run_phase2_complex_bireal.sh --help`: launcher reached the training CLI successfully with the intended defaults.
+- No long training run was started by this change; accuracy must be evaluated from the new workdir before using this topology as the Phase 3 baseline.
+
+<!-- experiment-entry:archive-before-clean-four-lutconv-20260801 -->
+## 2026-08-01 - Archive boundary before clean four-LUTConv Bi-Real route
+
+### Confirmed Baseline
+
+- `runs/phase2_complex_bireal_gpu1` completed 256 epochs.
+- Best test accuracy is `85.05%` at epoch 242; final test accuracy is `84.65%`.
+- This validates the standard complex Bi-Real trunk with the CIFAR `LearnImagBlock`, no residual pre-BN, and reference Bi-Real optimizer/schedule.
+- The result is now the only Phase 2 baseline for the next route.
+
+### Current Source Snapshot
+
+The working tree contains two groups of relevant source changes that must be archived before cleanup:
+
+- Standard complex Bi-Real alignment in `complexFunctions.py`, `complexLayers.py`, `complexBinaryResNet.py`, `training.py`, the Phase 2 launcher, tests, and route audit.
+- New differentiable LUTConv CUDA work in `complexPyTorch/lut_backend.py`, `lut_cuda/setup.py`, the tracked LUT CUDA backends, and the new BAFW/BFFB CUDA sources.
+
+The current source also still contains the previous pair-LUT route:
+
+- `PairLUTNeuronConv2d` and `AnalyticPairComparatorConv2d`.
+- Pair-specific Phase 2-to-3 conversion, random initialization, annealing, sign-diff capture, checkpoint table capture, scripts, launchers, tests, and audit assertions.
+- `BinaryLUTComplexConv2d` exists as an unwired development class. At this archive point, `complexBinaryResNet.py` still instantiates `PairLUTNeuronConv2d` for Phase 3.
+
+### New Route Definition
+
+After this snapshot is committed and pushed to an archive branch, a new local-only route will be cleaned to the following contract:
+
+- Phase 1: full-precision complex network.
+- Phase 2: standard complex Bi-Real network.
+- Phase 3: exactly the same Bi-Real topology, normalization, residual, projection, stem, and classifier as Phase 2; only each `BinaryComplexConv2d` is replaced by a four-branch LUT complex convolution.
+- The four real-valued branches are `x_r -> y_r`, `x_i -> y_r`, `x_i -> y_i`, and `x_r -> y_i`, combined as the standard complex expression `y_r = rr - ii`, `y_i = ir + ri`.
+- Pair-LUT code and its command-line surface will be removed from the clean version.
+- The cleaned route will remain local and unpushed until its behavior is verified.
+
+### Git Scope
+
+The archive commit will include source, CUDA source, scripts, tests, launcher, and this experiment record. It will explicitly exclude checkpoints, datasets, PDFs, backup directories, Python bytecode, compiled shared objects, object files, and build metadata.

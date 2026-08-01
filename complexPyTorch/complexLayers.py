@@ -21,7 +21,7 @@ from torch.nn import (
     PReLU
 )
 
-from .lut_backend import LUTFloatingConvFunction, LUTBinaryConvFunction
+from .lut_backend import LUTConvFP32Function, LUTBafwConvFunction, LUTBffbConvFunction, LUTBinaryConvFunction
 from .complexFunctions import (
     complex_relu,
     complex_tanh,
@@ -241,8 +241,15 @@ class BinaryComplexConv2d(Module):
         bias=True,
         per_channel=True,
         weight_grad_mode="ste",
+        weight_proxy_mode="scaled_ste",
     ):
         super().__init__()
+        if weight_proxy_mode not in ("scaled_ste", "bireal"):
+            raise ValueError(
+                "Unknown binary-weight proxy mode: {}".format(
+                    weight_proxy_mode
+                )
+            )
         self.conv_r = Conv2d(
             in_channels,
             out_channels,
@@ -269,6 +276,7 @@ class BinaryComplexConv2d(Module):
         self.groups = groups
         self.per_channel = per_channel
         self.weight_grad_mode = weight_grad_mode
+        self.weight_proxy_mode = weight_proxy_mode
 
     def forward(self, inp):
         weight = torch.complex(self.conv_r.weight, self.conv_i.weight)
@@ -276,6 +284,7 @@ class BinaryComplexConv2d(Module):
             weight,
             per_channel=self.per_channel,
             grad_mode=self.weight_grad_mode,
+            proxy_mode=self.weight_proxy_mode,
         )
         w_r = weight.real
         w_i = weight.imag
@@ -1173,8 +1182,6 @@ class PairLUTNeuronConv2d(Module):
         pair_channels = channels.view(self.pair_num, 2)
         pair_dy = dy.view(self.pair_num, 2)
         pair_dx = dx.view(self.pair_num, 2)
-        dummy_r = 2 * self.in_channels
-        dummy_i = dummy_r + 1
         input_channels = torch.empty(
             self.pair_num,
             self.LUT_K,
@@ -1187,13 +1194,12 @@ class PairLUTNeuronConv2d(Module):
                 channel = int(pair_channels[pair_index, item_index])
                 bit_base = item_index * 2
                 if channel < 0:
-                    input_channels[pair_index, bit_base] = dummy_r
-                    input_channels[pair_index, bit_base + 1] = dummy_i
-                else:
-                    input_channels[pair_index, bit_base] = channel
-                    input_channels[pair_index, bit_base + 1] = (
-                        self.in_channels + channel
+                    raise ValueError(
+                        "Encountered invalid negative channel index while "
+                        "building LUT input mapping"
                     )
+                input_channels[pair_index, bit_base] = 2 * channel
+                input_channels[pair_index, bit_base + 1] = 2 * channel + 1
                 input_dy[pair_index, bit_base:bit_base + 2] = pair_dy[
                     pair_index,
                     item_index,
@@ -1212,6 +1218,8 @@ class PairLUTNeuronConv2d(Module):
         self.register_buffer("input_dy", input_dy.to(torch.int32))
         self.register_buffer("input_dx", input_dx.to(torch.int32))
         self.register_buffer("unfold_indices", unfold_indices)
+
+        self.initialize_bimodal()
 
     def initialize_from_phase2_weights(
         self,
@@ -1542,22 +1550,21 @@ class PairLUTNeuronConv2d(Module):
         )
         signed_r = inp.real + (hard_r - inp.real).detach()
         signed_i = inp.imag + (hard_i - inp.imag).detach()
-        dummy = torch.zeros(
+
+        # Interleave real/imag values in the flattened spatial-major order
+        # used by the CUDA kernel: for each spatial location, the linearized
+        # channel order becomes [r0, i0, r1, i1, ...], so the real and
+        # imaginary parts of the same logical input sit next to each other.
+        x_prob = torch.zeros(
             inp.size(0),
-            2,
+            2 * self.in_channels,
             inp.size(2),
             inp.size(3),
             dtype=inp.real.dtype,
             device=inp.device,
         )
-        x_prob = torch.cat(
-            [
-                (signed_r + 1.0) / 2.0,
-                (signed_i + 1.0) / 2.0,
-                dummy,
-            ],
-            dim=1,
-        )
+        x_prob[:, 0 : 2 * self.in_channels : 2, :, :] = (signed_r + 1.0) / 2.0
+        x_prob[:, 1 : 2 * self.in_channels : 2, :, :] = (signed_i + 1.0) / 2.0
         table_r = annealed_binary_table(
             self.lut_r,
             self.tau,
@@ -1584,9 +1591,11 @@ class PairLUTNeuronConv2d(Module):
         )
         count_r = lut_forward(x_prob, table_r)
         count_i = lut_forward(x_prob, table_i)
-        scale = self.output_scale.view(1, -1, 1, 1)
-        output_r = (count_r - self.pair_num / 2.0) * 4.0 * scale
-        output_i = (count_i - self.pair_num / 2.0) * 4.0 * scale
+        #scale = self.output_scale.view(1, -1, 1, 1)
+        #output_r = (count_r - self.pair_num / 2.0) * 4.0 * scale
+        #output_i = (count_i - self.pair_num / 2.0) * 4.0 * scale
+        output_r = count_r
+        output_i = count_i
         return torch.complex(output_r, output_i)
 
     def extra_repr(self):
@@ -1630,6 +1639,7 @@ class AnalyticPairComparatorConv2d(BinaryComplexConv2d):
         bias=False,
         per_channel=True,
         weight_grad_mode="ste",
+        weight_proxy_mode="scaled_ste",
         kernel_mode="auto",
     ):
         if not isinstance(kernel_size, int):
@@ -1659,6 +1669,7 @@ class AnalyticPairComparatorConv2d(BinaryComplexConv2d):
             bias=False,
             per_channel=per_channel,
             weight_grad_mode=weight_grad_mode,
+            weight_proxy_mode=weight_proxy_mode,
         )
         self.pair_lut = PairLUTNeuronConv2d(
             in_channels,
@@ -1689,6 +1700,14 @@ class AnalyticPairComparatorConv2d(BinaryComplexConv2d):
         weight_r = self.conv_r.weight
         weight_i = self.conv_i.weight
         complex_weight = torch.complex(weight_r, weight_i)
+        if self.weight_proxy_mode == "bireal":
+            proxy = complex_binary_weight(
+                complex_weight,
+                per_channel=self.per_channel,
+                grad_mode=self.weight_grad_mode,
+                proxy_mode="bireal",
+            )
+            return proxy.real, proxy.imag
         alpha = binary_scale_weight_complex(
             complex_weight,
             per_channel=self.per_channel,
@@ -1958,3 +1977,126 @@ class ComplexLUTConv2d(Module):
         out_i = (out_i - (self.lut_num / 2.0)) * 4.0 * alpha
 
         return torch.complex(out_r, out_i)
+
+class LUTBinaryConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, group_num=1, init_cfg=[-1, 0.1, 1, 0.1]):
+        super(LUTBinaryConv2d, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.groups = group_num
+        self.K = kernel_size
+        self.stride = stride
+        self.padding = padding
+
+        self.lut_num = (in_channels // group_num) * kernel_size * kernel_size // 6
+        
+        self.weight = nn.Parameter(torch.randn(self.lut_num, 64, out_channels))
+        bimodal_initialization(self.weight, init_cfg=init_cfg)
+
+        self.register_buffer('offsets', None)
+        self.register_buffer('shifts', None)
+        self.offsets_padded_W = -1 
+
+    def _precompute_offsets(self, device, padded_W):
+        packed_C = (self.in_channels + 31) // 32
+        ic_per_g = self.in_channels // self.groups
+        K_sq = self.K * self.K
+        
+        l = torch.arange(self.lut_num, device=device).unsqueeze(1)
+        i = torch.arange(6, device=device).unsqueeze(0)
+        
+        group_id = (l * self.groups) // self.lut_num 
+        ic_start = group_id * ic_per_g
+        
+        initial_idx = (l * 6 + i) % (ic_per_g * K_sq)
+        ic = ic_start + (initial_idx // K_sq)
+        sp = initial_idx % K_sq
+        
+        dy = sp // self.K
+        dx = sp % self.K
+        c_word = ic // 32
+        c_shift = ic % 32
+        
+        abs_offset = (dy * padded_W + dx) * packed_C + c_word
+        
+        self.offsets = abs_offset.flatten().to(torch.int32)
+        self.shifts = c_shift.flatten().to(torch.int32)
+
+    def forward(self, x):
+        padded_W = x.shape[3] + 2 * self.padding
+        if self.offsets is None or self.offsets_padded_W != padded_W:
+            self._precompute_offsets(x.device, padded_W)
+            self.offsets_padded_W = padded_W
+
+        w_q = binary_gumbel_softmax(self.weight, tau=1, hard=True)
+
+        return LUTBinaryConvFunction.apply(
+            x, w_q, 
+            self.offsets, self.shifts, 
+            self.groups, self.K, self.stride, self.padding
+        )
+
+class BinaryLUTComplexConv2d(Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias=True,
+        per_channel=True,
+        weight_grad_mode="ste",
+        weight_proxy_mode="scaled_ste",
+    ):
+        super().__init__()
+        if weight_proxy_mode not in ("scaled_ste", "bireal"):
+            raise ValueError(
+                "Unknown binary-weight proxy mode: {}".format(
+                    weight_proxy_mode
+                )
+            )
+        self.conv_r = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            group_num=groups,
+        )
+        self.conv_i = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            group_num=groups,
+        )
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self.per_channel = per_channel
+        self.weight_grad_mode = weight_grad_mode
+        self.weight_proxy_mode = weight_proxy_mode
+
+    def forward(self, inp):
+        weight = torch.complex(self.conv_r.weight, self.conv_i.weight)
+        weight = complex_binary_weight(
+            weight,
+            per_channel=self.per_channel,
+            grad_mode=self.weight_grad_mode,
+            proxy_mode=self.weight_proxy_mode,
+        )
+        w_r = weight.real
+        w_i = weight.imag
+
+        real = self.conv_r(inp.real)
+        real = real - self.conv_i(inp.imag)
+
+        imag = self.conv_r(inp.imag)
+        imag = imag + self.conv_i(inp.real)
+
+        return torch.complex(real, imag)
