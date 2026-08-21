@@ -248,7 +248,7 @@ __global__ void lut_conv_fp32_backward_kernel(
 
         #pragma unroll
         for (int k = 0; k < 6; ++k) {
-            float val = dx_accum[k];
+            float val = valid_oc ? dx_accum[k] : 0.0f;
             #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) val += __shfl_down_sync(FULL_MASK, val, offset);
             int target = __shfl_sync(FULL_MASK, loaded_idx, k);

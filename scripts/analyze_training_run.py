@@ -3,20 +3,23 @@
 
 import argparse
 import json
+import math
 import re
 import shlex
 import sys
 from pathlib import Path
 
 
+FLOAT_PATTERN = r"(?:[-+0-9.eE]+|[-+]?(?:nan|inf))"
 EPOCH_PATTERN = re.compile(
     r"Epoch\s+(?P<epoch>\d+)\s+"
-    r"train_loss:\s*(?P<train_loss>[-+0-9.eE]+),\s*"
-    r"train_acc:\s*(?P<train_acc>[-+0-9.eE]+),\s*"
-    r"val_loss:\s*(?P<val_loss>[-+0-9.eE]+),\s*"
-    r"val_acc:\s*(?P<val_acc>[-+0-9.eE]+),\s*"
-    r"test_loss:\s*(?P<test_loss>[-+0-9.eE]+),\s*"
-    r"test_acc:\s*(?P<test_acc>[-+0-9.eE]+)"
+    r"train_loss:\s*(?P<train_loss>{}),\s*"
+    r"train_acc:\s*(?P<train_acc>{}),\s*"
+    r"val_loss:\s*(?P<val_loss>{}),\s*"
+    r"val_acc:\s*(?P<val_acc>{}),\s*"
+    r"test_loss:\s*(?P<test_loss>{}),\s*"
+    r"test_acc:\s*(?P<test_acc>{})".format(*([FLOAT_PATTERN] * 6)),
+    re.IGNORECASE,
 )
 CONFIG_PATTERN = re.compile(r"Configuration:\s*(\{.*\})")
 INVOCATION_PATTERN = re.compile(r"INVOCATION:\s*(.*)$", re.MULTILINE)
@@ -96,14 +99,30 @@ def summarize(workdir):
             if last["epoch"] >= requested_epochs
             else "incomplete"
         )
-    best_val = max(rows, key=lambda row: row["val_acc"])
-    best_test = max(rows, key=lambda row: row["test_acc"])
+    metric_names = (
+        "train_loss", "train_acc", "val_loss", "val_acc", "test_loss", "test_acc"
+    )
+    finite_rows = [
+        row for row in rows
+        if all(math.isfinite(row[name]) for name in metric_names)
+    ]
+    first_nonfinite = next(
+        (row for row in rows
+         if not all(math.isfinite(row[name]) for name in metric_names)),
+        None,
+    )
+    if not finite_rows:
+        raise RuntimeError("No finite epoch rows found in {}".format(log_path))
+    best_val = max(finite_rows, key=lambda row: row["val_acc"])
+    best_test = max(finite_rows, key=lambda row: row["test_acc"])
     result = {
         "workdir": str(workdir),
         "log": str(log_path),
         "status": status,
         "configuration": configuration,
         "epochs_logged": len(rows),
+        "finite_epochs_logged": len(finite_rows),
+        "first_nonfinite": first_nonfinite,
         "last": last,
         "best_validation": best_val,
         "best_test": best_test,
@@ -149,8 +168,14 @@ def to_markdown(result):
             last["val_acc"],
             last["test_acc"],
         ),
-        "",
     ]
+    if result["first_nonfinite"] is not None:
+        lines.append(
+            "- First non-finite metrics: epoch `{}`".format(
+                result["first_nonfinite"]["epoch"]
+            )
+        )
+    lines.append("")
     return "\n".join(lines)
 
 

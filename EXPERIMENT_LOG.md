@@ -1374,3 +1374,2463 @@ After this snapshot is committed and pushed to an archive branch, a new local-on
 ### Git Scope
 
 The archive commit will include source, CUDA source, scripts, tests, launcher, and this experiment record. It will explicitly exclude checkpoints, datasets, PDFs, backup directories, Python bytecode, compiled shared objects, object files, and build metadata.
+
+<!-- experiment-entry:clean-bireal-four-lutconv-route-20260801 -->
+## 2026-08-01 - Clean Phase 2 Bi-Real and Phase 3 four-LUTConv route
+
+### Git Boundary
+
+- The pre-clean source route is preserved on remote branch `archive/four-lutconv-pre-clean-20260801` at commit `dd0c822` (`Archive Bi-Real and LUTConv development snapshot`). Checkpoints and datasets were excluded.
+- The clean implementation lives on local branch `route/bireal-four-lutconv-clean`.
+- Per the request, this clean branch is intentionally uncommitted, has no upstream, and has not been pushed.
+
+### Active Route
+
+- Phase 1: full-precision complex Bi-Real topology.
+- Phase 2: standard complex Bi-Real. CIFAR input still uses `LearnImagBlock`; each residual block is activation -> binary complex convolution -> post-BN -> residual. There is no pre-BN or topology switch.
+- Phase 3: identical to Phase 2 except every residual main-path `BinaryComplexConv2d` is replaced by one `FourLUTComplexConv2d`.
+- Each complex LUT convolution owns four independent real LUT6 convolutions: `rr(x_r)`, `ii(x_i)`, `ir(x_i)`, and `ri(x_r)`. They combine as `y_r = rr - ii` and `y_i = ir + ri`.
+- Each real LUT table uses hard 0/1 forward values from epoch 1 and identity STE backward gradients. Entries use the successful real-LUT bimodal initialization: equal-probability modes centered at -1 and +1, both with standard deviation 0.1.
+- Phase 3 defaults to training from scratch. Supplying `CHECKPOINT=...` loads only topology-compatible Phase 2 state; LUT tables retain random bimodal initialization.
+- Old pair neurons, analytic comparators, LUT annealing/tau, separate LUT LR, sign-diff capture, and experimental topology/pre-BN switches are removed from the active route.
+
+### Canonical Commands
+
+```bash
+GPU_ID=0 WORKDIR=runs/phase2_complex_bireal ./run_phase2.sh
+GPU_ID=1 WORKDIR=runs/phase3_four_lutconv ./run_phase3.sh
+```
+
+The Phase 3 launcher defaults to 256 epochs, batch size 128, start filters 16, Adam, LR 0.02, the reference Bi-Real milestone schedule, no weight decay or clipping, real-LUT augmentation, label smoothing 0.1, and train/test-only evaluation. All values remain overridable through environment variables.
+
+### Modified Files
+
+- `complexPyTorch/complexBinaryResNet.py`: reduced the model to the fixed Phase 1/2/3 Bi-Real topology and wired Phase 3 to `FourLUTComplexConv2d` only.
+- `complexPyTorch/complexLayers.py`: removed archived operator/pair/analytic implementations and retained a minimal hard-STE `LUTBinaryConv2d` plus the four-branch complex wrapper.
+- `complexPyTorch/lut_backend.py`: reduced the Python backend to the binary LUTConv CUDA API and autograd wrapper.
+- `lut_cuda/setup.py`: reduced extension compilation to `lut_conv_binary_cuda`.
+- `training.py`: removed pair conversion, annealing, sign diagnostics, separate LUT optimization, and old CLI switches; added optional shared Phase 2 checkpoint loading for Phase 3.
+- `run_phase2.sh`: made the validated standard complex Bi-Real recipe the single Phase 2 launcher.
+- `run_phase3.sh`: replaced the pair launcher with the hard four-LUTConv recipe.
+- `scripts/audit_active_route.py`: rewrote the reusable route audit around Phase 2 Bi-Real and Phase 3 four-LUTConv structure.
+- `tests/test_phase12_route.py`: rewrote tests for the clean CLI, fixed topology, four-branch count, hard-table STE, bimodal initialization, and shared checkpoint loading.
+- `EXPERIMENT_LOG.md`: appended this route transition and per-file summary using `scripts/append_experiment_log.py`.
+
+### Deleted Active Files
+
+- Obsolete CUDA sources: `lut_cuda/lut_conv_bafw_cuda_backend.cu`, `lut_cuda/lut_conv_bafw_cuda_backend_top1.cu`, `lut_cuda/lut_conv_bffb_cuda_backend.cu`, `lut_cuda/lut_conv_cuda_backend.cu`, `lut_cuda/lut_cuda_backend.cu`, and `lut_cuda/lut_cuda_backend_binary.cu`.
+- Obsolete launchers: `run_phase2_complex_bireal.sh`, `run_phase3_pair_analytic.sh`, and `run_phase3_real_compatible.sh`.
+- Obsolete pair analysis: `scripts/analyze_pair_lut_checkpoint.py` and `scripts/analyze_pair_lut_states.py`.
+- Obsolete pair tests: `tests/test_pair_lut_phase3.py`.
+- Redundant untracked copies already represented by the archive commit: `complexPyTorch/complexBinaryResNet_lut_as_op_backup.py`, `complexPyTorch/complexLayers_lut_as_op_backup.py`, and `complexPyTorch/lut_backend_lut_as_op_backup.py`.
+
+### Verification
+
+- Python syntax compilation passed for the active model, layers, backend, training entry, audit, and tests.
+- Shell syntax passed for `run_phase1.sh`, `run_phase2.sh`, `run_phase3.sh`, and `run_training.sh`.
+- `conda run -n lut_net python scripts/audit_active_route.py`: passed.
+- `conda run -n lut_net python -m unittest tests.test_phase12_route`: 14 tests passed.
+- Single `FourLUTComplexConv2d` CUDA forward/backward produced shape `(2, 16, 8, 8)` and non-null input/LUT gradients.
+- `run_phase3.sh --help` reached the cleaned training CLI successfully when run with the `lut_net` Python.
+- A full Phase 3 one-batch CUDA smoke test was stopped after the custom-kernel process remained alive for over one minute. The single-layer numerical path passed, but full-model runtime/exit behavior still needs confirmation during the next real training launch.
+
+<!-- experiment-entry:grouped-binary-phase3-correction-20260801 -->
+## 2026-08-01 - Correction: align Phase 3 with the real grouped-binary LUT kernel
+
+### Reason for the correction
+
+The first cleanup pass temporarily wired the experimental direct-convolution `lut_conv_binary_cuda` backend. Its forward synchronized successfully, but even a `1x16x4x4` backward did not finish within 30 seconds. That implementation is therefore not the training path validated by the real Bi-Real LUT network and was removed before finalizing the clean route.
+
+### Final aligned implementation
+
+- `LUTBinaryConv2d` now exactly follows the real reference dataflow: pad, unfold image patches, reshape to `[batch, locations, groups, lut_num, 6]`, evaluate grouped LUT6 cells, sum the LUT outputs, and reshape to NCHW.
+- LUT weights now use the reference layout `[out_channels, lut_num, 64]`.
+- Forward LUT entries remain hard 0/1 with identity STE gradients and bimodal +/-1 initialization.
+- Autograd now uses `lut_cuda_grouped_binary.forward/backward`, the same grouped-binary extension used by `/home/jliangbr/workspace/LutNet/cifar10_bireal/lut_layer_main_compile.py`.
+
+### File updates
+
+- `complexPyTorch/complexLayers.py`: changed `LUTBinaryConv2d` from direct offset/shift CUDA dispatch to the reference unfold/grouped-LUT layout.
+- `complexPyTorch/lut_backend.py`: replaced the experimental direct-convolution wrapper with the minimal reference-compatible grouped-binary autograd function.
+- `lut_cuda/setup.py`: changed the only active extension target to `lut_cuda_grouped_binary`.
+- `lut_cuda/lut_cuda_backend_binary.cu`: restored the exact grouped-binary source used by the real reference implementation.
+- `lut_cuda/lut_conv_binary_cuda_backend.cu`: removed the experimental direct-convolution backend from the clean route.
+- `EXPERIMENT_LOG.md`: appended this correction using the reusable log script.
+
+### Verification
+
+- 14 route/unit tests passed after the backend correction.
+- Synchronized single-layer CUDA backward completed within the 30-second bound; output shape was `(1,16,4,4)`, with nonzero input and LUT gradients.
+- Synchronized full Phase 3 model forward/backward completed within the 60-second bound; output shape was `(1,10)` and all 24 LUTConv layers had gradients.
+- This entry supersedes the full-model runtime warning in the immediately preceding cleanup entry.
+
+<!-- experiment-entry:phase3-two-shared-lutconv-20260801 -->
+## 2026-08-01 - Correct Phase 3 to two shared LUTConv operators
+
+### Correction
+
+The complex operator must mirror the two parameterized real convolutions in Phase 2, not use four independent LUT parameter sets. The previous four-LUT wrapper over-parameterized the complex convolution and broke real/imaginary weight sharing.
+
+### Final two-LUT formula
+
+For two learned LUTConv operators representing the real and imaginary complex-weight components:
+
+- `conv_r` is reused for both `x_r` and `x_i`.
+- `conv_i` is reused for both `x_i` and `x_r`.
+- `y_r = conv_r(x_r) - conv_i(x_i)`.
+- `y_i = conv_r(x_i) + conv_i(x_r)`.
+
+Calling each module twice builds two autograd paths into the same parameter tensor, so PyTorch accumulates LUT-table gradients and input gradients from both paths. There are two learned LUT parameter sets per complex operator, although software invokes the operators four times. Hardware can time-multiplex the shared tables; fully parallel evaluation would require additional read/replication resources.
+
+### File updates
+
+- `complexPyTorch/complexLayers.py`: retained the user's two-module implementation, renamed it to `TwoLUTComplexConv2d`, clarified cross-term names, and documented real/imaginary LUT sharing.
+- `complexPyTorch/complexBinaryResNet.py`: changed Phase 3 to instantiate `TwoLUTComplexConv2d` and corrected the module description.
+- `training.py`: corrected the Phase 3 description and fixed Phase 2 checkpoint partial loading. Phase 2 `conv_r/conv_i.weight` keys now explicitly skip the same-named Phase 3 LUT tables instead of raising shape mismatch.
+- `run_phase3.sh`: renamed the launcher text and default workdir to `phase3_two_lutconv`.
+- `tests/test_phase12_route.py`: changed structural expectations from four to two LUTConv modules, added an exact analytic cross-term test, and retained checkpoint initialization coverage.
+- `scripts/audit_active_route.py`: changed the active-route contract to exactly two LUTConv modules per complex residual operator.
+- `EXPERIMENT_LOG.md`: appended this correction through the reusable log script.
+- Local branch renamed from `route/bireal-four-lutconv-clean` to `route/bireal-two-lutconv-clean`; it remains uncommitted and unpushed.
+
+### Verification
+
+- 15 unit tests passed.
+- The analytic test verifies `conv_r=2I`, `conv_i=3I` produces `(2x_r-3x_i) + j(2x_i+3x_r)` exactly.
+- Phase 2 checkpoint partial loading loaded 65 shared tensors and preserved 12 randomly initialized LUT tables in the six-operator test model.
+- The route audit passed and confirms two shared LUTConv modules per complex operator.
+- Synchronized full CUDA forward/backward passed with output shape `(1,10)`; all 12 LUT tables received gradients.
+
+<!-- experiment-entry:current-route-method-document-20260802 -->
+## 2026-08-02 - Rewrite current technical route as a concise method document
+
+### Documentation update
+
+- Replaced the obsolete Pair-LUT technical-route document with a concise description of the current method.
+- The document now explains only the active Phase 1 -> Phase 2 -> Phase 3 progression.
+- It defines the two shared LUTConv operators and their complex cross-computation equations.
+- It summarizes LUT6 local grouping, hard-forward STE training, and the time-multiplexed or parallel hardware interpretation.
+- Experimental history, parameter sweeps, retired branches, commands, and implementation-level details were intentionally omitted.
+
+### Modified files
+
+- `CURRENT_TECHNICAL_ROUTE.md`: rewritten as the high-level method document for the current complex Bi-Real to two-LUTConv route.
+- `EXPERIMENT_LOG.md`: recorded this documentation change through `scripts/append_experiment_log.py`.
+
+<!-- experiment-entry:phase3-exact-zero-one-lut-input-20260802 -->
+## 2026-08-02 - Correct Phase 3 LUT inputs from signed values to exact 0/1 bits
+
+### Problem identified
+
+Phase 2 Bi-Real activations use signed binary values `{-1,+1}`, while the grouped LUT6 CUDA kernel interprets each address input as a hardware bit `{0,1}` using a `>0.5` comparison. Although `-1/+1` happened to select the same forward addresses as `0/1`, directly passing signed values was not an equivalent training formulation:
+
+- The CUDA finite-difference backward is the derivative with respect to a `0/1` bit coordinate.
+- The missing conversion `b=(s+1)/2` omitted its factor `1/2` from the chain rule.
+- `sign(0)=0` was not an exact signed bit and relied implicitly on the CUDA threshold.
+
+### Correction
+
+Phase 2 remains unchanged and continues to use signed complex Bi-Real activation.
+
+Phase 3 now uses `BinaryComplexBitActivation`:
+
+- Hard forward: each real and imaginary component is exactly `1[x>0]`, including an exact zero bit when `x=0`.
+- Backward proxy: Bi-Real signed activation followed by `(s+1)/2`, so the gradient is `max(1-|x|,0)`, exactly half the signed Bi-Real proxy.
+- The two shared LUTConv operators therefore receive true `0/1` hardware address bits and the CUDA input finite difference is connected with the correct chain-rule scale.
+
+### Modified files
+
+- `complexPyTorch/complexLayers.py`: added `BinaryComplexBitActivation` with exact 0/1 hard forward and scaled Bi-Real backward.
+- `complexPyTorch/complexBinaryResNet.py`: Phase 3 now uses bit activation; Phase 2 keeps signed activation.
+- `training.py`: clarified the Phase 3 description as a 0/1-input two-LUTConv network.
+- `run_phase3.sh`: added an explicit 0/1 LUT-input startup message.
+- `tests/test_phase12_route.py`: added exact value and gradient tests and Phase 2/3 activation-type assertions.
+- `scripts/audit_active_route.py`: added the signed-Phase-2 versus bit-Phase-3 route contract.
+- `CURRENT_TECHNICAL_ROUTE.md`: documented the signed-to-bit encoding and its backward chain factor.
+- `EXPERIMENT_LOG.md`: appended this correction with the reusable log script.
+
+### Verification
+
+- 16 unit tests passed.
+- The exact bit test verifies forward `[0,0,0,1,1]` for inputs `[-2,-0.5,0,0.5,2]` and gradients `[0,0.5,1,0.5,0]`.
+- The active-route audit passed and distinguishes Phase 2 signed activation from Phase 3 bit activation.
+- Full synchronized CUDA forward/backward passed; a pre-forward hook observed the first LUTConv input values as exactly `[0.0,1.0]`, and all 12 LUT tables received gradients.
+
+<!-- experiment-entry:real-lut-reference-gap-audit-20260803 -->
+## 2026-08-03 - Real-LUT reference numerical and gradient audit
+
+Files: scripts/analyze_lut_reference_gap.py, reports/lut_reference_gap_current.md, reports/lut_reference_gap_current.json, and this EXPERIMENT_LOG.md entry. Added a reusable checkpoint-and-batch audit for Phase 3 LUT input bits, per-call LUT sums, complex pre-BN ranges, BN outputs, LUT margins, gradient norms, and shared-path gradient interaction. Audited runs/phase3_four_lutconv/chkpts/Bestmodel_phase3.pt (best test accuracy 0.7750). Confirmed exact 0/1 activation inputs and the same LUT6 CUDA/sum contract as the real reference. Found complex-only asymmetric pre-BN aggregation: real=A-B is centered while imag=C+D has means near L (23.4, 48.3, 96.2 by depth). First-layer shared paths are nearly orthogonal, with combined/independent gradient ratios 0.9885-1.0118, so severe first-layer cancellation is not supported. Found stronger depth attenuation: mean LUT gradient RMS is 7.83e-3 in stage2, 2.44e-4 in stage3, and 7.64e-5 in stage4. Mean abs(logit) has drifted to 2.76/2.93/3.26, leaving only 2.3%-3.2% within abs(logit)<0.1. Also identified recipe mismatches: current run uses Adam LR 0.02 with milestone drops, while the reference source defaults to LR 0.001 with linear decay; current negative-mode init std is 0.1 versus reference 0.2. Priority: reproduce optimizer schedule first, then test current-route BN and deeper gradient paths; signed LUT decoding is lower priority because train-mode BN mostly absorbs its affine shift/scale.
+
+<!-- experiment-entry:align-phase3-reference-scheduler-20260803 -->
+## 2026-08-03 - Align Phase 3 scheduler and explain complex BN/deep LUT gradients
+
+Modified files: training.py, run_phase3.sh, tests/test_phase12_route.py, scripts/analyze_lut_reference_gap.py, CURRENT_TECHNICAL_ROUTE.md, reports/lut_reference_gap_current.md, reports/lut_reference_gap_current.json, and this EXPERIMENT_LOG.md entry.
+
+Aligned Phase 3 scheduling with the local real-domain LUT reference. The schedule name `bireal_reference` now uses the same per-epoch linear rule `lr(epoch)=base_lr*(1-epoch/num_epochs)`; the former drops at epochs 90/140/180/220 remain available as `multistep` for historical reproducibility. Changed the Phase 3 launcher default Adam LR from 0.02 to the reference default 0.001. Added a regression test that checks exact rates at epochs 0, 128, and 255 and equivalence with `linear`.
+
+Clarified in the generated numerical audit that the 77.50% checkpoint is historical and used the former 0.02 milestone recipe. The current launcher now uses the aligned recipe. Updated the active-route document accordingly.
+
+BN analysis: covariance complex BN first subtracts the per-channel complex mean, so the LUT composition's imaginary DC offset near L is removed directly during training. It then estimates the 2x2 real/imag covariance, applies its inverse square root, and finally applies a learned symmetric 2x2 affine transform plus complex bias. This removes affine offset/scale in the forward pass but does not erase batch-statistic noise, eps effects, running-statistic mismatch, or the altered backward Jacobian.
+
+Gradient interpretation: the reported values are per-LUT-entry gradient RMS, not activation gradient magnitude. Deeper stages have 16x fewer spatial sites (32x32 to 8x8), up to 4x more LUT groups per output, 4x more output channels, and 64 mutually exclusive addresses per LUT. Each deep truth-table entry is therefore hit much less often, explaining why its gradient can be much smaller even though the layer is closer to the loss. Verification: 17 route unit tests passed; run_phase3.sh passed bash syntax validation; the CUDA numerical report regenerated successfully.
+
+<!-- experiment-entry:progressive-layerwise-lut-flow-20260803 -->
+## 2026-08-03 - Progressive float-to-hard layer-wise LUT training flow
+
+Modified files: complexPyTorch/complexLayers.py, training.py, run_phase3.sh, tests/test_phase12_route.py, scripts/audit_active_route.py, CURRENT_TECHNICAL_ROUTE.md, and this EXPERIMENT_LOG.md entry.
+
+Added an optional Phase 3 progressive LUT quantization flow without changing the default hard-from-start route. LUT activation addresses remain exact 0/1 throughout. During soft stages, truth-table entries are continuous values computed as (tanh(tau * logit) + 1) / 2 and are read directly by the existing grouped binary-address CUDA kernel. This preserves exact O(1) address lookup while making both table values and finite-difference activation gradients continuous.
+
+The progressive state machine is: float warmup, global geometric temperature annealing, layer-wise hardening, then fully-hard fine-tuning. Default 256-epoch parameters are 20 warmup epochs at tau 0.5, 100 annealing epochs from tau 0.5 to 8.0, 72 layer-hardening epochs, and 64 fully-hard epochs. The 18 complex residual operators are hardened as complete units, switching their real and imaginary LUTConv branches together. Default order is input-to-output so downstream soft layers can adapt to upstream quantization; output-to-input is also configurable.
+
+Hard layers use hard 0/1 forward plus identity STE, avoiding saturated tanh gradients after commitment. Soft layers stay at tau_max during layer-wise hardening. Bestmodel_phase3.pt selection is gated by hardware_ready, so soft or partially-hard epochs cannot overwrite the deployable best checkpoint; Lastmodel_phase3.pt continues to capture every epoch. Progressive mode rejects torch.compile to avoid repeated graph specialization as layer modes change.
+
+Launcher controls: LUT_TRAINING_FLOW, LUT_FLOAT_WARMUP_EPOCHS, LUT_ANNEAL_EPOCHS, LUT_LAYER_HARDENING_EPOCHS, LUT_TAU_MIN, LUT_TAU_MAX, and LUT_HARD_ORDER. Existing hard flow remains the default.
+
+Verification: 19 route unit tests passed. Tests cover the soft differentiable table and the warmup->anneal->one-complex-operator-at-a-time->fully-hard state machine. The active-route audit and run_phase3.sh syntax check passed. A CUDA smoke test on GPU 2 observed soft non-integer LUT sums (maximum distance from an integer 0.363) with nonzero table/input gradients, followed by strictly integer hard sums with nonzero table/input gradients using the same binary-address backend.
+
+<!-- experiment-entry:pruning-three-stage-activation-lut-20260805 -->
+## 2026-08-05 - Pruning-style three-stage activation and LUT schedule
+
+### 三阶段训练策略
+
+Phase 3 progressive flow 改为 pruning 风格的严格三阶段状态机：
+
+1. `temperature_anneal`：activation 与 LUT 均保持 soft，tau 按 `tanh(logit * tau)` 的语义从 `lut_tau_min` 线性增大到 `lut_tau_max`。
+2. `layer_hardening`：tau 固定在 `lut_tau_max`，按网络顺序逐个 hard 复数 block；一个 block 的 activation、实部 LUT 和虚部 LUT 同时切换。
+3. `fully_hard`：所有 activation 和 LUT 使用硬前向与 STE，继续训练 BN、LUT 参数和其余网络参数。只有此阶段标记为 hardware-ready 并参与最佳 checkpoint 选择。
+
+### 修改文件
+
+- `complexPyTorch/complexLayers.py`：为 `BinaryComplexBitActivation` 增加 tau/hard 状态；soft 前向使用 `sigmoid(2*tau*x)`，与 LUT 的 `(tanh(tau*x)+1)/2` 完全等价；hard 前向继续使用精确 0/1 和原 Bi-Real STE。
+- `training.py`：实现 activation 与 `TwoLUTComplexConv2d.conv_r/conv_i` 的同步三阶段调度；改用线性递增 tau；删除独立 warmup stage；旧 warmup CLI 名保留为 anneal 参数兼容别名；所有旧 `LUTBinaryConv2d` 路线引用改为当前 `LUTFPConv2d`。
+- `tests/test_phase12_route.py`：更新 LUT 类型断言与三阶段边界测试；增加 sigmoid soft activation 数值和梯度测试；保留最终 hard Bi-Real 梯度测试。
+- `EXPERIMENT_LOG.md`：通过可复用日志脚本追加本记录。
+
+### 验证
+
+- 三个修改代码文件通过 `py_compile`。
+- 全量 diff 检查仅报告用户此前 LUTFP/LUT backend 集成区域已有的行尾空格，本轮新增行没有格式错误。
+- 定向 unittest 在当前机器导入训练栈时持续高 CPU 且长时间无输出，已主动终止，未遗留后台测试进程。
+- `lut_backend.py` 与 CUDA kernel 均未修改。
+
+<!-- experiment-entry:phase3-progressive-nan-epoch35-20260805 -->
+## 2026-08-05 - Phase 3 progressive FP-LUT NaN diagnosis and safeguards
+
+Run: `runs/phase3_lutfp_progressive_tau1_2_a40_h90_e256`
+
+### Observation
+
+- Finite through epoch 34; best test accuracy 69.31% at epoch 32.
+- First non-finite metrics at epoch 35 with `tau=1.87179`, `hard_operators=0/18`, LR `0.0008671875`. Failure occurred in all-soft annealing before layer hardening while LR was decreasing.
+- Epoch-43 Last checkpoint has 136 non-finite model tensors and about 5.716 million non-finite model elements. LUT, BN, frontend, classifier, and Adam state are contaminated and cannot be resumed.
+
+### Files and fixes
+
+- `complexPyTorch/complexLayers.py`: changed soft LUT annealing from `tanh(logits / tau)` to reference-consistent `tanh(logits * tau)`, so LUT and activation harden in the same direction.
+- `training.py`: fail fast on non-finite loss and report batch/contaminated parameters; norm clipping now rejects non-finite gradient norms before optimizer update.
+- `run_phase3.sh`: expose `CLIPNORM` and `CLIPVAL`; both were previously hard-coded to zero.
+- `tests/test_phase12_route.py`: regression test verifies larger tau sharpens LUT entries; focused and complete active-route tests pass.
+- `scripts/analyze_training_run.py`: parse nan/inf and report the first non-finite epoch.
+- `scripts/analyze_checkpoint_nonfinite.py`: reusable model/optimizer checkpoint tensor scanner.
+
+### Next experiment
+
+Restart from the clean Phase 2 checkpoint in a new workdir with the 40/90 progressive schedule and `CLIPNORM=5`. Never load the poisoned Phase 3 Last checkpoint. A recurrence will now stop at the first affected batch while preserving the prior finite checkpoint.
+
+<!-- experiment-entry:phase3-mul-tau-clip5-stopped-epoch18-20260805 -->
+## 2026-08-05 - Phase 3 corrected-tau run stopped during epoch 18
+
+Run: `runs/phase3_lutfp_progressive_mul_tau1_2_a40_h90_clip5_e256`
+
+- A first launch at 09:35 exited before completing epoch 1. A second launch at 14:51 trained normally through epoch 17.
+- Each completed epoch took about 592-594 seconds. Test accuracy increased from 37.92% at epoch 1 to 60.31% at epoch 17. No NaN/Inf was logged.
+- The log stopped after entering epoch 18 at `tau=1.4359`, LR `0.00093359375`, with all 18 operators still soft. At inspection time no project training process remained on any GPU; this was process termination, not a still-running deadlock.
+- `Lastmodel_phase3.pt` is epoch 17. All 228 model tensors and all 276 optimizer tensors are finite, so this checkpoint is valid for recovery.
+- Persistent `train.txt` does not capture process stderr, and kernel logs are unavailable to this user. The remaining evidence cannot distinguish a CUDA extension failure, shell signal, or external kill. A resumed run should redirect both stdout and stderr to a console log and retain the epoch-17 checkpoint.
+
+<!-- experiment-entry:phase3-mul-tau-clip5-epoch18-gradient-correction-20260805 -->
+## 2026-08-05 - Correction: epoch 18 stopped on non-finite gradient norm
+
+This entry corrects the earlier interpretation that the epoch-18 disappearance could only be an external termination. The terminal traceback was not present in persistent `train.txt` but shows the exact stop condition.
+
+- At epoch 18 (`tau=1.4359`, LR `0.00093359375`, 0/18 hard operators), forward loss was still finite.
+- After `loss.backward()`, `torch.nn.utils.clip_grad_norm_(..., error_if_nonfinite=True)` found a non-finite global L2 gradient norm and raised before `optimizer.step()`.
+- Gradient clipping did not cause the failure; it detected and contained it. Setting `error_if_nonfinite=False` would allow contamination and must not be used.
+- The epoch-17 model and optimizer checkpoint remain fully finite.
+- Compared with the former divide-tau experiment, which first became non-finite at epoch 35 around tau 1.87, multiply-tau failed at epoch 18 around tau 1.44. This strongly indicates that sharpening LUT entries increases finite-difference input-gradient gain and destabilizes the deep soft-LUT chain earlier.
+- The next diagnostic change should report the exact parameter names and per-group gradient maxima when the norm becomes non-finite; Phase 3 resume support would avoid replaying 17 epochs solely to reproduce the failure.
+
+<!-- experiment-entry:phase3-nonfinite-gradient-debug-20260805 -->
+## 2026-08-05 - Add non-finite gradient explosion diagnostics
+
+### Purpose
+
+The corrected multiply-tau run failed at epoch 18 because the post-backward global gradient norm was non-finite. Add enough diagnostics to distinguish true NaN/Inf gradient elements from float32 norm-reduction overflow and identify the responsible parameter tensors.
+
+### File changes
+
+- `training.py`: track the maximum pre-clip global gradient norm and batch for every completed epoch. When `clip_grad_norm_` detects a non-finite norm, scan gradients before any optimizer update and atomically write `WORKDIR/debug/nonfinite_grad_epochXXXX_batchXXXX.json`. The report includes epoch/batch, finite forward loss and output magnitude, diagnosis class, all non-finite gradient tensors with NaN/+Inf/-Inf counts, float64 L2 norms and maximum magnitudes, the 20 largest still-finite gradients, and every LUT/activation tau and hard state. The raised error now points directly to this report.
+- `tests/test_phase12_route.py`: add a regression test that creates Inf/NaN gradients and verifies the generated report identifies the parameter and element counts.
+
+### Interpretation
+
+If `diagnosis=nonfinite_gradient_elements`, inspect the listed names to locate the contaminated backward path. If `diagnosis=float32_global_norm_overflow_with_finite_elements`, individual gradients remain finite and the problem is overflow in norm aggregation caused by extremely large finite values; the largest-finite list identifies the amplification source.
+
+### Verification
+
+Python compilation passed. All 22 tests in `tests.test_phase12_route` passed. The protected `complexPyTorch/lut_backend.py` and CUDA kernels were not modified.
+
+<!-- experiment-entry:phase3-mul-tau-debug-epoch7-batch57-20260808 -->
+## 2026-08-08 - Debug run: localized NaN backward at epoch 7 batch 57
+
+Run: `runs/phase3_lutfp_progressive_mul_tau_debug_gpu1`
+
+### Result
+
+- The run completed six epochs and stopped during epoch 7, batch 57. The last completed test accuracy was 49.14%. The process is no longer running.
+- This invocation used batch size 256, not 128. It remained in the all-soft stage; failure tau was 1.153846 and 0/18 operators were hard.
+- Forward was finite at failure: loss 1.77758 and maximum output magnitude 4.82835.
+- Pre-clip global gradient norms in epochs 1-6 were 3.94664, 3.96013, 4.42090, 3.92388, 3.79772, and 4.29326. There was no increasing trend and ordinary clipping had not been persistently active.
+
+### Gradient report
+
+Report: `runs/phase3_lutfp_progressive_mul_tau_debug_gpu1/debug/nonfinite_grad_epoch0007_batch0057.json`
+
+- Diagnosis is `nonfinite_gradient_elements`, not float32 norm-reduction overflow.
+- Fourteen parameter-gradient tensors contain NaNs. They are confined to `stage2.0` and all modules before it: `stage2.0.conv.conv_r/i.weight`, `stage2.0.bn_post.weight/bias`, stem `bn1/conv1`, and `learn_imag`.
+- All parameter gradients from `stage2.1` onward remain finite. Their largest absolute element is only about 0.218. The finite remainder has a float64 global L2 norm of about 1.051.
+- Therefore this is a sudden localized NaN generated at the shallow backward boundary, not gradual whole-network gradient explosion.
+
+### Root-cause narrowing
+
+Backpropagation traverses deeper blocks before shallower blocks. Finite `stage2.1` parameter gradients but NaN `stage2.0` and earlier gradients place the first invalid value between the `stage2.1` input-gradient calculation and the `stage2.0` post-BN backward. The two primary candidates are the FP-LUT custom backward returning a NaN input gradient from `stage2.1`, or the covariance complex BN backward in `stage2.0`.
+
+The finite epoch-6 checkpoint does not show persistent covariance singularity: `stage2.0.bn_post.running_covar` has determinant minimum about 3.79 and maximum absolute correlation about 0.301. A single bad batch covariance remains possible, but the running statistics do not support general BN collapse.
+
+### Next diagnostic
+
+Use PyTorch anomaly detection or targeted backward hooks around `stage2.1.conv`, `stage2.1.act`, and `stage2.0.bn_post`. This should identify whether `LUTConvFP32FunctionBackward` first returns NaN in its input-gradient output or complex BN creates it. A naive post-BN control run is also a clean A/B test for the covariance-BN hypothesis.
+
+<!-- experiment-entry:phase3-all-stage-backward-hooks-20260808 -->
+## 2026-08-08 - Add ordered backward hooks across all residual stages
+
+### Goal
+
+Capture the first invalid gradient boundary regardless of which residual stage fails in future progressive FP-LUT experiments.
+
+### File changes
+
+- `training.py`: added optional `BackwardHookRecorder`. With `--debug-backward-hooks`, it registers full backward hooks on every `BinaryComplexBitActivation`, `LUTFPConv2d`, `TwoLUTComplexConv2d`, covariance complex BN, and naive complex BN module under `stage2`, `stage3`, and `stage4`. Each failing batch report now contains the ordered backward trace with per-module `grad_output` and `grad_input` shape, dtype, finite/NaN/Inf counts, finite maximum magnitude, and float64 L2 norm. The raised exception prints the first hooked non-finite module, type, and backward sequence number. Records reset each batch and are serialized only when the existing non-finite global-norm guard triggers.
+- `run_phase3.sh`: added `DEBUG_BACKWARD_HOOKS=1`, which forwards `--debug-backward-hooks`.
+- `tests/test_phase12_route.py`: added a regression test proving stage hooks register and identify the first non-finite backward record.
+
+### Coverage and verification
+
+The full Phase 3 model registers 92 hooks: 30 in stage2, 31 in stage3, and 31 in stage4. Shared LUT branches may generate multiple ordered records per batch, preserving real/imaginary cross-path call information. Python compilation and shell syntax checks passed. All 23 active-route tests passed. The protected `complexPyTorch/lut_backend.py` and CUDA kernels were not modified.
+
+### Runtime note
+
+This mode performs finite-value checks at every hooked backward boundary and is intended for diagnosis; it will be slower than ordinary training. Normal logs remain concise. On failure, inspect `WORKDIR/debug/nonfinite_grad_epochXXXX_batchXXXX.json`, especially `backward_hooks.first_nonfinite` and `backward_hooks.records`.
+
+<!-- experiment-entry:phase3-stage-block-gradient-probes-20260808 -->
+## 2026-08-08 - Correction: replace intrusive LUT hooks with stage-block probes
+
+### Correction
+
+The previous all-module implementation was not safe for the custom CUDA LUT path. Both `register_full_backward_hook` and tensor hooks placed directly on `LUTFPConv2d` boundaries made the otherwise stable configuration produce NaN at epoch 1 batch 0. The apparent first failure at `stage2.5.conv.conv_i` was instrumentation-dependent and must not be treated as a model root-cause result.
+
+### A/B evidence
+
+- Hooks enabled inside LUT/activation/BN modules: epoch 1 batch 0 immediately produced non-finite gradients.
+- Identical seed, checkpoint, batch size, schedule, and GPU with hooks disabled: ran for the full 90-second smoke window without an error.
+- The failure is therefore caused by intrusive observation of the custom CUDA backward path, not by the baseline configuration naturally failing on its first batch.
+
+### File changes
+
+- `training.py`: replaced internal custom-operator hooks with output-gradient probes at every residual block under `stage2`, `stage3`, and `stage4`. Hook callbacks only retain detached gradient references; finite/NaN/Inf statistics are computed after backward and only when the existing non-finite guard requests a report. This avoids wrapping LUT tensors and avoids CUDA synchronization inside custom backward callbacks. The full model exposes 18 block-boundary probes.
+- `EXPERIMENT_LOG.md`: recorded this correction so the earlier 92-hook implementation is not reused or interpreted as valid evidence.
+
+### Verification
+
+- Python compilation passed and the focused NaN-capture regression test passed.
+- A real GPU1 smoke run with the corrected 18 block probes survived 90 seconds and did not create a non-finite report; the old implementation failed at batch 0 within seconds.
+- `complexPyTorch/lut_backend.py` and all CUDA kernel files were not modified.
+
+<!-- experiment-entry:phase3-stage2-fplut-invalid-lanes-20260808 -->
+## 2026-08-08 - Phase 3 stage2 FP-LUT backward NaN root cause
+
+Run: `runs/phase3_lutfp_mul_tau_stagehooks_bs256_gpu1`
+
+### Failure
+
+- Epochs 1 and 2 completed normally, reaching test accuracies 35.88% and 41.19%.
+- Epoch 3 failed at batch 148 while all 18 operators were soft, tau was 1.051282, and LR was 0.0009921875.
+- Forward remained finite: loss 1.87293 and output maximum magnitude 4.52519. This is a backward-only failure.
+- The epoch-2 `Lastmodel_phase3.pt` is safe: all 228 model tensors and all 276 optimizer tensors are finite.
+
+### Gradient localization
+
+Report: `runs/phase3_lutfp_mul_tau_stagehooks_bs256_gpu1/debug/nonfinite_grad_epoch0003_batch0148.json`
+
+- Block-boundary gradients are fully finite from `stage4.5` through `stage2.3`.
+- The gradient at the output of `stage2.2`, which is the input gradient returned through `stage2.3`, is the first invalid boundary: 2,944 of 4,194,304 complex elements are NaN.
+- The contamination then expands to every element at `stage2.1` and `stage2.0`.
+- Parameters in `stage2.3` remain finite, including both LUT weight gradients and complex-BN gradients. Parameter NaNs begin at `stage2.2` and propagate toward the stem.
+- Epoch-2 `stage2.3` LUT logits are ordinary (absolute maximum about 1.43), and its running complex covariance is well conditioned (determinant 7.41 to 15.56, absolute correlation at most 0.246). This rules out persistent BN singularity or runaway logits.
+
+### Root cause
+
+The evidence identifies the FP-LUT CUDA input-gradient path in `stage2.3`. Stage 2 has 16 output channels, while `lut_conv_fp32_backward_kernel` reduces over a fixed 32-lane tile. Lanes 16-31 have no valid output channel, so `dy=0`, but their `s_w[..., lane]` entries are not initialized. Those invalid lanes still compute `dx_accum` and participate in the full-warp reduction used for `grad_x`. If stale shared memory contains NaN, IEEE arithmetic preserves it through `0 * NaN`, and the warp reduction contaminates an otherwise finite input gradient. The `grad_w` path is guarded by valid/nonzero `dy`, explaining why LUT weight gradients remain finite while `grad_x` fails. Stages 3 and 4 use 32/64 output channels and therefore do not expose the partial-tile condition.
+
+This is an intermittent CUDA partial-output-tile bug, not gradient explosion caused by tau, LR, activation annealing, or complex BN. The protected `complexPyTorch/lut_backend.py` and CUDA files were inspected read-only and were not modified.
+
+### File changes
+
+- `scripts/analyze_nonfinite_gradient_report.py`: added a reusable parser that summarizes failure metadata, contaminated parameter names, and ordered residual-block gradient boundaries from future non-finite JSON reports.
+- `EXPERIMENT_LOG.md`: recorded this experiment and root-cause analysis.
+
+<!-- experiment-entry:real-bireal-vs-fused-fp-kernel-20260808 -->
+## 2026-08-08 - Why the real Bi-Real LUT route did not trigger the FP-kernel NaN
+
+The real CIFAR Bi-Real LUT network also contains a 16-channel first residual stage, so channel width alone does not explain why it trained without NaN. The decisive difference is the operator path.
+
+- The real model's `BasicBlock` uses `lut_conv_group`, performs `unfold/img2col`, reshapes inputs to explicit LUT groups, and calls `LUT6Function -> lut_cuda_grouped_binary`.
+- That grouped binary kernel organizes work over explicit LUT/output indices and does not use the current fused convolution kernel's fixed 32-output-channel warp reduction.
+- The real Bi-Real block also sets each LUT kernel to hard mode at construction.
+- The current complex progressive route uses `LUTFPConv2d -> LUTConvFP32Function -> fused_lut_conv_bw`. Its stage2 output width is 16, exposing a partial 32-lane output tile whose invalid lanes can contaminate `grad_x`.
+
+Therefore the real model's successful training does not contradict the current diagnosis: it did not exercise the faulty fused FP partial-output-tile backward path. The next required engineering step is to correct and directly test the CUDA FP kernel for output channel counts below or not divisible by 32 before resuming long progressive training. No kernel or backend file was modified during this comparison.
+
+<!-- experiment-entry:fplut-valid-oc-gradx-mask-20260808 -->
+## 2026-08-08 - Single-line FP-LUT partial-tile CUDA fix
+
+### Source change
+
+Only one source line was changed in `lut_cuda/lut_conv_cuda_backend.cu`: the value entering the `grad_x` warp reduction is now `valid_oc ? dx_accum[k] : 0.0f`. No other source line, LUT backend wrapper, training file, or model file was changed for this fix.
+
+### Build and deployment
+
+- Rebuilt the CUDA extensions in the `lut_net` conda environment. CUDA 13.2 reported a minor-version mismatch with the CUDA 13.0 used to build PyTorch, but compilation and linking completed successfully.
+- Deployed only the rebuilt `lut_conv_fp32_cuda` binary to the environment's site-packages path used by training.
+- Verified that Python loads `/home/jliangbr/miniconda3/envs/lut_net/lib/python3.10/site-packages/lut_conv_fp32_cuda.cpython-310-x86_64-linux-gnu.so`.
+
+### CUDA verification
+
+On GPU1, tested `LUTConvFP32Function` with output channel counts 8, 16, 24, 32, 40, and 64. Each case ran 100 independent forward/backward iterations. All 600 iterations produced finite forward outputs, finite `grad_x`, and finite `grad_w`. This covers partial output tiles below 32, non-multiples of 32, and complete tiles.
+
+The failed Phase 3 workdir must not be resumed from a poisoned batch. Restart from the Phase 2 checkpoint in a new workdir using the same progressive schedule.
+
+<!-- experiment-entry:phase3-remove-hooks-constant-lr002-20260810 -->
+## 2026-08-10 - Remove backward hooks and use constant 0.02 Phase 3 LR
+
+With the FP-LUT CUDA partial-tile fix eliminating the observed NaN, remove the temporary runtime gradient instrumentation and restore ordinary training execution.
+
+### File changes
+
+- `training.py`: removed `BackwardHookRecorder`, block-output tensor hook registration, per-batch hook reset, hook snapshots in non-finite reports, the hook-specific exception text, model attachment logic, and the `--debug-backward-hooks` CLI option. The existing parameter-gradient finite checks, atomic JSON failure report, gradient clipping, and tau/hard-state diagnostics remain intact.
+- `run_phase3.sh`: removed the `DEBUG_BACKWARD_HOOKS` environment switch and CLI forwarding. Changed Phase 3 defaults from LR 0.001 with `bireal_reference` linear decay to LR 0.02 with the `constant` schedule.
+- `tests/test_phase12_route.py`: removed the obsolete backward-hook regression test. All other route, quantization, scheduler, checkpoint, and failure-report tests remain.
+- `EXPERIMENT_LOG.md`: recorded the cleanup, resulting runtime behavior, and verification.
+
+### Learning-rate behavior
+
+The Adam optimizer uses `args.lr` for every parameter group, and `set_optimizer_lr` applies the scheduler result to every group. With the new defaults, LUT entries, complex BN parameters, stem, projections, and classifier all use LR 0.02 for every epoch. Environment overrides remain available only when explicitly supplied.
+
+### Verification
+
+- No hook recorder, hook registration, debug-hook CLI flag, or shell debug-hook switch remains in `training.py`, `run_phase3.sh`, or the active tests.
+- Python compilation and shell syntax checks passed.
+- All 22 tests in `tests.test_phase12_route` passed.
+- Direct scheduler verification confirmed all 256 epochs return exactly 0.02 under the constant schedule.
+
+<!-- experiment-entry:phase3-progressive-lr002-structural-vs-optimization-20260811 -->
+## 2026-08-11 - Interpret current progressive LUT loss: representation versus optimization
+
+- Run: `runs/phase3_lutfp_progressive_lr002_constant_gpu1/logs/train.txt`. The file contains two invocations; this analysis uses the second/current invocation started at 2026-08-10 15:35.
+- Reference: the source Phase 2 checkpoint reached 85.05% best test accuracy.
+- Observed trajectory: Phase 3 reached 80.76% at epoch 20 while all 18 operators were still soft; at epoch 40 (`tau=2`, 0/18 hard) test accuracy was 77.27%. During progressive hardening it was 78.30% at 12/18 hard, 74.32% at 14/18, 68.25% at 15/18, and about 70.28% at 16/18 as of the inspected log.
+- Optimization evidence: pre-clip gradient norms rose sharply late in hardening (including about 182.3 and 284.8) while `clip_grad_norm=5`. Therefore late-stage updates are strongly clipped and the hardening transition also creates a difficult, unstable optimization problem.
+- Structural interpretation: each original six-term binary local accumulation has seven possible levels (`-6,-4,-2,0,2,4,6`). A hard LUT emits only one bit and collapses those seven levels to two. This is a real local output-bandwidth/information bottleneck, and the accuracy decline tracking the hard-operator count is strong evidence that hard conversion causes genuine representational loss.
+- Important qualification: it is not correct to say optimization is irrelevant. Structural loss and optimization difficulty coexist. Also, the current Phase 3 loads shared Phase 2 tensors while LUT tables use bimodal initialization, so the soft-stage gap includes initialization shock and does not isolate the architectural loss.
+- Proposed isolation experiment: (A) initialize every soft LUT exactly from its corresponding Phase 2 local sum using an affine normalization and recalibrate BN, then test immediate equivalence; (B) hard-project that same checkpoint without training to measure pure representational loss; (C) fine-tune the hard model to measure how much of that loss is recoverable. This separates initialization, hard representation, and optimization effects.
+- Files changed for this analysis: only `EXPERIMENT_LOG.md`; no model, training, LUT backend, or CUDA source was modified.
+
+<!-- experiment-entry:review-binary-twolut-rollback-20260811 -->
+## 2026-08-11 - Review binary rollback in TwoLUTComplexConv2d
+
+- Scope: reviewed the new `LUTBinaryConv2d` and `TwoLUTComplexConv2d` implementation at the end of `complexPyTorch/complexLayers.py`, plus the current Phase 3 model, scheduler, checkpoint loader, and optimizer integration. No source code was changed.
+- Correct part: sharing `conv_r` for `rr/ri`, sharing `conv_i` for `ii/ir`, and returning `(rr-ii) + j(ri+ir)` preserves the intended two-operator complex cross pattern.
+- Blocking scheduler mismatch: `configure_lut_training_flow()` writes `branch.tau` and `branch.hard`, but `LUTBinaryConv2d` defines neither buffer. Both hard and progressive Phase 3 flows will fail when configuration is applied.
+- Blocking soft-input mismatch: progressive `BinaryComplexBitActivation` emits values strictly between 0 and 1, while `LUTBinaryConvFunction.forward()` converts inputs with `x.to(torch.int8)`. Almost every soft activation therefore becomes zero. A binary-kernel path must keep activation hard from the start, or use a non-binary kernel during the soft stage.
+- Blocking checkpoint mismatch: `load_phase3_shared_checkpoint()` recognizes only `LUTFPConv2d` as a LUT layer. New `LUTBinaryConv2d.weight` tensors are therefore treated as shared Phase 2 convolution weights; their shapes differ and the loader raises an incompatible-shape error instead of retaining bimodal LUT initialization.
+- Coverage issue: `LUTBinaryConv2d.lut_num` uses floor division. For the first stage with 11 channels and a 3x3 kernel, 99 positions become only 16 LUTs, covering 96 positions and dropping three. `ceil` alone would prevent dropping but the extra LUT inputs also need an explicit neutral-padding policy rather than accidental wraparound.
+- Integration inconsistencies: LUT layer counting, gradient diagnostics, and no-weight-decay classification still recognize `LUTFPConv2d` only. Training may still update binary LUT weights through the generic decay group, but behavior and reporting no longer match the intended LUT configuration.
+- Static syntax check passed for `complexLayers.py`, `complexBinaryResNet.py`, and `training.py`; this does not cover the runtime interface failures above.
+- Files changed for this review: only `EXPERIMENT_LOG.md` was appended through `scripts/append_experiment_log.py`.
+
+<!-- experiment-entry:phase3-fully-hard-binary-rollback-20260811 -->
+## 2026-08-11 - Restore Phase 3 to fully hard binary Bi-Real/LUT training
+
+- Goal: fully roll Phase 3 back from floating/annealed LUT training to binary training aligned with the real Bi-Real LUT reference.
+- `complexPyTorch/complexLayers.py`: `BinaryComplexBitActivation` now explicitly performs the original Bi-Real signed activation first, forces the zero boundary to the `-1` branch, and only then applies `(s + 1) / 2`. The LUT kernel therefore receives exact `{0,1}` bits while backward remains the Bi-Real proxy with the expected one-half chain factor. `LUTBinaryConv2d` uses hard `{0,1}` LUT entries with identity STE and the binary CUDA backend. It now rejects convolution layouts whose per-group logical input count is not divisible by six instead of silently dropping positions; this also respects the fixed LUT-count dispatches in the existing CUDA kernel. `TwoLUTComplexConv2d` uses two shared binary LUT branches and retains `(rr-ii) + j(ri+ir)`.
+- `training.py`: all active Phase 3 integration now recognizes `LUTBinaryConv2d` rather than `LUTFPConv2d`. Phase 2 checkpoint loading excludes binary LUT tables and keeps their bimodal initialization; LUT parameters are put in the no-weight-decay group; gradient diagnostics and layer counts report binary LUT branches. The soft anneal/layer-hardening scheduler and its validation were removed. Every Phase 3 epoch is reported as fully hard and hardware-ready.
+- `run_phase3.sh`: removed all temperature, warmup, progressive flow, and hardening arguments. The default remains Adam with constant LR `0.02`, and the script now states that activations and LUT tables are binary from epoch 1.
+- `tests/test_phase12_route.py`: switched Phase 3 expectations and checkpoint tests to `LUTBinaryConv2d`, removed progressive/soft-activation tests, added the always-hard flow assertion and invalid incomplete-six-input-group test, and retained the exact Bi-Real-to-bit forward/gradient test.
+- `CURRENT_TECHNICAL_ROUTE.md`: replaced the obsolete progressive-flow and LR `0.001` description with the current fully hard `(s+1)/2`, identity-STE, Adam LR `0.02` constant route.
+- Verification: `python -m unittest tests.test_phase12_route` passed all 21 tests in the `lut_net` environment. A GPU0 smoke test ran `BinaryComplexBitActivation -> LUTBinaryConv2d(16,32,3x3)` forward/backward; activation unique values were exactly `[0.0, 1.0]`, output shape was `(2,32,8,8)`, and input/LUT gradients were finite. `run_phase3.sh` passed `bash -n`; Python modules passed syntax compilation. Existing AMP deprecation warnings in `lut_backend.py` remain unchanged.
+- Protected files: neither `complexPyTorch/lut_backend.py` nor any CUDA source was edited.
+
+<!-- experiment-entry:phase3-binary-no-epoch-output-diagnosis-20260811 -->
+## 2026-08-11 - Diagnose silent Phase 3 binary run: binary backward performance bottleneck
+
+- Run inspected: `runs/phase3_binary_lr002/logs/train.txt`. It initialized the dataset, Phase 2 checkpoint, 36 binary LUT branches, optimizer state, and entered Epoch 1 successfully. There was no exception; the user terminated it before the first epoch completed.
+- Logging behavior: the active training loop reports metrics only after a complete epoch, not per batch. With 50,000 samples and batch size 256, approximately 196 silent training batches occur before the next log line.
+- Process/GPU check after termination found no active training process and idle GPUs at that moment, confirming the original job had been killed rather than continuing invisibly.
+- Controlled timing isolated the issue. A complete Phase 3 model with synthetic `batch=1` completed forward in about 0.331 seconds, but backward did not complete within a 90-second timeout. A representative single `LUTBinaryConv2d(16,16,3x3)` backward also failed to finish within the timing window. During the long operation GPU0 remained at 100% SM utilization, so this is computation, not a DataLoader stall, log buffering issue, or deadlock.
+- Root cause: `lut_conv_backward_ultimate_kernel` iterates over every LUT for every spatial/output block. For each LUT it clears a shared `64 x TILE_OC` gradient table, synchronizes the block repeatedly, computes six Boolean derivatives, and performs shared/global atomic accumulation. The complex operator invokes two LUT tables on both real and imaginary inputs, multiplying this already expensive backward path across 18 residual operators. The binary forward is fast; the binary backward is the bottleneck.
+- This explains why the earlier floating-kernel route was much faster. The current binary CUDA kernel is suitable for hard inference forward but its training backward implementation is not practical for the full complex network.
+- Recommended next implementation: keep Bi-Real activation and LUT entries hard `{0,1}` in forward, use the binary kernel only to establish the hard forward value, and route backward through the faster FP LUT kernel as a proxy/STE. Detaching the binary result prevents the slow binary backward from running. This preserves hardware-consistent forward semantics while changing only the training surrogate. A simpler equivalent may use the FP kernel directly with hard `{0,1}` inputs/tables if an equality test confirms bit-exact outputs at Boolean corners.
+- No source files were changed during this diagnosis. No CUDA or `lut_backend.py` edits were made. All diagnostic benchmark processes were stopped or ended by timeout.
+
+<!-- experiment-entry:phase3-restore-a30-grouped-binary-backend-20260811 -->
+## 2026-08-11 - Correct binary slowdown diagnosis and restore A30 grouped-binary backend
+
+- Correction to the immediately preceding diagnosis: the A30 result was valid, and the grouped binary training kernel is fast. The slow run did not use the same training backend despite both paths being described as binary LUT kernels.
+- Backend identity: the real CIFAR Bi-Real reference uses `lut_conv_group -> LUT6Function -> lut_cuda_grouped_binary`. The recently restored `LUTBinaryConv2d` instead used the experimental `LUTBinaryConvFunction -> lut_conv_binary_cuda` direct-convolution backend. Existing experiment entries from 2026-08-01 had already measured that direct backend at over 30 seconds for a tiny backward and explicitly removed it from the clean route. The rollback accidentally reintroduced it.
+- Architecture/build checks ruled out the initial environment hypothesis: the current machine uses RTX 4090 D GPUs (SM 8.9), and the loaded direct binary extension contains a native `sm_89` cubin. The slowdown was not caused by running an A30 `sm_80` binary on Ada.
+- `complexPyTorch/complexLayers.py`: restored the validated reference dataflow without changing CUDA/backend sources. `LUTBinaryConv2d` now pads and unfolds image windows, reshapes them to `[batch, locations, groups, lut_num, 6]`, hard-binarizes LUT entries, calls the existing `LUT6Function`, sums LUT outputs, and restores NCHW output. LUT weights use the reference layout `[out_channels, lut_num, 64]`. Incomplete six-input tail groups repeat the start of the local input vector exactly as the real reference does. Bi-Real `{-1,+1}` activation followed by `(s+1)/2` remains unchanged.
+- `tests/test_phase12_route.py`: updated the tail-group test for the grouped reference behavior and verified the `[out_channels, lut_num, 64]` weight layout.
+- `training.py`: added optional low-frequency batch progress logging to `train_one_epoch`. The main training loop passes the logger and `--log-interval`; default interval is 25 batches. This prevents approximately three minutes of silence within an epoch.
+- `run_phase3.sh`: added `LOG_INTERVAL`, default 25, and forwards it as `--log-interval`.
+- `CURRENT_TECHNICAL_ROUTE.md`: documented `pad + unfold -> lut_cuda_grouped_binary`, excluded the experimental direct backend from the active route, and documented progress logging.
+- Performance verification on GPU0: full Phase 3 with batch 1 completed in 0.2871 seconds forward and 0.1928 seconds backward, with gradients on all 36 LUT branches. With the actual batch size 256, forward took 0.5913 seconds, backward 0.3371 seconds, output shape was `(256,10)`, and peak allocated memory was about 4608 MiB. The prior direct backend exceeded 90 seconds in backward even at batch 1.
+- Correctness verification: all 21 active-route unit tests passed; Phase 2 shared checkpoint loading retained random bimodal initialization for 12 tested LUT tables; Python/shell syntax checks passed. A three-batch CPU smoke test confirmed progress logs print at the configured interval and final batch.
+- Protected files: no edits were made in this correction to `complexPyTorch/lut_backend.py` or any CUDA source. Existing pre-task modifications/build artifacts under those paths were left untouched.
+
+<!-- experiment-entry:grouped-binary-is-hard-forward-clarification-20260811 -->
+## 2026-08-11 - Clarify grouped-binary naming versus fully binary LUT forward
+
+- `grouped` in `lut_cuda_grouped_binary` describes the CUDA tensor/work organization for batching many independent LUT6 evaluations. It does not mean grouped convolution, soft LUTs, or floating forward values. The active model uses `group_num=1`.
+- Active forward value domains are fully hard: Bi-Real activation produces `{-1,+1}` and `(s+1)/2` produces exact `{0,1}` address bits; `binary_gumbel_softmax(..., hard=True)` produces exact `{0,1}` truth-table entries; the grouped binary CUDA forward thresholds each address input at `>0.5`, performs an integer table index, and returns exactly the selected binary entry for each LUT6.
+- After the LUT kernel, outputs from multiple LUT6 cells are summed, so the convolution aggregate is an integer-valued multi-level result rather than one bit. This matches the real Bi-Real LUT reference and the intended LUTConv operator.
+- Latent LUT logits and backward gradients remain floating point so entries can be optimized. Requiring the stored trainable parameters or gradients themselves to be binary would remove ordinary gradient-based learning; it is distinct from requiring a fully binary forward.
+- No source file was changed for this clarification; only `EXPERIMENT_LOG.md` was appended.
+
+<!-- experiment-entry:direct-bitpacked-backward-performance-explanation-20260811 -->
+## 2026-08-11 - Why the direct bit-packed LUT backward is slower than grouped binary
+
+- Bit-packing accelerates the direct forward because six input bits form one address and each 64-entry Boolean table fits in one `uint64`. It does not make training gradients binary: backward must still emit floating `grad_x` and 64 floating `grad_w` values per LUT.
+- The direct kernel launches blocks over spatial positions and 32-output-channel tiles. Every block then loops over every LUT. For every LUT iteration it clears a shared `64 x 32` float gradient table, executes several block-wide synchronizations, and eventually atomically merges the shared table into the same global LUT-gradient addresses updated by many other spatial blocks.
+- For a representative first-stage layer with `B=256`, `H=W=32`, `O=16`, and `L=24`, the direct launch has about 65,536 spatial blocks, each looping over 24 LUTs. This creates roughly 1.57 million shared-table initialization/synchronization rounds. Since each table has 2,048 floats, the kernel clears on the order of 3.2 billion shared float slots. The 32-output tile is also only half utilized when `O=16`.
+- The grouped binary kernel launches work by `(output_channel, LUT_index, BR_chunk)`. Each block owns one output/LUT pair, uses only 64 shared LUT values and 64 shared gradient values, processes many batch/spatial samples, and aggregates locally before a much smaller number of global atomic updates. It therefore matches the reduction structure required by `grad_w` instead of the spatial lookup structure optimized for forward.
+- The direct kernel's warp reduction makes `grad_x` reasonably compact, but repeated shared-table clearing, synchronization, and contended `grad_w` atomics dominate. Thus the direct design is a fast inference-forward organization paired with an unsuitable training-backward organization; the slowdown is not caused by binary arithmetic itself.
+- A performant bit-packed training kernel would keep the packed forward but redesign backward around output/LUT ownership, likely separating `grad_w` and `grad_x` kernels. No source file was changed for this analysis; only `EXPERIMENT_LOG.md` was appended.
+
+
+<!-- experiment-entry:grouped-direct-binary-equivalence-conditions-20260811 -->
+## 2026-08-11 - Forward/backward equivalence conditions for grouped and direct binary LUT kernels
+
+- Scope: current grouped binary LUT path (`lut_conv_group -> LUT6Function -> binary_lut`) versus the old direct bit-packed convolution path. They represent the same operator only after aligning logical connections, padding, tail handling, and LUT address mapping.
+- Raw tensors cannot be copied directly: grouped weights use `[out_channels, lut_num, 64]`, while direct weights use `[lut_num, 64, out_channels]`. Grouped indexing uses `1 << (5-j)`, so input 0 is the MSB; direct `ballot_sync` puts input 0 in the LSB. Conversion requires both a layout transpose and 6-bit address reversal.
+- Forward: after that conversion, every 6-bit input selects the same binary entry and the same LUT outputs are accumulated, so the mathematical outputs are exactly equal. For exact 0/1 inputs, grouped `>0.5` and direct `>0` thresholds are equivalent.
+- Backward: both implement the same finite-difference surrogate. The selected entry accumulates `grad_y`; input bit k receives `grad_y * (T(addr, bit_k=1) - T(addr, bit_k=0))`, accumulated across outputs and windows. CUDA atomic/reduction order differs, so floating results should be allclose but are not guaranteed bitwise identical.
+- Tail caveat: grouped repeats the beginning of the local vector when the input count is not divisible by 6. A direct implementation using floor or fixed supported counts is not equivalent in that case. The default `C=16, kernel=3x3` has `16*9=144`, divisible by 6.
+- Source-code changes: none. This entry also repairs an earlier malformed append caused by shell interpretation of Markdown backticks.
+
+<!-- experiment-entry:pair-lut4-exact-bit-phase3-20260811 -->
+## 2026-08-11 - Pair-LUT4 complex convolution with exact 0/1 activation inputs
+
+### 实验目标
+
+重新启用“每两个复数 activation 作为一组”的 LUT-as-neuron 方案，但修复旧实验最关键的值域错误：保持当前 Bi-Real activation 和梯度不变，并在 LUT 入口显式使用 `(sign(x)+1)/2`，保证实部、虚部地址 bit 严格属于 `{0,1}`，不再把 `{-1,+1}` 直接交给 LUT。
+
+### 当前算子定义
+
+- 一个卷积窗口包含 `k*k*Cin` 个复数位置，按 channel/spatial 顺序 flatten。
+- 每两个复数位置组成四位地址 `[x0r,x0i,x1r,x1i]`。
+- 每个 pair、每个输出通道拥有两张独立 LUT4：一张输出局部实部 bit，一张输出局部虚部 bit。
+- pair 数为 `ceil(k*k*Cin/2)`；实部和虚部输出分别沿 pair 维累加。
+- LUT 输出采用 `{0,1}` 直接计数，因此两路聚合范围都是 `[0,pair_num]`。现有 post complex-BN 负责吸收直流偏置和尺度；算子内部没有额外复数乘法、交叉分支或 `2*count-pair_num` 变换。
+- 奇数尾组重复窗口中的第一个复数位置。默认 3x3 stage 的 channel 数为 16/32/64，逻辑位置数均为偶数，不触发尾组。
+- 每张 16-entry 表使用 bimodal logit 初始化；前向为 hard `0/1`，反向为 identity STE。
+
+### CUDA 映射
+
+本次没有修改 `complexPyTorch/lut_backend.py` 或任何 CUDA 源文件。新层复用当前 grouped binary LUT6 backend：
+
+1. 在四个有效地址 bit 后附加两个常数 0；
+2. 将每个 LUT4 entry 沿两个未使用地址位复制四份，形成 64-entry 表；
+3. 调用 `LUT6Function`；
+4. 对 pair 输出累加。
+
+该映射保持 LUT4 前向严格不变，并令两个 dummy bit 的有限差分为 0。
+
+### 文件改动摘要
+
+- `complexPyTorch/complexLayers.py`
+  - 新增 `PairLUT4ComplexConv2d`。
+  - 实现复数 patch 展开、两复数配对、LUT4 CPU multilinear reference、LUT4-to-LUT6 精确嵌入、real/imag 两路累计和 hard-table STE。
+  - 保留原 `LUTBinaryConv2d`、`TwoLUTComplexConv2d` 和 backend/CUDA 接口。
+- `complexPyTorch/complexBinaryResNet.py`
+  - 新增 `phase3_operator` 选择器，允许 `pair_lut4` 与 `shared_lut6`。
+  - Phase3 默认使用 `PairLUT4ComplexConv2d`；activation 仍为现有 `BinaryComplexBitActivation`。
+  - Phase1/Phase2 路由不变。
+- `training.py`
+  - 新增 CLI `--phase3-operator {pair_lut4,shared_lut6}`，默认 `pair_lut4`。
+  - Phase2 checkpoint 初始化会跳过新 LUT4 表，只加载共享 stem/BN/projection/classifier 状态。
+  - 新 LUT4 参数归入 no-weight-decay 组。
+  - hard-flow 检查、nonfinite report 元数据和启动日志均识别新 operator。
+- `run_phase3.sh`
+  - 新增环境变量 `PHASE3_OPERATOR`，默认 `pair_lut4`。
+  - 默认 workdir 改为 `runs/phase3_pair_lut4`，并将 operator 传入 training CLI。
+  - 启动信息明确标记 pair-LUT4、严格 0/1 地址和 fully-hard STE。
+- `tests/test_phase12_route.py`
+  - 默认 Phase3 断言更新为 PairLUT4。
+  - 新增 `[r0,i0,r1,i1]` 地址顺序、双输出、输入/LUT 梯度、表形状和 shared-LUT6 对照路由测试。
+  - checkpoint shared-state 与 hard-flow 测试同步新 operator。
+- `scripts/audit_active_route.py`
+  - 路线审计改为验证 PairLUT4 默认 operator、每张表 16 entries、每层 pair 数和 0/1 activation。
+  - 不再将 pair 误判为归档选项。
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - Phase3 章节全面改写为成对 LUT4 数据流、训练定义、CUDA 嵌入、硬件含义和对照开关。
+- `EXPERIMENT_LOG.md`
+  - 追加本条实现、验证和运行基线，供后续结果分析复用。
+
+### 验证结果
+
+- Python 语法检查：通过。
+- 全部单元测试：`26/26` 通过。
+- active-route audit：通过。
+- launcher 在 `lut_net` 环境中解析成功，显示 `--phase3-operator {pair_lut4,shared_lut6}`。
+- CPU LUT4 reference 对 CUDA grouped backend，同输入、同表、同上游梯度：
+  - forward max abs diff：`0.0`
+  - real input grad max abs diff：`1.1920929e-6`
+  - imag input grad max abs diff：`2.8610229e-6`
+  - LUT grad max abs diff：`9.536743e-7`
+- 完整默认 Phase3（start_filter=16, num_blocks=3）在 GPU1 单 batch 前反向：
+  - 输出 shape：`(2,10)`
+  - 检查到 18 个 PairLUT4 residual operator；
+  - 18/18 operator 输入均严格为 `{0,1}`；
+  - 18/18 LUT 表均获得 finite gradient；
+  - 单 batch smoke elapsed 约 `0.461 s`。
+- 仅有已存在的 PyTorch AMP deprecation warning；无功能错误。
+
+### 推荐正式命令
+
+从头训练：
+
+```bash
+GPU_ID=1 PHASE3_OPERATOR=pair_lut4 WORKDIR=runs/phase3_pair_lut4_bimodal_lr002 ./run_phase3.sh
+```
+
+从 Phase2 checkpoint 加载共享状态：
+
+```bash
+GPU_ID=1 PHASE3_OPERATOR=pair_lut4 CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase2.pt WORKDIR=runs/phase3_pair_lut4_from_phase2_lr002 ./run_phase3.sh
+```
+
+Matched shared-LUT6 对照仍可用 `PHASE3_OPERATOR=shared_lut6`。
+
+<!-- experiment-entry:pair-lut4-scratch-sf11-decision-20260811 -->
+## 2026-08-11 - Pair-LUT4 switches to matched-size training from scratch
+
+### 报错原因
+
+用户按上一条推荐命令读取 `bi_workdir/chkpts/Bestmodel_phase2.pt` 时，模型在训练开始前发生 shape mismatch。检查 checkpoint 元数据确认：
+
+- `phase=2`
+- `start_filter=11`
+- `num_blocks=3`
+- `spectral_pool_scheme=none`
+- checkpoint epoch 126
+
+上一条命令未设置 `START_FILTER`，而当前 `run_phase3.sh` 默认是 16，因此 stem、BN 和各 stage 通道全部出现 `11 vs 16` 的形状冲突。
+
+将模型宽度改为 11 后，又发现该旧 checkpoint 来自更早的网络拓扑：包含 `bn_pre`，projection 使用旧的 `proj.0 Conv + proj.1 BN` 命名，而当前干净路线采用 avg-pool 后的 `proj.1 Conv + proj.2 BN`。因此该 checkpoint 不适合作为“只改变卷积算子”的严格起点。
+
+### 最终决定
+
+用户决定不读取 checkpoint，只要求新模型尺寸与旧模型一致，直接从头训练：
+
+- `start_filter=11`
+- `num_blocks=3`
+- `phase3_operator=pair_lut4`
+- 所有 backbone、BN、classifier 和 LUT 参数均重新初始化
+- 显式设置 `CHECKPOINT=`，防止 shell 中遗留的 checkpoint 环境变量被使用
+
+在排查期间曾临时加入旧 projection key 兼容映射；用户决定 from scratch 后，该临时映射已完整撤销，`training.py` 最终没有保留这一未采用方案。
+
+### 文件改动摘要
+
+- `training.py`
+  - 临时 legacy projection 映射已添加后撤销；最终文件相对本轮开始没有保留该兼容逻辑。
+  - PairLUT4 实现和 from-scratch 路由保持不变。
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - 本轮推荐命令更新为 `start_filter=11, num_blocks=3` 的 from-scratch 实验。
+  - 删除将旧 Phase2 checkpoint 作为本轮推荐起点的描述。
+- `EXPERIMENT_LOG.md`
+  - 追加本条故障原因、路线决策、撤销操作与验证结果。
+
+### 验证
+
+- 全部测试：`26/26` 通过。
+- `_resolve_initial_checkpoint(args) == (None, None)`。
+- GPU1 完整宽度 11 模型单 batch 前反向通过：
+  - output shape `(2,10)`
+  - PairLUT4 层数 `18`
+  - 18/18 LUT gradient 存在且 finite
+  - 总参数量 `2,029,221`
+- 检查确认 `training.py` 不再包含临时 `_phase3_shared_source_keys` 映射。
+
+### 最终运行命令
+
+```bash
+CHECKPOINT= \
+GPU_ID=1 \
+START_FILTER=11 \
+NUM_BLOCKS=3 \
+PHASE3_OPERATOR=pair_lut4 \
+WORKDIR=runs/phase3_pair_lut4_scratch_sf11_lr002 \
+./run_phase3.sh
+```
+
+<!-- experiment-entry:pair-lut4-riri-layout-audit-20260812 -->
+## 2026-08-12 - Pair-LUT4 real/imag input layout audit
+
+### 用户疑问
+
+用户担心 `_pair_patches` 分别对实部和虚部执行 `F.unfold` 后，会形成“全部实部在前、全部虚部在后”的布局，使某些 LUT4 只看到实部或只看到虚部。
+
+### 代码核对结论
+
+当前实现不会发生该问题：
+
+1. `real` 和 `imag` 的 shape 都是 `[B, logical_positions, locations]`。
+2. `torch.stack((real, imag), dim=-1)` 立即形成 `[B, logical_positions, locations, 2]`，最后一维顺序严格为 `[real, imag]`。
+3. `permute(0,2,1,3).contiguous()` 得到 `[B, locations, logical_positions, 2]`；每个复数位置的实部和虚部在连续内存中相邻。
+4. 最终 `view(B, locations, pair_num, 4)` 合并两个连续复数位置，地址顺序严格为 `[x0r,x0i,x1r,x1i]`。
+
+最小编号实测：
+
+```text
+Cin=3, k=1
+real = [10,20,30]
+imag = [11,21,31]
+pair0 = [10,11,20,21]
+pair1 = [30,31,10,11]
+```
+
+第二组展示了奇数尾组规则：最后一个复数 `[30,31]` 与窗口第一个复数 `[10,11]` 配对。
+
+### Pair 的位置顺序
+
+`F.unfold` 的 logical position 顺序是 channel-major，并在每个 channel 内按 kernel spatial 顺序排列。因此 pair 通常连接同一 channel 的相邻 kernel tap，也可能在 flatten 边界处连接前一 channel 的最后一个 tap 与下一 channel 的第一个 tap。但无论 pair 是否跨 channel，每个复数位置的 real/imag 始终相邻，不会拆开。
+
+### 文件改动
+
+没有修改模型代码；当前排列正确。仅向 `EXPERIMENT_LOG.md` 记录本次核对和编号验证。
+
+<!-- experiment-entry:pair-lut4-channel-priority-same-spatial-20260812 -->
+## 2026-08-12 - Pair-LUT4 switches to same-spatial channel-priority pairing
+
+### 修改目标
+
+将 PairLUT4 的复数位置展开顺序从旧的 channel-major（每个 channel 内遍历 kernel spatial）改成用户定义的 channel-priority 配对：固定一个 kernel spatial tap，在该位置内优先遍历 input channel，使每张 LUT4 的两个复数输入来自同一位置的两个相邻 channel。
+
+### 最终数据排列
+
+`F.unfold` 原始输出 `[B, Cin*k^2, locations]` 先恢复为：
+
+```text
+[B, Cin, kernel_area, locations]
+```
+
+随后重排为：
+
+```text
+[B, locations, kernel_area, Cin]
+```
+
+再将 real/imag stack 到最后一维：
+
+```text
+[B, locations, kernel_area, Cin, 2]
+```
+
+因此每个 LUT4 的地址顺序仍严格为：
+
+```text
+[channel c real, channel c imag,
+ channel c+1 real, channel c+1 imag]
+```
+
+即 `[x0r,x0i,x1r,x1i]`，而两个复数属于同一个 kernel spatial tap。
+
+### 奇数 channel 规则
+
+为避免正式配置 `Cin=11` 时跨 spatial 位置配对，不再对完整的 `k^2*Cin` 序列只补一次尾组。现在对每个 spatial tap 单独补齐 channel：
+
+- `Cin` 为偶数：直接按 `(c0,c1),(c2,c3),...` 配对；
+- `Cin` 为奇数：最后一个 channel 与该 spatial tap 的第一个 channel 配对；
+- 任意情况下都不跨 kernel spatial tap。
+
+pair 数由：
+
+```text
+ceil(k^2 * Cin / 2)
+```
+
+改为：
+
+```text
+k^2 * ceil(Cin / 2)
+```
+
+因此 `Cin=11, k=3` 时，每个输出通道从旧定义的 50 个 global pair 变为 `9*6=54` 个 strictly same-spatial pair。
+
+### 文件改动摘要
+
+- `complexPyTorch/complexLayers.py`
+  - `PairLUT4ComplexConv2d._pair_patches` 恢复 `Cin × kernel_area` 维度并执行 `spatial -> channel` 重排。
+  - 新增 `pairs_per_position=ceil(Cin/2)`。
+  - `pair_num` 改为 `kernel_area*pairs_per_position`。
+  - 奇数 channel 在每个 spatial tap 内复制该 tap 的第一个 channel。
+  - LUT 地址内部的 `[r0,i0,r1,i1]` 顺序、hard table、CUDA LUT6 嵌入和累计方式均不变。
+- `tests/test_phase12_route.py`
+  - 新增 `Cin=4,k=2` 唯一编号测试，验证每个 pair 是同一 spatial tap 的两个相邻 channel。
+  - 新增 `Cin=3,k=2` 奇数 channel 测试，验证尾组在每个 spatial tap 内使用 `last channel + first channel`，绝不跨位置。
+- `scripts/audit_active_route.py`
+  - PairLUT4 表 shape 审计公式更新为 `k^2*ceil(Cin/2)`。
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - 更新 flatten 顺序、pair 数公式和奇数 channel 尾组规则。
+- `EXPERIMENT_LOG.md`
+  - 追加本条实现与验证记录。
+- `complexPyTorch/lut_backend.py` 和 CUDA 文件：未修改。
+
+### 验证结果
+
+- 全部单元测试：`28/28` 通过。
+- active-route audit：通过。
+- Python syntax check：通过。
+- `Cin=11,k=3` CPU reference 与 CUDA grouped binary backend：
+  - pair_num：`54`，符合 `9*ceil(11/2)`
+  - forward max abs diff：`0.0`
+  - real input grad max abs diff：`1.9073486e-6`
+  - imag input grad max abs diff：`1.9073486e-6`
+  - LUT grad max abs diff：`1.9073486e-6`
+- 完整 `start_filter=11,num_blocks=3` GPU 模型：
+  - output shape：`(2,10)`
+  - PairLUT4 layers：`18`
+  - 18/18 LUT gradients finite
+  - 第一层 pair_num：`54`
+
+### 兼容性说明
+
+本次改变了 LUT table 的 pair 语义和奇数 channel 时的 pair 数，因此修改前的 PairLUT4 checkpoint 不应直接加载到新排列。当前正式实验本来就是 from scratch，不受影响。
+
+<!-- experiment-entry:disable-intra-epoch-batch-logs-20260812 -->
+## 2026-08-12 - Disable intra-epoch batch progress logs by default
+
+### 修改目标
+
+关闭 epoch 内部每隔若干 batch 打印的训练进度，只保留每个 epoch 结束时的汇总日志。
+
+### 行为
+
+`train_one_epoch` 原有判断为：
+
+```python
+if logger is not None and log_interval > 0 and ...:
+```
+
+因此 `log_interval=0` 会明确关闭 batch progress，不影响 epoch 结束后的 train/val/test loss 和 accuracy 汇总，也不影响学习率、LUT hard-flow 状态或异常诊断。
+
+CLI 参数仍然保留；如果以后临时排查卡顿，可显式设置 `LOG_INTERVAL=25` 重新开启。
+
+### 文件改动摘要
+
+- `training.py`
+  - `--log-interval` 默认值由 `25` 改为 `0`。
+- `run_phase3.sh`
+  - `LOG_INTERVAL` 默认值由 `25` 改为 `0`，并继续显式传给 training CLI。
+- `tests/test_phase12_route.py`
+  - 新增测试，断言默认 `training.parse_args([]).log_interval == 0`。
+- `EXPERIMENT_LOG.md`
+  - 追加本条变更记录。
+
+### 验证
+
+- 全部测试：`29/29` 通过。
+- CLI 默认值实测：`log_interval 0`。
+- `run_phase3.sh` shell syntax check：通过。
+- 训练中不再出现 `Epoch N batch M/... train_loss...`，每个 epoch 结束汇总保持不变。
+
+<!-- experiment-entry:triple-lut6-default-after-pair-result-20260812 -->
+## 2026-08-12 - Pair-LUT4 result and Triple-LUT6 default Phase3 implementation
+
+### 上一版 PairLUT4 完整结果
+
+使用可复用脚本 `scripts/analyze_training_run.py` 分析
+`runs/phase3_pair_lut4_scratch_sf11_lr002`：
+
+- 状态：complete，256/256 finite epochs；
+- 配置：from scratch，`start_filter=11`，`num_blocks=3`，Adam，
+  constant LR `0.02`，batch 256，hard LUT + STE；
+- best test：`81.10%`，epoch 116，test loss `0.595156`；
+- best 点 train accuracy：`73.80%`；
+- final test：`77.83%`，final train：`71.35%`；
+- 无 NaN/Inf。
+
+对比已记录的 Phase2 baseline `85.05%`，PairLUT4 低 `3.95 pp`。它比更早
+analytic pair 的 `50.22%` 显著好，证明修复 `{-1,+1}` 到 `{0,1}` 地址值域
+是关键；但仍未超过 Phase2，而且后期在 constant LR 0.02 下明显回落。
+
+channel-priority PairLUT4 对 `Cin=11,k=3` 使用
+`9*ceil(11/2)=54` 组。用户决定停止把该结构作为默认路线，尝试更宽的局部 neuron。
+
+### 新方案：三个复数输入、两个 LUT6 输出
+
+新增 `TripleLUT6ComplexConv2d`。对于每个 kernel spatial tap，沿 channel
+优先顺序把三个二值复数组织为：
+
+```text
+[x0r,x0i,x1r,x1i,x2r,x2i]
+```
+
+这六个 bit 同时连接两张独立 64-entry LUT6，分别产生局部实部 bit 和虚部 bit。
+所有组的两路输出分别累加，再进入现有 post complex-BN。
+
+分组数：
+
+```text
+lut_num = k^2 * ceil(Cin / 3)
+```
+
+奇数/余数 channel 在每个 spatial tap 内独立从该 tap 的开头补足，绝不跨 spatial。
+例如 `Cin=5` 使用 `(c0,c1,c2)`、`(c3,c4,c0)`。
+
+activation 保持 `BinaryComplexBitActivation`：前向输入严格为 `{0,1}`，反向
+保持 Bi-Real surrogate。LUT table 前向 hard、logit backward identity STE；
+输入梯度继续使用 LUT 有限差分。
+
+### 文件改动摘要
+
+- `complexPyTorch/complexLayers.py`
+  - 新增 `TripleLUT6ComplexConv2d`。
+  - 实现 spatial 固定/channel 优先的三复数分组、每位置尾组补齐、CPU 64-state
+    multilinear reference、CUDA grouped `LUT6Function` 路径、实虚两路累计。
+  - 保留 `PairLUT4ComplexConv2d` 和 `TwoLUTComplexConv2d`，未删除历史方案。
+- `complexPyTorch/complexBinaryResNet.py`
+  - `phase3_operator` 增加 `triple_lut6` 并改为默认。
+  - 保留 `pair_lut4` 和 `shared_lut6` 显式对照。
+- `training.py`
+  - 导入并识别 TripleLUT6 的 checkpoint LUT 参数排除、no-decay、hard-flow、
+    nonfinite diagnostic 和启动统计。
+  - CLI choices 更新为 `triple_lut6,pair_lut4,shared_lut6`，默认
+    `triple_lut6`。
+  - `log_interval=0` 保持不变，每个 epoch 只打印汇总。
+- `run_phase3.sh`
+  - 默认 operator 改为 `triple_lut6`。
+  - 默认 workdir 改为 `runs/phase3_triple_lut6`。
+  - 保持 from-scratch/checkpoint 开关和其他训练参数不变。
+- `tests/test_phase12_route.py`
+  - 默认 Phase3 路由断言更新为 TripleLUT6。
+  - 新增六位 `ririri` 地址、实虚双输出、channel-priority、`Cin=5` 同位置尾组、
+    输入/LUT 梯度测试。
+  - checkpoint shared-state 与 hard-flow 测试同步 TripleLUT6。
+  - PairLUT4 和 shared-LUT6 对照测试继续保留。
+- `scripts/audit_active_route.py`
+  - 默认路线审计更新为 `k^2*ceil(Cin/3)` 张组表、每表 64 entries、
+    real/imag 两路输出。
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - Phase3 章节更新为 TripleLUT6 数据流、上一实验结果、运行命令与资源分析。
+- `EXPERIMENT_LOG.md`
+  - 追加本条实验分析与实现记录。
+- `complexPyTorch/lut_backend.py` 和所有 CUDA 源文件：未修改。
+
+### 验证
+
+- Python compile：通过。
+- 全部测试：`33/33` 通过。
+- active-route audit：通过。
+- 默认 CLI：`phase3_operator=triple_lut6`、`log_interval=0`。
+- `Cin=11,k=3` CPU/CUDA：
+  - `lut_num=36=9*ceil(11/3)`
+  - forward max abs diff：`0.0`
+  - real input grad max abs diff：`2.8610229e-6`
+  - imag input grad max abs diff：`2.1457672e-6`
+  - LUT grad max abs diff：`1.9073486e-6`
+- 完整 `start_filter=11,num_blocks=3` GPU smoke：
+  - output `(2,10)`
+  - TripleLUT6 layers `18`
+  - 18/18 输入严格为 `{0,1}`
+  - 18/18 LUT gradients finite
+  - 第一层每个 real/imag output bank 各 36 组
+  - 总 trainable parameters `5,632,997`
+
+### 资源账
+
+对 `Cin=11,k=3` 每个输出 channel：
+
+- PairLUT4：54 组双输出 LUT4；若映射为一个 LUT6_2/site 每组，约 54 sites；
+- TripleLUT6：36 组，每组两张单输出 LUT6，共 72 sites；
+- Triple 相比 Pair 物理 LUT site 约增加 33%，但每个 neuron 同时观察三个复数；
+- 软件 truth-table 参数从每组 `2*16` 增至 `2*64`，完整模型参数约
+  `2.03M -> 5.63M`。
+
+### 运行命令
+
+```bash
+CHECKPOINT= \
+GPU_ID=1 \
+START_FILTER=11 \
+NUM_BLOCKS=3 \
+PHASE3_OPERATOR=triple_lut6 \
+WORKDIR=runs/phase3_triple_lut6_scratch_sf11_lr002 \
+./run_phase3.sh
+```
+
+该路线必须从头开始；不要加载 PairLUT4 checkpoint。
+
+<!-- experiment-entry:restore-pair-lut4-after-triple-lut6 -->
+## 2026-08-13 - Restore PairLUT4 as default after TripleLUT6 result
+
+### 完成实验对比
+
+使用 `scripts/analyze_training_run.py` 重新解析两组 256-epoch from-scratch 实验：
+
+| operator | best test acc | best epoch | final test acc | final train acc |
+| --- | ---: | ---: | ---: | ---: |
+| PairLUT4 | 81.10% | 116 | 77.83% | - |
+| TripleLUT6 | 76.94% | 120 | 67.42% | 60.28% |
+
+TripleLUT6 的最佳精度比 PairLUT4 低 `4.16 pp`，最终精度低 `10.41 pp`，后期回落也更明显。同时完整模型可训练参数约从 `2.03M` 增至 `5.63M`；以第一层 `Cin=11,k=3` 估算，物理 LUT site 从 54 墱至 72，约增加 33%。因此恢复 PairLUT4 为默认 Phase3 路线；TripleLUT6 保留为显式可选对照，不删除实现。
+
+### 文件修改总结
+
+- `complexPyTorch/complexBinaryResNet.py`：Phase3 默认 operator 恢复为 `pair_lut4`；TripleLUT6 和 shared-LUT6 映射继续保留。
+- `training.py`：`--phase3-operator` 默认值恢复为 `pair_lut4`，其他 operator 仍可显式选择。
+- `run_phase3.sh`：默认 operator 与默认 workdir 恢复为 PairLUT4。
+- `tests/test_phase12_route.py`：默认模型、checkpoint 和结构断言恢复为 PairLUT4；TripleLUT6 的独立功能测试继续保留。
+- `scripts/audit_active_route.py`：默认路线审计恢复为 PairLUT4 的两复数输入、16-entry 双输出真值表。
+- `CURRENT_TECHNICAL_ROUTE.md`：恢复 PairLUT4 主路线，并补充已完成 TripleLUT6 的精度和资源结论。
+- `EXPERIMENT_LOG.md`：追加本条实验分析与回退记录。
+- `complexPyTorch/complexLayers.py`：本次未修改；PairLUT4 与 TripleLUT6 实现均保留。
+- `complexPyTorch/lut_backend.py` 和所有 CUDA 文件：未修改。
+
+### 验证
+
+- 单元测试：`33/33` 通过。
+- active-route audit：通过，确认 Phase3 activation 为严格 `{0,1}`，默认主卷积为 PairLUT4，真值表为 16 entries。
+- `run_phase3.sh` shell syntax：沿用已验证结构，默认变量已检查为 `PHASE3_OPERATOR=pair_lut4`。
+
+### 结论
+
+当前已测试粒度下，增加到三个复数输入并未换来表达收益，反而使优化稳定性、最终精度和资源效率同时下降。后续继续以 PairLUT4 为基础定位精度差距，不再默认扩大 LUT 输入组。
+
+<!-- experiment-entry:phase2-checkpoint-to-pair-lut4-analytic-init -->
+## 2026-08-13 - Initialize PairLUT4 from trained Phase2 binary complex weights
+
+### 目标与定义
+
+将当前 PairLUT4 从随机初始化改为可由训练好的标准 Phase2 Binary Complex NN checkpoint 解析初始化。每个 LUT neuron 固定观察同一 kernel spatial tap 的两个相邻复数 input channel，四位地址顺序为 `[x0_r,x0_i,x1_r,x1_i]`。
+
+对每个输出通道和 channel pair，读取 Phase2 的 `conv_r.weight` 与 `conv_i.weight`，使用与 Phase2 forward 相同的实虚权重符号。遍历 16 种输入 bit，将 bit 解码为 `{-1,+1}` 后计算：
+
+```text
+real = xr0*wr0 - xi0*wi0 + xr1*wr1 - xi1*wi1
+imag = xi0*wr0 + xr0*wi0 + xi1*wr1 + xr1*wi1
+```
+
+分别以 `real >= 0`、`imag >= 0` 生成两个 Boolean 输出，写成 `-1/+1` LUT logits。Phase2 的 per-output-channel 正缩放因子对该符号表没有影响。奇数 `Cin` 的尾组将缺失的第二个权重置 0，因此初始真值表与两个填充地址位无关；训练后仍允许 LUT 使用这些位。
+
+### 实现行为
+
+- 提供 Phase2 checkpoint 且 operator 为 PairLUT4：共享的 BN、残差、stem、projection 和 classifier 参数照常加载，所有 PairLUT4 表由对应 Phase2 主卷积权重解析生成。
+- 不提供 checkpoint 并使用 `--train-from-scratch`：保持原有 bimodal 随机初始化。
+- TripleLUT6/shared-LUT6 没有对应的两复数解析规则，仍保持其原有随机初始化。
+- 兼容旧 Binary Complex NN checkpoint 的 projection 编号：旧 `proj.[conv,bn]` 参数映射到当前 `proj.[avgpool,conv,bn]` 的 `proj.1/2`；映射后仍严格检查所有当前共享参数，缺失或 shape 不匹配会报错。
+
+### 真实 checkpoint 检查
+
+使用 `bi_workdir/chkpts/Bestmodel_phase2.pt`，配置 `start_filter=11,num_blocks=3`：
+
+- 成功加载 125 个共享 tensors；
+- 成功解析初始化 18 个 PairLUT4 operators；
+- LUT entries 总数 2,033,856；
+- logits 的唯一值严格为 `{-1,+1}`；
+- hard table 中 1 的比例为 68.8279%；
+- 0 个 PairLUT4 参数集保留随机初始化。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`：为 `PairLUT4ComplexConv2d` 增加 Phase2 二值复权重到双输出 LUT4 真值表的向量化编译方法；处理 shape、logit magnitude 和奇数 channel 尾组。
+- `training.py`：Phase3 checkpoint 加载后自动解析初始化 PairLUT4；加入旧 projection 索引的受限兼容映射和初始化数量提示。
+- `run_phase3.sh`：启动时区分并打印 checkpoint 解析初始化与 from-scratch bimodal 初始化。
+- `tests/test_phase12_route.py`：新增真值表公式、奇数 channel 填充位独立性和旧 projection checkpoint 映射测试。
+- `CURRENT_TECHNICAL_ROUTE.md`：补充完整解析公式、tie rule、尾组规则、兼容策略、真实 checkpoint 统计和运行命令。
+- `EXPERIMENT_LOG.md`：追加本记录。
+- `complexPyTorch/lut_backend.py` 与所有 CUDA 文件：未修改。
+
+### 验证
+
+- 定向初始化测试：`2/2` 通过。
+- 完整单元测试：`35/35` 通过。
+- active-route audit：通过。
+- `run_phase3.sh` shell syntax：通过。
+- 真实 Phase2 checkpoint smoke load：通过。
+
+### 运行命令
+
+```bash
+GPU_ID=1 \
+CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase2.pt \
+START_FILTER=11 \
+NUM_BLOCKS=3 \
+PHASE3_OPERATOR=pair_lut4 \
+WORKDIR=runs/phase3_pair_lut4_phase2init_sf11_lr002 \
+./run_phase3.sh
+```
+
+<!-- experiment-entry:restore-pair-lut4-channel-major-spatial-pairs-20260813 -->
+## 2026-08-13 - Restore PairLUT4 channel-major spatial pairing
+
+### 修改目标
+
+将 PairLUT4 从 2026-08-12 引入的“固定 kernel spatial tap、配对相邻 channels”恢复为最初的 channel-major 全窗口配对：一个 LUT 通常接收同一个 input channel 的两个相邻 kernel spatial positions。
+
+### 恢复后的精确定义
+
+`F.unfold` 的逻辑位置顺序为：
+
+```text
+channel -> kernel_row -> kernel_col
+```
+
+实部和虚部在每个复数位置内 stack，得到 `[real,imag]`，再对整个长度为 `Cin*k²` 的复数序列全局两两分组。每张 LUT4 地址保持：
+
+```text
+[x0_real, x0_imag, x1_real, x1_imag]
+```
+
+pair 数恢复为：
+
+```text
+ceil(Cin*k²/2)
+```
+
+边界行为与最初版本一致：
+
+- 绝大多数 pair 来自同一个 channel 的两个相邻 kernel taps；
+- 当 `k²` 为奇数时，channel 边界处会有一个 pair 连接前一 channel 最后一个 tap 与下一 channel 第一个 tap；
+- 当 `Cin*k²` 为奇数时，全局最后一个复数位置与窗口第一个复数位置补齐。
+
+### Phase2 checkpoint 初始化同步
+
+`PairLUT4ComplexConv2d.initialize_from_binary_complex_weights` 同步改为使用全局 logical-position pair。每个 logical position 解析为各自的 `(channel,kernel_row,kernel_col)`，读取两个对应 Phase2 二值复权重，再遍历 16 个输入地址生成“二复数乘加 + 实虚 `>=0` 截断”的两张真值表。
+
+全局奇数尾组运行时复制窗口第一个输入以补齐四位地址，但初始化时缺失的第二个数学权重设为 0，因此初始 LUT 对两个复制输入 bit 无关。
+
+### 规模变化
+
+对正式配置 `Cin=11,k=3`：
+
+- same-spatial/channel-priority 版本：`9*ceil(11/2)=54` pairs；
+- 恢复后的 channel-major 版本：`ceil(11*9/2)=50` pairs。
+
+使用 `bi_workdir/chkpts/Bestmodel_phase2.pt` 初始化完整 `start_filter=11,num_blocks=3` 模型：
+
+- 18 个 PairLUT4 operators 全部成功初始化；
+- 全模型 LUT entries：2,022,592；
+- logits 唯一值：`{-1,+1}`；
+- hard 1 比例：68.7587%；
+- 总 trainable parameters：2,029,221。
+
+历史 `81.10%` PairLUT4 结果属于 same-spatial/channel-priority 布局，不能直接作为当前恢复版本的成绩；当前布局需要用 Phase2 解析初始化重新训练。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`
+  - PairLUT4 `pair_num` 恢复为 `ceil(Cin*k²/2)`。
+  - `_pair_patches` 恢复 channel-major 全局两两配对。
+  - Phase2 权重解析初始化同步改为 global logical-position 权重索引。
+- `tests/test_phase12_route.py`
+  - 删除 same-spatial/channel-pair 断言。
+  - 新增同 channel 空间配对编号测试。
+  - 新增奇数 `k²` 跨 channel 边界测试。
+  - 新增全局奇数尾组重复窗口首位置测试。
+- `scripts/audit_active_route.py`
+  - 表 shape 公式恢复为 `ceil(logical_positions/2)`。
+  - 审计输出明确标记 channel-major spatial pairs。
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - Phase3 数据流、公式、边界规则、checkpoint 初始化和资源统计全部同步。
+  - 标明历史 81.10% 结果不属于当前布局。
+- `EXPERIMENT_LOG.md`
+  - 追加本记录。
+- `training.py`、`run_phase3.sh`：本次无需修改；此前 Phase2 checkpoint 加载与启动方式继续适用。
+- `complexPyTorch/lut_backend.py` 和所有 CUDA 文件：未修改。
+
+### 验证
+
+- PairLUT4 定向测试：`6/6` 通过。
+- 完整单元测试：`36/36` 通过。
+- active-route audit：通过。
+- `run_phase3.sh` shell syntax：通过。
+- 真实 Phase2 checkpoint smoke load：125 shared tensors、18 PairLUT4 operators 成功。
+- `Cin=11,k=3,pair_num=50` CPU/CUDA 对照：
+  - forward max abs diff：`0.0`
+  - real input grad max abs diff：`9.54e-7`
+  - imag input grad max abs diff：`7.15e-7`
+  - LUT grad max abs diff：`1.43e-6`
+
+### 运行命令
+
+```bash
+GPU_ID=1 \
+CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase2.pt \
+START_FILTER=11 \
+NUM_BLOCKS=3 \
+PHASE3_OPERATOR=pair_lut4 \
+WORKDIR=runs/phase3_pair_lut4_channelmajor_phase2init_sf11_lr002 \
+./run_phase3.sh
+```
+
+<!-- experiment-entry:categorical-complex-output-pair-lut4-20260813 -->
+## 2026-08-13 - Optional categorical complex-output PairLUT4 parameterization
+
+### 目标
+
+在不改变默认 PairLUT4 行为的前提下，增加“联合复数输出”的 categorical 参数化。默认 `independent` 仍维护两张互相独立的 16-entry LUT4 logits；可选 `categorical` 为每个地址维护四个类别 logits，使实部和虚部由同一个合法复数状态联合产生。
+
+### 数学与实现
+
+Categorical 模式的可学习参数 shape：
+
+```text
+[Cout, pair_num, 16 addresses, 4 complex states]
+```
+
+固定码本：
+
+```text
+0 -> 00 -> -1-j
+1 -> 01 -> -1+j
+2 -> 10 ->  1-j
+3 -> 11 ->  1+j
+```
+
+对每个地址：
+
+```text
+p = softmax(logits / 1.0)
+h = one_hot(argmax(p))
+selection = p + stop_gradient(h - p)
+entry_bits = selection @ codebook
+```
+
+因此 forward 使用 hard argmax，生成严格 `{0,1}` 的 `[2*Cout,pair_num,16]` 双 LUT4 表；backward 通过 softmax STE 回到四分类 logits。生成双表后继续使用原有 PairLUT4 activation 查表、有限差分输入梯度、pair 累加和 complex-BN，backend/CUDA 无改动。
+
+### 初始化
+
+- Independent 默认模式：保持原 `[2*Cout,pair_num,16]` bimodal logits 和 hard-threshold/identity-STE。
+- Categorical from-scratch：四类 logits 使用 `N(0,0.01)` 打破 argmax 平局。
+- Phase2 checkpoint：先按两个二值复权重生成原解析双表，再将 `(real_bit,imag_bit)` 编码为类别 `2*real+imag`；目标类别 logit 设为 0.25，其他三类为 0。
+- 同一 Phase2 权重下，independent 与 categorical 的初始 hard 双表逐 entry 完全一致。
+
+### 开关
+
+CLI：
+
+```text
+--pair-lut-parameterization {independent,categorical}
+```
+
+Shell：
+
+```text
+PAIR_LUT_PARAMETERIZATION=independent|categorical
+```
+
+默认值始终是 `independent`。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`
+  - `PairLUT4ComplexConv2d` 增加 `parameterization` 与固定四状态码本。
+  - Independent 参数 shape 与行为保持不变。
+  - Categorical 增加 hard argmax + softmax STE 的双 LUT 表生成。
+  - Phase2 解析初始化按参数化模式写入独立 logits 或四分类 logits。
+  - `forward` 统一消费 `materialize_table()`，后续查表路径不变。
+  - `extra_repr` 显示参数化模式。
+- `complexPyTorch/complexBinaryResNet.py`
+  - 网络和残差块增加 `pair_lut_parameterization`，默认 independent。
+  - 该参数只传给 PairLUT4，不影响 TripleLUT6/shared-LUT6。
+- `training.py`
+  - 增加 `--pair-lut-parameterization` CLI、模型传参和启动日志。
+  - checkpoint 提示从 bimodal 泛化为 random，兼容两种模式。
+- `run_phase3.sh`
+  - 增加 `PAIR_LUT_PARAMETERIZATION` 环境变量，默认 independent。
+  - 启动提示区分独立阈值 STE、categorical argmax/softmax STE 和各自随机初始化。
+- `tests/test_phase12_route.py`
+  - 测试默认 independent shape 不变。
+  - 测试四类到 `00/01/10/11` 码本映射、hard table 二值性、logits/input 梯度。
+  - 测试 Phase2 初始化后两种参数化 hard table 完全一致。
+- `scripts/audit_active_route.py`
+  - 新增默认参数化必须为 independent 的审计。
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - 增加两种参数化、数学定义、初始化和运行命令。
+- `EXPERIMENT_LOG.md`
+  - 追加本记录。
+- `complexPyTorch/lut_backend.py` 与所有 CUDA 文件：未修改。
+
+### 验证
+
+- Categorical 定向测试：`4/4` 通过。
+- 完整测试：`40/40` 通过。
+- active-route audit：通过。
+- Python compile 与 `run_phase3.sh` shell syntax：通过。
+- `Cin=11,k=3,pair_num=50` categorical CPU/CUDA：
+  - forward max abs diff：`0.0`
+  - real/imag input grad max abs diff：`1.43e-6`
+  - categorical logit grad max abs diff：`7.15e-7`
+  - materialized table values：严格 `{0,1}`。
+- 真实 `Bestmodel_phase2.pt` 完整 categorical GPU smoke：
+  - 18 个 PairLUT4 全部解析初始化；
+  - 第一层 categorical shape `(11,50,16,4)`；
+  - 18/18 层 logits gradients finite；
+  - output shape `(2,10)`；
+  - trainable parameters `4,051,813`，仅增加训练期 logits，FPGA 双 LUT4 资源不变。
+- `git diff --check` 仍报告 `complexLayers.py` 旧区域原有 trailing whitespace；本次新增区域没有引入该问题，未清理无关历史格式。
+
+### Categorical 运行命令
+
+```bash
+GPU_ID=1 \
+CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase2.pt \
+START_FILTER=11 \
+NUM_BLOCKS=3 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical \
+WORKDIR=runs/phase3_pair_lut4_categorical_phase2init_sf11_lr002 \
+./run_phase3.sh
+```
+
+<!-- experiment-entry:generalized-categorical-complex-lut-k4-k6-20260814 -->
+## 2026-08-14 - Generalize categorical complex LUT from k=4 to k=4/6
+
+### 新基线结果
+
+先使用可复用脚本 `scripts/analyze_training_run.py` 解析完成的 categorical LUT4 实验：
+
+```text
+run: runs/phase3_pair_lut4_categorical_phase2init_sf11_lr002
+epochs: 256/256, all finite
+optimizer: Adam
+initial LR: 0.02
+schedule: multistep
+best test: 82.53% at epoch 248
+final test: 81.80%
+```
+
+该结果高于此前 PairLUT4 版本，说明联合四状态输出参数化在调整 LR schedule 后是有效路线。本次以它作为三复数 LUT6 的直接基线。
+
+### 修改目标
+
+将当前写死为“两个复数输入、16 个地址”的 categorical LUT4 泛化为由 LUT 输入 bit 数 `k` 配置：
+
+```text
+k=4: 2 complex inputs/group, 16 addresses, categorical logits 4*16/address bank
+k=6: 3 complex inputs/group, 64 addresses, categorical logits 4*64/address bank
+```
+
+这里更精确的完整 tensor shape 为：
+
+```text
+categorical: [Cout, group_num, 2^k, 4]
+independent: [2*Cout, group_num, 2^k]
+group_num = ceil(Cin*kernel^2 / (k/2))
+```
+
+默认仍为 `k=4 + independent`，所以不带新参数的现有命令和模型结构不变。
+
+### 数据流
+
+- `F.unfold` 继续按 `channel -> kernel_row -> kernel_col` 展开复数位置。
+- `k=4` 每两个连续复数一组，地址为 `riri`。
+- `k=6` 每三个连续复数一组，地址为 `ririri`。
+- 尾组不足时，从窗口开头复制所需复数位置补齐。
+- Categorical 每个地址的四类仍编码 `00/01/10/11`，forward hard argmax，backward softmax STE，`tau=1.0`。
+- 生成的两个 hard table 分别作为实部、虚部输出并沿 group 维累加。
+
+### Phase2 初始化
+
+初始化函数同步泛化：对于每组 `n=k/2` 个二值复权重，遍历 `2^k` 个输入状态，计算 `sum(x_t*w_t)` 后以实部/虚部 `>=0` 产生目标类别。尾组复制输入对应的数学权重设为 0。该解析 operation 只作为初始化，不宣称等价于 Phase2 整层累加。
+
+### CUDA 与硬件
+
+- `k=4` 保持原路径：添加两个 dummy 0 bits，并把 16-entry 表扩展为 64-entry 后调用 LUT6 backend。
+- `k=6` 直接把六位地址与 64-entry 双表交给现有 LUT6 backend。
+- 两种模式最终都是两张硬 LUT；categorical 的四分类 logits 只存在于训练，不增加 FPGA 推理资源。
+- `complexPyTorch/lut_backend.py` 与所有 CUDA 文件均未修改。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`
+  - 将 `PairLUT4ComplexConv2d` 内部泛化为 `lut_inputs in {4,6}`；类名保留以兼容当前路由和 checkpoint 识别。
+  - 新增 `complex_inputs_per_lut`、`table_size=2^k`、`group_num`；旧 `pair_num` 保留为兼容别名。
+  - 输入分组、state bits、independent/categorical 参数 shape、Phase2 初始化、CPU reference 和 CUDA dispatch 全部动态化。
+  - `_pair_patches` 保留为 `_group_patches` 的兼容入口。
+- `complexPyTorch/complexBinaryResNet.py`
+  - 网络和残差块新增 `pair_lut_inputs=4`，并只传给当前 grouped complex LUT operator。
+  - `_make_stage` 使用统一 kwargs，保证 18 个 residual operators 配置一致。
+- `training.py`
+  - 新增 `--pair-lut-inputs {4,6}`，默认 4；传入模型并写入启动配置日志。
+- `run_phase3.sh`
+  - 新增 `LUT_INPUTS=4|6`，默认 4；传给 CLI 并显示每组复数输入数量。
+  - 保留用户当前 `LR=0.02`、`SCHEDULE=multistep` 默认设置。
+- `tests/test_phase12_route.py`
+  - 测试默认 k=4 不变。
+  - 新增 k=6 categorical shape、三复数 channel-major 分组、尾组补齐、64-entry hard table、Phase2 初始化及输入/logit 梯度测试。
+- `scripts/audit_active_route.py`
+  - shape 审计泛化为 `group_num` 和 `2^k`；锁定默认 k=4 independent。
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - Phase3 与 LUT 参数化章节更新为统一 k=4/6 方案，并记录 82.53% LUT4 基线和 LUT6 命令。
+- `EXPERIMENT_LOG.md`
+  - 追加本记录。
+
+### 验证
+
+- k=4/k=6 定向测试：`5/5` 通过。
+- 完整单元测试：`44/44` 通过。
+- active-route audit、Python compile、shell syntax、CLI 解析：通过。
+- k=6 `Cin=11,kernel=3` categorical CPU/CUDA：
+  - groups `33`
+  - logits shape `(3,33,64,4)`（测试层 Cout=3）
+  - forward max abs diff `0.0`
+  - real input grad max abs diff `9.54e-7`
+  - imag input grad max abs diff `7.15e-7`
+  - categorical logit grad max abs diff `2.38e-7`
+  - materialized table 严格 `{0,1}`。
+- 真实 Phase2 checkpoint 完整 k=6 categorical GPU smoke：
+  - 125 shared tensors loaded
+  - 18 grouped complex LUT operators initialized
+  - 第一层 shape `(11,33,64,4)`
+  - 18/18 categorical gradients finite
+  - output `(2,10)`
+  - trainable parameters `10,786,277`，增加部分仅为训练期 logits。
+
+### LUT6 运行命令
+
+```bash
+GPU_ID=1 \
+CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase2.pt \
+START_FILTER=11 \
+NUM_BLOCKS=3 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical \
+LUT_INPUTS=6 \
+LR=0.02 \
+SCHEDULE=multistep \
+WORKDIR=runs/phase3_lut6_categorical_phase2init_sf11_lr002 \
+./run_phase3.sh
+```
+
+
+<!-- experiment-entry:parallel-dominance-lut6-random-init-20260814 -->
+## 2026-08-14 - 两复数并行 dominance-bit LUT6 随机初始化分支
+
+### 目标与设计决定
+
+- 放弃从当前 LUT4 checkpoint 复制 16-entry 真值表；新的 64-entry categorical LUT6 logits 使用 `N(0,0.01)` 独立随机初始化。
+- 该分支仍只组合两个复数位置，不使用此前“三个复数压缩成一个复数”的 LUT6 地址。
+- 每个复数从同一个量化前激活并行生成 `sr=1[r>0]`、`si=1[i>0]`、`p=1[|r|>|i|]`。
+- 两个复数的 LUT6 地址固定为 `[sr0,si0,p0,sr1,si1,p1]`。
+- categorical 参数 shape 为 `[Cout,ceil(Cin*k*k/2),64,4]`，四类对应输出 `00/01/10/11`。
+- LUT 表 forward 使用 hard argmax，backward 保留当前 softmax STE；最终实部和虚部仍是严格 `{0,1}`。
+
+### dominance 梯度
+
+`p` 前向使用严格比较器，tie (`|r|==|i|`) 取 0。反向代理为：
+
+```text
+delta = |real| - |imag|
+p_soft = clamp(0.5 + delta/(2*margin), 0, 1)
+p = p_soft + stop_gradient(p_hard - p_soft)
+```
+
+因此 LUT 输出对第 3/6 个地址 bit 的有限差分梯度能够继续经过 `abs(real)-abs(imag)` 回到量化前激活。默认 `margin=1.0`，可通过 `DOMINANCE_STE_MARGIN` 配置。
+
+### checkpoint 规则
+
+- 不传 `CHECKPOINT`：整个模型随机训练。
+- 传 Phase2 checkpoint：共享 stem、BN、shortcut、classifier 参数正常加载，但所有 dominance LUT6 logits 保持构造时随机值。
+- dominance 模式禁止调用 Phase2 复权重解析编译函数，从代码层面避免意外退化为忽略 `p` 的 LUT4 扩展。
+- 不读取也不需要任何 LUT4 checkpoint。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`
+  - `PairLUT4ComplexConv2d` 新增 `activation_encoding={standard,dominance}` 与 `dominance_ste_margin`。
+  - dominance 模式强制 `lut_inputs=6 + categorical`，但 `complex_inputs_per_lut=2`。
+  - 新增硬比较/软反向 dominance bit，并按 `[sr0,si0,p0,sr1,si1,p1]` 分组。
+  - forward 接收可选 `dominance_source`；旧 standard LUT4/三复数 LUT6 行为不变。
+  - dominance LUT6 显式拒绝 Phase2 权重解析初始化。
+- `complexPyTorch/complexBinaryResNet.py`
+  - 残差块和顶层模型新增编码与 STE margin 参数。
+  - dominance 模式把量化前激活并行传给 LUT 层；主 activation 仍沿用现有 Bi-Real `{0,1}` 编码。
+  - stage 构造统一传播新参数；默认 standard 路线不变。
+- `training.py`
+  - 新增 `--pair-lut-encoding` 和 `--dominance-ste-margin`。
+  - Phase2 shared loader 跳过 dominance LUT6 编译并报告随机 LUT 数量。
+  - 模型构造和启动日志记录实际 encoding。
+- `run_phase3.sh`
+  - 新增 `PAIR_LUT_ENCODING`、`DOMINANCE_STE_MARGIN` 环境变量。
+  - dominance 启动日志明确两复数六位地址以及 checkpoint 只加载共享参数。
+- `tests/test_phase12_route.py`
+  - 新增 dominance LUT6 shape/group 数测试。
+  - 新增六位地址顺序及 dominance 梯度回到原始实虚部的测试。
+  - 新增 Phase2 checkpoint 不覆盖随机 LUT6 logits 的测试。
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - 追加并行 dominance-bit LUT6 路线、梯度定义、随机初始化规则和运行参数。
+- `EXPERIMENT_LOG.md`
+  - 追加本实验设计、实现和验证记录。
+
+### 保护边界
+
+`complexPyTorch/lut_backend.py` 与所有 CUDA 源文件均未修改。新模式直接复用现有 `LUT6Function`。
+
+### 验证
+
+- Python syntax 与 `run_phase3.sh` shell syntax：通过。
+- dominance 定向测试加旧 LUT4/LUT6 初始化测试：`5/5` 通过。
+- 完整 `tests.test_phase12_route`：`45/45` 通过。
+- GPU1 CUDA smoke：hard output 正常；LUT logits、raw real、raw imag 梯度均有限且非零。
+- smoke gradient absolute sums：LUT `0.9990`，raw real `1.0200`，raw imag `1.0600`。
+- 完整小模型 GPU1 forward/backward：output shape `(2,10)`，6/6 dominance LUT6
+  的 logits gradient finite 且非零，stem gradient sum `34.8355`。
+
+### 推荐运行命令
+
+```bash
+GPU_ID=1 \
+CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase2.pt \
+START_FILTER=11 \
+NUM_BLOCKS=3 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical \
+LUT_INPUTS=6 \
+PAIR_LUT_ENCODING=dominance \
+DOMINANCE_STE_MARGIN=1.0 \
+LR=0.02 \
+SCHEDULE=multistep \
+WORKDIR=runs/phase3_lut6_dominance_randomlut_phase2shared_sf11_lr002 \
+./run_phase3.sh
+```
+
+
+<!-- experiment-entry:dominance-lut6-epoch100-analysis-20260814 -->
+## 2026-08-14 - dominance LUT6 epoch 100 阶段性分析
+
+### 日志预处理
+
+先调用可复用的 `scripts/analyze_training_run.py` 解析 dominance、categorical LUT4
+基线和旧三复数 LUT6；随后新增并调用
+`scripts/analyze_dominance_lut_checkpoint.py` 审计 64-entry categorical table
+对 `p0/p1` 的 hard-category 敏感度。
+
+### 当前结果
+
+- dominance LUT6 已记录 100 epochs，所有 loss/gradient 指标 finite。
+- epoch 96 best test accuracy：`75.37%`；epoch 100：`75.17%`。
+- epoch 100 train accuracy：`67.64%`，train loss：`1.2459`。
+- LR 在 epoch 91 从 `0.02` 降至 `0.002`；test accuracy 从 epoch 90 的
+  `71.68%` 恢复到约 `75%`，但随后再次平台化。
+- 同 epoch 98，dominance 为 `74.79%`，categorical LUT4 基线为 `79.81%`；
+  train accuracy 分别为 `67.49%` 和 `73.86%`。
+- 完整 categorical LUT4 best 为 `82.53%`；当前 dominance best 落后 `7.16 pp`。
+- 旧三复数 categorical LUT6 在 epoch 66 best `74.46%`；dominance 比它略高，
+  但仍明显低于 LUT4。
+
+### LUT hard-table 审计
+
+best epoch 96 checkpoint：
+
+- `p0` category-change fraction：`69.866%`。
+- `p1` category-change fraction：`69.931%`。
+- 单个实部/虚部输出 bit change fraction 约 `45.5%`。
+- 四个输出类别在各层几乎均匀占据约 `25%`。
+
+epoch 100 last checkpoint：
+
+- `p0` category-change fraction：`69.856%`。
+- `p1` category-change fraction：`69.902%`。
+- 与 epoch 96 几乎完全相同，表结构已没有明显整理趋势。
+
+随机四分类真值表的理论 category-change fraction 为 `75%`，单输出 bit change
+fraction 为 `50%`。当前 table 虽从随机值略微形成了不变性，但仍保留大部分随机
+`p` 依赖。dominance 并非没有进入 LUT；问题是它以接近随机的方式强烈控制输出。
+
+### 原因判断
+
+Phase2 checkpoint 在该模式下只恢复 stem、BN、shortcut 和 classifier。18 个主卷积
+全部被随机 64-entry LUT6 替代，因此 Phase2 已学到的主干 operation 实际全部丢失。
+这更接近“从随机局部 operator 重新训练网络”，不是在稳定 Phase2/LUT4 operation
+上测试额外 dominance 信息。训练精度同步落后证明主要是优化/表达组织失败，而不是
+单纯过拟合。
+
+### 决策与下一步
+
+- 当前实验继续到 256 epoch 的价值较低，建议停止并保留 epoch 96 best checkpoint。
+- 不据此否定 dominance bit 本身；本实验否定的是“所有 LUT6 entry 完全随机初始化”
+  这一训练起点。
+- 下一实验应从 Phase2 复权重解析生成 16-entry C4 operation，再沿 `p0/p1` 复制为
+  64 entries，保证 hard forward 初始等价于稳定基线；这不需要 LUT4 checkpoint。
+- 为避免复制后 `p` 初始梯度为零，可只在 backward 增加 detached soft-table
+  finite-difference surrogate，使 hard forward 完全不变但 `p` 从第一个 epoch
+  就能向量化前激活传梯度。两个 p slice 的 logits 仍独立更新，之后允许自然分化。
+
+### 文件修改总结
+
+- `scripts/analyze_dominance_lut_checkpoint.py`
+  - 新增 categorical LUT6 checkpoint 审计，统计类别占用、logit margin 以及
+    `p0/p1` 对类别和两个输出 bit 的敏感率。
+  - 新增 `--summary-only`，便于后续运行快速输出聚合结果。
+- `EXPERIMENT_LOG.md`
+  - 追加本次 epoch 100 对比、checkpoint 审计、原因判断和下一步建议。
+- 本次分析未修改模型、training flow、LUT backend 或 CUDA 源码。
+
+
+<!-- experiment-entry:lut4-to-dominance-lut6-warm-start-20260814 -->
+## 2026-08-14 - categorical LUT4 → dominance LUT6 strict warm start
+
+### 修改动机
+
+完全随机 dominance LUT6 在 epoch 100 仅达到 `75.37%` best，且 hard table 的
+`p0/p1` category-change fraction 仍约 `69.9%`，接近随机四分类表的 `75%`。
+因此将主实验起点改为当前最佳 categorical LUT4 Phase3 checkpoint，使新模型
+初始函数严格等价于已达到 `82.53%` 的 LUT4。
+
+### 地址映射
+
+旧地址 bit 顺序：
+
+```text
+[r, i, r', i']
+```
+
+新地址 bit 顺序：
+
+```text
+[r, i, p, r', i', p']
+```
+
+对每个新 6-bit state，旧地址计算为：
+
+```text
+old_index = 8*r + 4*i + 2*r' + i'
+```
+
+随后复制旧 tensor `old_logits[..., old_index, :]`。复制的是完整四类 logits，
+不是只复制 argmax class，因此 hard LUT 输出和 softmax backward proxy 均继承。
+
+需要注意：由于两个 dominance bit 插在地址中间，旧 address `0000` 对应的新
+整数地址为 `[0,1,8,9]`，不是连续的 `[0,1,2,3]`。实现按 bit 语义 index-select，
+不使用错误的 `repeat_interleave(4)`。
+
+### checkpoint 行为
+
+- dominance 模式读取 Phase3 checkpoint 时，要求每层 source weight shape 为
+  `[Cout,group_num,16,4]`，随后扩展到 `[Cout,group_num,64,4]`。
+- stem、BN、shortcut、classifier 等 topology-compatible tensors 同时加载。
+- dominance 模式读取 Phase2 checkpoint 时仍保留此前行为：共享参数加载，LUT6 随机。
+- standard LUT4 读取 Phase2 checkpoint 的解析初始化行为不变。
+
+### 文件修改总结
+
+- `training.py`
+  - 新增 `_load_dominance_lut6_warm_start()`。
+  - Phase3 初始化入口自动识别 Phase3 categorical LUT4 checkpoint，并执行
+    语义地址扩展；Phase2 loader 继续兼容。
+  - checkpoint help 更新为同时说明 Phase2 shared init 与 LUT4 warm start。
+- `run_phase3.sh`
+  - dominance checkpoint 日志更新：Phase3 checkpoint 执行 LUT4 扩展，
+    Phase2 checkpoint 保留随机 LUT。
+- `tests/test_phase12_route.py`
+  - 新增完整 logits 映射测试，锁定旧 `0000 -> 新 [0,1,8,9]`。
+  - 新增 LUT4 与 warm-start LUT6 整模型初始输出逐元素等价测试。
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - 将 dominance 主初始化从随机改为 categorical LUT4 strict warm start。
+- `EXPERIMENT_LOG.md`
+  - 追加本实现、地址语义、验证和运行命令。
+
+### 验证
+
+- 定向 warm-start/Phase2 compatibility/dominance gradient 测试：`3/3` 通过。
+- 完整 active-route tests：`46/46` 通过。
+- 小模型 warm start 后 LUT4 与 LUT6 logits 映射逐元素相同，整模型输出
+  `allclose(atol=1e-6)`。
+- 真实 82.53% checkpoint：加载 `125` 个共享 tensors，扩展 `18/18` LUT layers，
+  `max_logit_diff=0.0`。
+- 真实地址审计：旧 address 0 映射到新 `[0,1,8,9]`。
+- `complexPyTorch/lut_backend.py` 与 CUDA 文件均未修改。
+
+### 运行命令
+
+```bash
+GPU_ID=1 \
+CHECKPOINT=runs/phase3_pair_lut4_categorical_phase2init_sf11_lr002/chkpts/Bestmodel_phase3.pt \
+START_FILTER=11 \
+NUM_BLOCKS=3 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical \
+LUT_INPUTS=6 \
+PAIR_LUT_ENCODING=dominance \
+DOMINANCE_STE_MARGIN=1.0 \
+LR=0.02 \
+SCHEDULE=multistep \
+WORKDIR=runs/phase3_lut6_dominance_lut4warm_sf11_lr002 \
+./run_phase3.sh
+```
+<!-- experiment-entry:dominance-stop-gradient-20260814 -->
+## 2026-08-14 - dominance 第三 bit 默认截断反向梯度
+
+### 决策
+
+当前 dominance LUT6 的地址仍为 `[sr0,si0,p0,sr1,si1,p1]`，其中
+`p=1[|real|>|imag|]`，forward、tie 规则和 LUT4 warm start 均不改变。
+本次只切断 LUT 输出经由 `p` 回到量化前 activation 的代理梯度。sign real/imag
+的 Bi-Real 梯度、categorical LUT logits 的 softmax STE 梯度、BN 和其他网络参数
+梯度均保持原样。
+
+新增 `dominance_grad_mode={stop,ste}`：
+
+- `stop`（默认）：`p` 是 detached hard comparator，不向 `real/imag` 回传梯度。
+- `ste`：保留旧 clipped-linear STE，用于精确复现此前 dominance 实验。
+- `DOMINANCE_STE_MARGIN` 只在 `ste` 模式生效。
+
+### 历史第三 bit 路线核对
+
+- magnitude bit：`1[|x|>=learnable_threshold]`，曾使用 sigmoid STE，并让梯度同时到
+  magnitude threshold 和原 activation；早期版本曾出现第五 bit 无有效梯度。
+- dominance bit：`1[|real|>|imag|]`，即当前并行比较器；尝试过 hard comparator、
+  clipped-linear STE 和 sigmoid/temperature soft dominance。
+- C8 phase bit：仍以 sign real、sign imag、dominance 三 bit 编码，但进一步解码为
+  8 相位码本；尝试过 roots（轴上 0/45/90 度系列）与 octants（扇区中心）码本，
+  以及 bireal_ste、semantic_ste、semantic_phase_ste。
+- threshold selector：额外 bit 曾用于在两个局部输出 threshold 之间选择，而不是
+  直接改变 activation 码本；包括可学习 threshold、固定 >0/>=0 等变体。
+- 两 bit activation/LUT6 是另一条增加信息带宽的路线，并非单独第三 bit。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`：为 dominance 增加 stop/ste 模式，默认 hard bit detach。
+- `complexPyTorch/complexBinaryResNet.py`：模型和残差块传播并保存 gradient mode。
+- `training.py`：增加 CLI 参数、模型传参和启动日志。
+- `run_phase3.sh`：增加 `DOMINANCE_GRAD_MODE`，默认 stop，并仅在 ste 时打印 margin。
+- `tests/test_phase12_route.py`：旧梯度测试显式使用 ste；新增默认 stop 回归测试。
+- `CURRENT_TECHNICAL_ROUTE.md`：更新当前默认梯度语义和运行配置。
+- `EXPERIMENT_LOG.md`：记录本次决策、历史路线及验证结果。
+
+### 验证
+
+- Python syntax 与 shell syntax 检查通过。
+- dominance stop、legacy ste、LUT4-to-LUT6 warm start 三个定向测试通过。
+- `tests.test_phase12_route` 完整测试进程成功退出。
+
+<!-- experiment-entry:dominance-stopgrad-completed-analysis-20260819 -->
+## 2026-08-19 - dominance stop-gradient 完整结果
+
+使用现有 `scripts/analyze_training_run.py` 和
+`scripts/analyze_dominance_lut_checkpoint.py` 重新分析最新完整运行。
+
+### 对比结果
+
+| 实验 | best test | best epoch | final test |
+| --- | ---: | ---: | ---: |
+| categorical LUT4 基线 | 82.53% | 248 | 81.80% |
+| LUT6 dominance warm-start + legacy STE | 79.28% | 2 | run stopped at epoch 31 |
+| LUT6 dominance warm-start + stop-gradient（第一组） | 79.95% | 1 | 78.40% |
+| LUT6 dominance warm-start + stop-gradient（最新复跑） | 79.75% | 3 | 77.09% |
+
+最新复跑共 256 epochs，所有指标 finite。stop-gradient 相比旧 STE 略有改善，
+但没有超过 LUT4 起点，也没有在后期恢复。
+
+### LUT slice 分化
+
+- 最新 stop-gradient best checkpoint 中，改变 `p0` 时 categorical output 改变
+  11.23%，改变 `p1` 时改变 11.22%；单个 real/imag bit 改变约 6.23%。
+- 第一组 stop-gradient best checkpoint 的 categorical 改变约 6.44%，单输出 bit
+  改变约 3.56%。
+- 这说明 dominance slices 并非完全相同，第三 bit 确实改变了硬 LUT；但这些早期
+  分化没有转化成准确率收益。
+
+### 判断
+
+stop-gradient 去除了额外 activation surrogate gradient 的干扰，但不是主要瓶颈。
+LUT4 的 16-entry table 扩展成 LUT6 的 64-entry table 后，每个旧地址被
+`(p0,p1)` 拆成四个独立 slice。每个 slice 的命中样本量大约降为原来的四分之一，
+参数量增加四倍，hard argmax + softmax STE 的更新因而更稀疏、更噪声化。
+`LR=0.02` 使复制得到的四个等价 slice 在最初几个 epoch 就快速分裂。
+
+LUT4 在 epoch 80 附近也曾降到约 77.8%，但学习率下降后恢复到 81.7%以上；
+LUT6 后期只恢复到 77–78%，说明问题不只是初始学习率，而是无约束四路表分裂
+形成了更差的优化空间。
+
+### 后续优先方案
+
+不再优先更换第三 bit。建议使用共享基表加零均值 residual：
+
+[
+L_6(a,p_0,p_1)=L_4(a)+alpha(D(a,p_0,p_1)-mean_p D(a,p)).
+]
+
+初始化 `D=0, alpha=0`，保持与 LUT4 严格等价；LUT4 base 固定或使用低学习率，
+dominance residual 使用较小学习率，并逐渐增大 `alpha`。训练完成后仍可物化为
+普通 64-entry LUT6，不增加最终硬件资源。
+
+<!-- experiment-entry:dominance-shared-base-residual-implementation-20260819 -->
+## 2026-08-19 - 共享 LUT4 基表加零均值 dominance residual
+
+### 动机
+
+完整 stop-gradient 实验仍低于 categorical LUT4。主要问题由 activation 梯度转为
+LUT4 的每个地址被两个 dominance bit 拆成四个独立、低命中率的 LUT6 slice。
+同时旧实验从成熟 LUT4 checkpoint 重新以 Adam LR=0.02 启动，进一步放大了漂移。
+
+### 新参数化
+
+新增 `pair_lut_parameterization=categorical_residual`：
+
+[
+Z_6(a,p)=B_4(a)+alpha(D_6(a,p)-mean_p D_6(a,p)).
+]
+
+- `dominance_base`：shape `[Cout,group,16,4]`，从 LUT4 checkpoint 读取，
+  作为冻结 buffer。
+- `weight`：shape `[Cout,group,64,4]`，表示可学习 residual，初始化严格为零。
+- `dominance_assignment`：缓存 64 个地址到 16 个旧地址的固定归属矩阵。
+- 每个旧地址下四个 `(p0,p1)` residual 强制零均值，避免 residual 整体覆盖基表。
+- effective logits 仍经过 hard argmax forward + softmax STE backward，最终仍是普通
+  64-entry LUT6，不增加部署硬件。
+- dominance bit 保持 hard forward + stop-gradient。
+
+### 训练控制
+
+- `DOMINANCE_RESIDUAL_LR`：residual 独立 LR，默认 0.002。
+- `DOMINANCE_RESIDUAL_ALPHA_START`：默认 0.1。
+- `DOMINANCE_RESIDUAL_ALPHA_END`：默认 1.0。
+- `DOMINANCE_RESIDUAL_RAMP_EPOCHS`：默认 120。
+- optimizer group 使用相对 `lr_scale`，因此全局 schedule 衰减时 residual LR 同比例衰减。
+- checkpoint metrics 保存当前 residual alpha。
+- residual checkpoint 可以直接重新加载；旧 categorical LUT4 checkpoint 自动加载到
+  frozen base，并把 residual 清零。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`
+  - 新增 `categorical_residual` 参数化、冻结 LUT4 base、零均值 residual、
+    alpha buffer 和 effective-logit 构造。
+  - 缓存 dominance address assignment，避免每次 forward 重建 one-hot。
+- `complexPyTorch/complexBinaryResNet.py`
+  - 模型验证允许 dominance LUT6 使用 `categorical_residual`；旧模式不变。
+- `training.py`
+  - warm-start loader 将旧 LUT4 logits 装入 base 并清零 residual。
+  - 新增 residual checkpoint reload、独立 optimizer group/LR scale、alpha ramp、
+    参数校验、日志和 checkpoint metric。
+- `run_phase3.sh`
+  - 新增 residual LR 与 alpha 环境变量并传入 CLI；修正新 categorical 模式的提示。
+- `tests/test_phase12_route.py`
+  - 新增严格 LUT4 等价 warm start、零均值约束、alpha schedule 和独立 LR 测试。
+- `scripts/analyze_dominance_lut_checkpoint.py`
+  - 对 residual checkpoint 重建实际 effective logits 后再分析 sensitivity；
+    继续兼容旧 unrestricted LUT6 checkpoint。
+- `CURRENT_TECHNICAL_ROUTE.md`
+  - 新增共享基表 residual 路线、公式、硬件语义和推荐命令。
+- `EXPERIMENT_LOG.md`
+  - 记录本次实现、验证和运行配置。
+- 未修改 `complexPyTorch/lut_backend.py` 及任何 CUDA kernel。
+
+### 验证
+
+- Python 及 shell syntax 检查通过。
+- 活动路线完整测试 `50/50` 通过。
+- warm-start 模型初始输出与 LUT4 模型在 `atol=1e-6` 下严格一致。
+- residual analyzer smoke test 初始 `p0/p1 category sensitivity=0`，符合零 residual。
+- 旧 unrestricted LUT6 checkpoint 的 analyzer 输出保持原数值。
+
+### 推荐命令
+
+```bash
+GPU_ID=0 \
+CHECKPOINT=runs/phase3_pair_lut4_categorical_phase2init_sf11_lr002/chkpts/Bestmodel_phase3.pt \
+START_FILTER=11 NUM_BLOCKS=3 NUM_EPOCHS=200 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical_residual \
+LUT_INPUTS=6 PAIR_LUT_ENCODING=dominance \
+DOMINANCE_GRAD_MODE=stop \
+LR=0.0002 SCHEDULE=constant \
+DOMINANCE_RESIDUAL_LR=0.002 \
+DOMINANCE_RESIDUAL_ALPHA_START=0.1 \
+DOMINANCE_RESIDUAL_ALPHA_END=1.0 \
+DOMINANCE_RESIDUAL_RAMP_EPOCHS=120 \
+WORKDIR=runs/phase3_lut6_dominance_sharedres_lr2e4_reslr2e3 \
+./run_phase3.sh
+```
+<!-- experiment-entry:dominance-shared-residual-success-20260819 -->
+## 2026-08-19 - dominance shared-residual 达到 84.28%
+
+使用 `scripts/analyze_training_run.py` 和
+`scripts/analyze_dominance_lut_checkpoint.py` 分析完整运行：
+
+`runs/phase3_lut6_dominance_sharedres_lr2e4_reslr2e3`
+
+### 最终结果
+
+- 训练完成：200/200 epochs，所有指标 finite。
+- best test accuracy：84.28%，epoch 194。
+- final test accuracy：84.10%，仅比 best 低 0.18 pp，后期稳定。
+- LUT4 categorical 起点：82.53%，提升 1.75 pp。
+- 旧 unrestricted dominance LUT6 best：79.75%，提升 4.53 pp。
+- epoch 1：81.97%。
+- epoch 60：82.63%。
+- epoch 119：83.47%。
+- epoch 120 alpha 到 1.0：83.09%。
+- epoch 194：84.28%。
+
+### 第三 bit 使用情况
+
+best checkpoint 中：
+
+- 切换 `p0` 时，categorical LUT 输出类别改变 15.39%；
+- 切换 `p1` 时，categorical LUT 输出类别改变 15.36%；
+- real/imag 单输出 bit 分别改变约 8.54%–8.57%。
+
+因此模型并未忽略第三 bit。它学习出了明显不同于 LUT4 base 的 dominance-conditioned
+逻辑，而且这种分化带来了真实 accuracy 收益。该结果同时说明，之前失败的关键不是
+dominance 信息无效，而是 64-entry LUT6 无约束独立优化导致的稀疏、噪声化分裂。
+
+### 当前方法的准确描述
+
+- 每个二值复数 activation 原本由 `(sr,si)` 两 bit 表示。
+- 两个复数 activation 一组，因此基础地址是四 bit，进入 LUT4。
+- 每个复数额外增加一个 dominance bit `p`；一组总共增加 `p0,p1` 两 bit，
+  地址从 LUT4 扩展成 LUT6。
+- LUT6 logits 不独立随机学习，而由冻结 LUT4 base 加零均值 dominance residual 构成。
+- alpha 从 0.1 退火到 1.0，residual LR=0.002，普通网络 continuation LR=0.0002。
+- dominance bit forward 为硬比较器，向前 activation 的梯度被截断。
+- 最终 checkpoint 的 alpha=1.0，forward 是完全 hard、可物化的普通 LUT6。
+
+### 结论
+
+这是当前首个证明额外 dominance bit 能带来正向精度收益的 LUT6 实验。关键贡献来自
+“保留已学习 LUT4 operation，再受控学习条件 residual”，而不是单纯增加 LUT entry
+数量。后续分析应以该 checkpoint 作为 dominance LUT6 基线。
+
+### 文件修改总结
+
+- `EXPERIMENT_LOG.md`：记录本次完整结果、里程碑、LUT sensitivity 和路线结论。
+<!-- experiment-entry:dominance-shared-residual-layer-analysis-20260819 -->
+## 2026-08-19 - 84.28% residual checkpoint 逐层利用率分析
+
+通过 `scripts/analyze_dominance_lut_checkpoint.py` 对 best checkpoint 做逐层分析。
+
+### 观察
+
+- stage2 的 dominance category sensitivity 从 6.3% 逐步增加到约 10.6%。
+- stage3 约为 10.5%–15.4%，末层明显更高。
+- stage4 约为 14.5%–19.2%，最高为 `stage4.1` 的约 19.2%。
+- p0/p1 sensitivity 在每层都高度接近，未观察到某一个额外 bit 被系统性忽略。
+- centered residual RMS 从浅层约 0.36–0.45 增长到深层约 0.50–0.63。
+- categorical top1-top2 mean margin 约 2.9–3.6，硬表整体并非处于普遍临界翻转状态。
+
+### 推断
+
+dominance/phase 信息在深层更有价值；统一 residual LR 和统一 alpha 会让低收益浅层承担
+不必要的 LUT 分化噪声。下一步优先级：
+
+1. 从 epoch194 best checkpoint 以 alpha=1、较小 continuation LR 延长训练，确认当前
+   200 epochs 是否尚未收敛。
+2. 增加 stage-wise residual gate/LR：stage2 更小或冻结，stage3 中等，stage4 保持完整。
+3. 将四个 `(p0,p1)` slice 改为 Walsh/main-effect residual 参数化，优先学习 p0、p1
+   主效应，再以较小尺度学习 p0×p1 interaction；最终仍物化为同一个 LUT6。
+4. 在改变 phase-bit 公式前，先统计真实训练数据的 p0/p1 和 64-address occupancy，
+   排除稀有 slice 导致的样本不足。
+
+### 文件修改总结
+
+- `EXPERIMENT_LOG.md`：记录逐层 sensitivity、residual 强度与后续实验优先级。
+<!-- experiment-entry:continuation-and-occupancy-analysis-20260820 -->
+## 2026-08-20 - residual 续训结果与真实地址 occupancy
+
+### 续训结果
+
+使用 `scripts/analyze_training_run.py` 分析：
+
+`runs/phase3_lut6_dominance_sharedres_continue_lr1e4`
+
+- 完成 100/100 epochs，所有指标 finite。
+- best test accuracy：84.56%，续训 epoch 77。
+- final test accuracy：84.21%。
+- 相对上一阶段 84.28% 再提升 0.28 pp。
+- best checkpoint 为 alpha=1.0 的完全 hard LUT6。
+- p0/p1 静态 category sensitivity 分别为 17.04%/17.02%，单输出 bit sensitivity
+  约 9.5%。
+
+### 新增可复用分析脚本
+
+新增 `scripts/analyze_dominance_occupancy.py`。脚本从 checkpoint 恢复实际模型，
+在真实数据前向中通过 dominance LUT6 pre-hook 逐层、逐 group 累积地址，报告：
+
+- p0/p1 的 0/1 分布；
+- (p0,p1) 四组合分布；
+- 每个 group 的 64-address coverage、零命中、低命中比例；
+- normalized address entropy；
+- LUT category sensitivity；
+- 按真实地址命中次数加权的 sensitivity；
+- 已分化但未访问/低访问的 LUT entry 比例；
+- 最高与最低频地址。
+
+保存报告：
+
+- `reports/dominance_occupancy_continue_best_train10000.json`
+- `reports/dominance_occupancy_continue_best_test10000.json`
+
+### 10,000 个训练样本结果
+
+共记录 5,164,160,000 次 LUT group lookup。
+
+- p0=1：48.25%；p1=1：47.83%，边际分布接近均衡。
+- (p0,p1)：00=31.70%，01=20.05%，10=20.47%，11=27.78%。
+- 两个 bit 存在正相关，但四种组合均有充足样本，不构成严重 collapse。
+- 所有层/group/address 合计零命中率仅 0.835%。
+- hit-weighted category sensitivity：18.73%，高于静态平均水平，说明学到的
+  phase-conditioned 变化倾向于落在常访问地址上。
+
+稀疏性主要集中在最浅层：
+
+- stage2.0：22.44% group-address 未访问，30.63% 少于 100 hits；
+  8.28% 的 sensitive entries 未访问，17.61% 少于 100 hits。
+- stage2.1：8.59% 未访问，11.53% 少于 100 hits；
+  1.11% sensitive entries 未访问。
+- stage2.2/2.3：未访问约 0.31%/0.94%。
+- 从 stage2.4 开始，中深层几乎全部覆盖 64 地址。
+- stage3/4 normalized entropy 多为 0.84–0.91，地址利用充分。
+- 深层 hit-weighted sensitivity 约 23%–34%，明显高于浅层。
+
+完整 test set 与训练增强样本结论一致：p0/p1 仍接近均衡，整体 group-address
+零命中率为 0.908%，不存在 train/test occupancy 失配。
+
+### 结论和下一步
+
+第四步检查排除了“全网地址严重稀疏”和“第三 bit 单边 collapse”。当前 residual
+已经把变化集中到高频地址，主要可优化点仅在 stage2.0/2.1：
+
+1. 不应做全网 occupancy balancing，也不应继续强行提高 LUT 翻转率。
+2. stage2.0/2.1 使用较小 residual alpha/LR，或采用共享主效应参数化，减少低频
+   group-address 的独立噪声。
+3. stage2.2 之后保持当前 full residual，尤其 stage3/4 不应收缩。
+4. 对浅层低命中 entry 可使用 occupancy-weighted residual regularization，使其回归
+   LUT4 base；最终硬件表不变。
+5. Walsh 参数化优先在 stage2.0/2.1 试验：先学习 p0/p1 主效应，再决定是否开放
+   p0*p1 interaction。
+
+### 文件修改总结
+
+- `scripts/analyze_dominance_occupancy.py`：新增真实数据逐层/逐 group occupancy
+  和 hit-weighted LUT sensitivity 分析。
+- `reports/dominance_occupancy_continue_best_train10000.json`：保存训练样本报告。
+- `reports/dominance_occupancy_continue_best_test10000.json`：保存完整测试集报告。
+- `EXPERIMENT_LOG.md`：记录续训结果、occupancy 指标和后续决策。
+### 补充：浅层两路 activation 的联合相关性
+
+stage2.0/2.1 的最高频地址集中在 `0,9,18,27,36,45,54,63`。按照
+`[sr0,si0,p0,sr1,si1,p1]` 解码，这些地址满足第一个三 bit code 与第二个
+三 bit code 相同。说明当前同 channel 空间位置配对在浅层具有明显相关性，两路输入
+频繁表达同一复数状态，因此 LUT6 的联合地址熵较低。这与 stage2.0 normalized
+entropy 约 0.64、深层约 0.84–0.91 的结果一致。
+
+除了收缩浅层 residual，后续还可只针对 stage2 测试更低相关性的配对，例如拉开空间
+tap 距离或跨 channel 配对；stage3/4 保持当前布局。该实验会改变路由代价，必须同时
+评估 FPGA wiring，不应直接作为默认方案。
+
+### 文件修改总结
+
+- `EXPERIMENT_LOG.md`：补充最高频地址的 code-equality 解释和浅层配对优化方向。
+## 2026-08-20：dominance LUT6 的 Walsh residual 参数化
+
+### 目标
+
+在不改变 LUT6 硬件接口和最终 64-entry 真值表的前提下，将原先四个
+`(p0,p1)` slice 独立学习再减均值的 residual，改写为 Walsh-Hadamard 基底。
+希望通过跨 slice 共享主效应，提高浅层地址 occupancy 较稀疏时的统计效率。
+
+令 `q0=2*p0-1`、`q1=2*p1-1`，对每个旧 LUT4 地址和四个输出类别维护：
+
+```
+R(p0,p1) = q0*A + q1*B + q0*q1*I
+logits6 = logits4_base + alpha*R
+```
+
+其中 `A` 是第一个 dominance bit 的主效应，`B` 是第二个 dominance bit
+的主效应，`I` 是两者的交互效应。四个 slice 的 residual 均值天然为零。
+`A/B/I` 共三个自由度，与原四 slice 减去均值后的三个有效自由度完全相同，
+因此这是无损换坐标，不是表达能力压缩。
+
+### 实现与兼容性
+
+新增命令行参数值：
+
+```
+--pair-lut-parameterization categorical_walsh
+```
+
+要求仍为 `--pair-lut-inputs 6 --pair-lut-encoding dominance`。LUT4 checkpoint
+warm start 时，冻结的 `dominance_base` 读取原 `16x4` categorical logits，
+`A/B/I` 全部初始化为零，所以初始模型与 LUT4 逐地址完全等价。训练继续沿用
+`dominance_residual_lr` 和 `dominance_residual_alpha` ramp。前向最终仍展开成
+普通的 `64x2` hard LUT bits 并调用现有 LUT6 kernel，不增加 FPGA LUT、引脚或
+输出资源。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`：新增 `categorical_walsh`；参数形状为
+  `[Cout, group, 16, 3, 4]`，注册 `[q0,q1,q0*q1]` 基底，并在 categorical
+  logits 生成阶段展开为 64-entry LUT6。
+- `complexPyTorch/complexBinaryResNet.py`：模型参数校验允许 dominance LUT6
+  使用 `categorical_walsh`。
+- `training.py`：命令行、LUT4 warm start、checkpoint 恢复、独立 residual
+  optimizer group 和 alpha ramp 接入 Walsh 参数化。
+- `run_phase3.sh`：Walsh 模式下显示 residual LR 与 alpha ramp 配置。
+- `tests/test_phase12_route.py`：新增 LUT4→Walsh 整网等价测试，以及任意零均值
+  四 slice residual 可被 Walsh `A/B/I` 无损重建的测试。
+- `scripts/analyze_dominance_lut_checkpoint.py`：支持读取 Walsh checkpoint，
+  展开有效 LUT6 logits，并报告 `p0/p1/interaction` coefficient RMS。
+- `EXPERIMENT_LOG.md`：记录本次公式、实现、硬件兼容性和验证结果。
+
+### 验证
+
+- 核心 Python 文件和分析脚本通过 `py_compile`。
+- `run_phase3.sh` 通过 `bash -n`。
+- Walsh 三项针对性测试通过。
+- 完整 `tests.test_phase12_route` 回归测试：`52/52 passed`。
+- 临时 Walsh checkpoint 可由分析脚本正确加载和展开。
+
+## 2026-08-20：Walsh residual 首轮结果分析（运行中快照）
+
+### 统一预处理
+
+先使用 `scripts/analyze_training_run.py` 对 Walsh、旧 shared residual 主训练和续训
+生成统一 JSON，再使用 `scripts/analyze_dominance_lut_checkpoint.py` 分析
+best/last checkpoint 的 hard category sensitivity 与 residual 强度。本次观察时
+Walsh 任务仍在运行，主进程为 PID 34127，约进行到 epoch 126，因此以下是运行中快照。
+
+### 结果
+
+| 实验 | weight/BN LR | residual LR | 最佳 test acc | 最佳 epoch |
+|---|---:|---:|---:|---:|
+| LUT4 warm-start 源模型 | 0.02（原始完整训练） | - | 82.53% | 248 |
+| Walsh 首轮 | 0.02 multistep | 0.002 | 79.09% | 1 |
+| shared residual 主训练 | 0.0002 constant | 0.002 | 84.28% | 194 |
+| shared residual 续训 | 0.0001 constant | 0.001 | 84.56% | 77 |
+
+Walsh 从 LUT4 checkpoint warm start 在数学和单测上完全等价，因此训练前应保持源模型
+82.53% 的精度。但第一次 epoch 更新后立即降到 79.09%，随后到约 epoch 126 只有
+约 77.5%–77.8%。此次命令将已收敛共享参数的 LR 设为 0.02，比成功的 residual
+主训练 0.0002 大 100 倍，比续训 0.0001 大 200 倍。旧 LUT4 的 0.02 是从较差起点
+完成整段训练时使用的 LR，不能直接用于已经处于局部最优点的 warm-start 续训。
+
+### LUT 是否学动
+
+Walsh best checkpoint（epoch 1，alpha=0.1）：
+
+- p0/p1 category sensitivity 均约 0.36%；
+- 此时 LUT6 基本仍等价于 LUT4。
+
+Walsh 当前 last checkpoint（约 epoch 126，alpha=1）：
+
+- p0 category sensitivity 约 16.19%；
+- p1 category sensitivity 约 16.19%；
+- `A`、`B`、`I` 的逐层 RMS 均值分别约 0.3330、0.3334、0.3119；
+- 展开后的 residual RMS 均值约 0.5653。
+
+旧 shared residual 最佳 checkpoint：
+
+- p0/p1 category sensitivity 约 17.04%/17.02%；
+- centered residual RMS 均值约 0.5277。
+
+因此 Walsh 并没有再次出现 LUT 不翻转的问题。它已经学出和旧 residual 相近数量的
+hard table 差异；精度差主要来自共享 weight/BN 在第一轮被过大 LR 破坏。
+
+### Walsh LR 尺度
+
+对一个已命中的 dominance slice，旧参数化
+`z_s-mean(z)` 的参数梯度平方范数为 `3/4`；Walsh
+`q0*A+q1*B+q0*q1*I` 的参数梯度平方范数为 `3`。同一 residual LR 下，
+Walsh 的局部函数空间更新尺度约为旧参数化的 4 倍。Adam 会削弱但不会完全消除这种
+差异。因此下一次干净实验建议：
+
+- weight/BN：`LR=0.0002`、`SCHEDULE=constant`；
+- Walsh residual：先用 `DOMINANCE_RESIDUAL_LR=0.0005`；
+- alpha 仍从 0.1 在 120 epochs 内升到 1；
+- 从同一个 LUT4 best checkpoint 重新开始，使用新 WORKDIR；
+- 当前 `LR=0.02` 的 run 已无继续判断 Walsh 优劣的价值，可停止。
+
+### 文件修改总结
+
+- `reports/phase3_lut6_dominance_walsh_lr002.json`：Walsh 训练统一报告。
+- `reports/phase3_lut6_dominance_sharedres_continue_lr1e4.json`：旧 residual
+  续训统一对照报告。
+- `reports/phase3_lut6_dominance_sharedres_lr2e4_reslr2e3.json`：旧 residual
+  主训练统一对照报告。
+- `reports/phase3_pair_lut4_categorical_phase2init_sf11_lr002.json`：LUT4
+  warm-start 源模型报告。
+- `reports/phase3_lut6_dominance_walsh_best_lut.json`：Walsh best LUT 指标。
+- `reports/phase3_lut6_dominance_walsh_last_lut.json`：Walsh last 汇总指标。
+- `reports/phase3_lut6_dominance_walsh_last_lut_full.json`：Walsh last 逐层指标。
+- `reports/phase3_lut6_dominance_sharedres_continue_best_lut.json`：旧 residual
+  最佳 checkpoint 的逐层 LUT 对照指标。
+- `EXPERIMENT_LOG.md`：记录本次配置错误、LUT 指标和下一实验决策。
+
+## 2026-08-21：clean Walsh 完整结果与参数化结论
+
+### 结果
+
+使用修正后的公平配置完成 200 epochs：
+
+- weight/BN LR：0.0002 constant；
+- Walsh residual LR：0.0005；
+- alpha：0.1→1.0，120 epochs；
+- LUT4 best checkpoint warm start；
+- dominance bit stop-gradient。
+
+最终结果：
+
+- best test acc：83.53%（epoch 176）；
+- final test acc：83.25%；
+- LUT4 warm-start 源模型：82.53%；
+- direct shared residual 主训练：84.28%；
+- direct shared residual 续训最佳：84.56%。
+
+因此 clean Walsh 相比 LUT4 确实获得约 1.00 个百分点收益，但相比直接维护四个
+dominance slice 的 residual 仍低约 1.03 个百分点。此前 LR=0.02 的失败不能用于
+判断 Walsh；本次 clean run 才是有效比较。
+
+### LUT 指标
+
+Walsh best checkpoint：
+
+- p0 category sensitivity：7.29%；
+- p1 category sensitivity：7.31%；
+- A/B/I RMS 均值：0.1393 / 0.1392 / 0.1189；
+- interaction 与两个 main-effect 平均 RMS 之比：85.35%；
+- 展开后的 residual RMS：0.2303。
+
+旧 direct residual 最佳 checkpoint：
+
+- p0/p1 category sensitivity：17.04% / 17.02%；
+- centered residual RMS：0.5277；
+- best test acc：84.56%。
+
+交互项强度接近主效应，说明最优 LUT6 操作明显依赖两个复数输入及其 dominance bit
+的联合状态，不是主要由可分离的 p0、p1 factor 构成。
+
+### 原因分析
+
+Walsh 与 direct zero-mean residual 在数学表达能力上等价，均有三个有效自由度；
+性能差异来自优化坐标而非硬件表达能力：
+
+- LUT6 地址本身已经联合包含
+  `[sr0,si0,p0,sr1,si1,p1]`，直接 residual 对每个 6-bit 地址局部更新；
+- Walsh 中更新 A 会同时改变两组 p0 slice，更新 B 会同时改变两组 p1 slice，
+  更新 I 会以 checkerboard 方式同时改变四个 slice；
+- 某一个具体地址只需要翻转一个输出类别时，Walsh 必须协调 A/B/I 才能保持另外三个
+  slice 不变；
+- categorical hard argmax 使这种联动更容易产生无关 slice 的 margin 扰动；
+- Adam 不具备对这种线性坐标变换的旋转不变性，因此即使函数空间等价，优化轨迹也
+  不等价。
+
+这与“LUT6 已经蕴含两个复数的联合 factor，外部再次结构化会增加优化难度”的判断
+一致。Walsh 在这里不是硬件上的外部 factor，但确实是训练参数上的额外结构约束。
+
+### 路线决策
+
+不建议继续把 Walsh 作为主路线。恢复 direct `categorical_residual`：
+
+- 它与 LUT6 的 address-local 语义最一致；
+- 当前已有 84.56% 最佳结果；
+- hard sensitivity 更高，说明第五、第六 bit 被更充分利用；
+- 最终硬件资源与 Walsh 完全相同。
+
+Walsh 代码可作为消融实验保留，不设为默认，不继续投入主要实验额度。
+
+### 文件修改总结
+
+- `reports/phase3_lut6_dominance_walsh_clean_lr2e4_reslr5e4.json`：clean Walsh
+  完整训练报告。
+- `reports/phase3_lut6_dominance_walsh_clean_best_lut.json`：clean Walsh best
+  checkpoint 的逐层 A/B/I、margin 和 sensitivity 报告。
+- `EXPERIMENT_LOG.md`：记录 clean Walsh 最终结果、优化机理和路线决策。
+
+## 2026-08-21：categorical residual 后续 idea 筛选
+
+基于当前累计结果（LUT4 82.53%、direct categorical residual 84.56%、clean Walsh
+83.53%）逐项评估新的改进建议。
+
+### 方向 1：hierarchical residual
+
+原提案
+`B + alpha1*D_phase + alpha2*D_corr` 若两个 residual 都是完整的 64-address
+四分类 logits，则存在不可辨识性：同一修正可以任意分配给两个张量，只增加优化冗余。
+若将 `D_phase` 限制为 p0/p1 主效应、`D_corr` 表示交互或 full correction，
+本质上又回到 Walsh/ANOVA staged release。clean Walsh 已证明这种跨 slice 联动
+不如 address-local residual。因此不建议按原形式实现。
+
+### 方向 2：complex/factorized residual
+
+将 residual 拆成独立 real/imag logits 会取消当前成功的四分类联合约束。最终硬件虽是
+两张 LUT，但当前训练通过同一个四分类状态联合决定实虚输出；拆分后会重新出现两张表
+各自优化、复数输出组合缺乏约束的问题。可作为低优先级消融，不作为主路线。
+
+### 方向 3/7：替换 third bit
+
+magnitude bit、learnable threshold 和带梯度的第五 bit 在历史路线中已多次出现训练
+下降或局部最优问题。当前 dominance bit 已经带来约 2.03 个百分点收益，不应立即替换。
+若重启该方向，应先用现有 occupancy 脚本比较候选 bit 的 balance、地址 entropy 和
+与 hard LUT correction 的互信息，再决定是否做完整训练。learnable gamma 还会引入
+额外硬件尺度比较代价，除非量化成移位可实现的有限集合。
+
+### 方向 4：phase interaction 分解
+
+`D0(p0)+D1(p1)+D01(p0,p1)` 就是已经完成的 Walsh/ANOVA 参数化。其表达空间与
+direct zero-mean residual 等价，但 clean 结果只有 83.53%，低于 direct residual
+84.56%。该方向已经完成验证，不再重复。
+
+### 方向 5：residual regularization
+
+普通全局 L2 可用，但会对高频、确有收益的 correction 一并施压，并且 raw categorical
+logits 存在共同平移不改变 softmax 的 gauge。更推荐 occupancy-aware functional
+regularization：
+
+- 对同一 LUT4 base 下的 centered residual 或 categorical KL 施加约束；
+- 低 occupancy 地址使用更大 lambda，使其回归 base；
+- 高频地址使用较小 lambda，保留第五/第六 bit 的有效修正；
+- lambda 随 epoch 逐渐减小或在 alpha ramp 结束后固定到很小值。
+
+这直接针对之前发现的 stage2.0/2.1 稀疏地址问题，且不改变硬件。
+
+### 方向 6：knowledge distillation
+
+有潜力，但不建议使用 `||Z6-Z4||^2` 的 raw-logit MSE。更合理的是：
+
+`KL(softmax(B/T) || softmax((B+alpha*R)/T))`
+
+并采用 early-only、逐渐衰减、occupancy-aware 的权重。它相当于 categorical
+trust region：训练初期防止低置信地址无依据翻转，后期释放 student 超过 teacher。
+由于 alpha ramp 已具有类似保守作用，distillation 应先作为小规模消融，避免过强约束
+把模型锁回 82.53% teacher。
+
+### 推荐优先级
+
+1. direct categorical residual + occupancy-aware categorical KL/L2；
+2. 更简单的 layer-wise residual LR：stage2.0/2.1 降低，stage3/4 保持当前值；
+3. early decaying categorical KL distillation；
+4. 在统计信息证明更好后，再测试固定 third-bit 替代方案；
+5. real/imag independent residual 仅作消融；
+6. 不再测试 Walsh/ANOVA 或冗余 hierarchical full residual。
+
+### 文件修改总结
+
+- `EXPERIMENT_LOG.md`：记录 idea 与历史实验的对应关系、淘汰理由和下一实验优先级。
+
+## 2026-08-21：当前 categorical residual 执行顺序审计
+
+按当前代码重新核对 LUT4 checkpoint warm start、activation、LUT6 地址生成、
+categorical residual、CUDA 查表、BN/residual block 和反向传播。
+
+关键事实：
+
+1. Phase3 block 顺序为 pre-activation：保存原 inp 作为 identity 和
+   dominance_source，BinaryComplexBitActivation 将实虚符号编码为 0/1，LUT 查表累加，
+   covariance complex BN，最后与 identity/projection 相加。
+2. dominance 实际公式是
+   `delta=sign(i)*r-sign(r)*i=sign(r)sign(i)(|r|-|i|)`，
+   `p=1[delta>=0]`。它是象限相关的 phase/Gray bit，并非始终等于
+   `1[|r|>=|i|]`。当前 stop 模式直接 detach，不经 p 向前层传梯度。
+3. LUT6 地址顺序严格为 `[r0,i0,p0,r1,i1,p1]`，整数地址为
+   `32r0+16i0+8p0+4r1+2i1+p1`。旧 LUT4 地址为
+   `8r0+4i0+2r1+i1`。
+4. LUT4 categorical logits 作为冻结 buffer `dominance_base[O,G,16,4]`；
+   可学习 residual 为 `weight[O,G,64,4]`，初始化全零。对同一旧地址的四个
+   `(p0,p1)` slice 按 class 分别减均值，再计算
+   `base+alpha*centered_residual`。
+5. 每个地址经四分类 softmax + hard argmax STE 联合选择
+   `00/01/10/11` 复数输出状态，再展开成两张 `[O,G,64]` 的 0/1 LUT。
+6. CUDA 前向将六个输入 bit 打包为 0–63 地址，读取 hard table；所有 group 的
+   0/1 输出直接求和，所以 BN 前实部、虚部范围均为 `[0,G]`。post complex BN
+   负责去直流、协方差白化和可学习复仿射变换。
+7. CUDA 对 LUT table 的梯度只累积到命中地址；输入 bit 梯度采用
+   `table[idx(bit=1)]-table[idx(bit=0)]` 的有限差分。real/imag bit 梯度继续经过
+   Bi-Real surrogate；p 因 stop-gradient 不继续传播。
+8. residual raw 参数梯度还会经过四 slice 零均值投影，并乘当前 alpha。
+   base 是 buffer，不更新。训练全程 hard，没有 tau/soft-forward，只有 alpha ramp。
+9. 当前 `F.unfold` 的 logical position 顺序是 channel-major、channel 内 kernel
+   row-major，然后每两个位置一组。由于 3x3 每 channel 有 9 个 tap，边界 pair 会
+   跨 channel：例如 `(c0,k22)` 与 `(c1,k00)`。若总 logical position 为奇数，
+   最后一个位置会与整个 patch 的第一个位置配对。当前实现因此是“多数 pair 同 channel”，
+   不是“所有 pair 严格同 channel”。
+
+### 文件修改总结
+
+- `EXPERIMENT_LOG.md`：记录当前 categorical residual 的实际代码顺序、梯度路径、
+  地址公式和 channel-major pairing 边界行为。
+
+
+## 2026-08-21：固化 84.56% categorical residual 主路线并移除 Walsh
+
+### 结果与决策
+
+当前最佳模型来自 `categorical_residual` dominance LUT6：LUT4 categorical checkpoint
+先扩展为完全等价的 LUT6 base，再只学习每个 64-address 的零均值四分类 residual。
+主训练最佳 84.28%，续训最佳 **84.56%**（epoch 77），相对 LUT4 warm-start 的
+82.53% 提升 2.03 个百分点。p0/p1 hard category sensitivity 为 17.04% /
+17.02%，说明两个新增 phase/Gray bit 已实际改变硬真值表。
+
+clean Walsh 对照仅达到 83.53%。虽然其函数空间与零均值 direct residual 等价，
+但跨 dominance slice 的联动坐标增加了 hard categorical 优化难度。因此本次从模型、
+CLI、调度、测试和 checkpoint 分析脚本中完全移除 Walsh，不再提供该运行选项；历史
+实验结论保留在本日志中，避免未来重复测试。
+
+### 验证
+
+- `python -m py_compile`：核心模型、训练入口和 dominance checkpoint 分析脚本通过；
+- `bash -n run_phase3.sh`：通过；
+- `python -m unittest tests.test_phase12_route`：50 tests passed；
+- 保留 LUT4->LUT6 等价 warm start、zero-mean residual、alpha/LR schedule 测试。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`：清理历史行尾空格；删除 Walsh 参数张量、basis 展开和分支，只保留
+  independent、categorical 与当前最佳 categorical_residual。
+- `complexPyTorch/complexBinaryResNet.py`：删除 Walsh 模型配置入口。
+- `training.py`：删除 Walsh checkpoint、optimizer、flow scheduler 和 CLI 分支；修正
+  dominance bit 的帮助文本为 phase/Gray comparator bit。
+- `run_phase3.sh`：删除 Walsh residual 调度分支。
+- `tests/test_phase12_route.py`：删除 Walsh 专用测试，保留主路线回归覆盖。
+- `scripts/analyze_dominance_lut_checkpoint.py`：删除 Walsh coefficient 分析，仅分析当前
+  64x4 direct categorical residual checkpoint。
+- `CURRENT_TECHNICAL_ROUTE.md`：记录 84.56% 最佳结果、续训命令和硬件映射结论。
+- `EXPERIMENT_LOG.md`：记录本次路线固化、验证结果及所有文件修改。
+
+### 本次路线快照中一并固化的历史文件变化
+
+- `lut_cuda/lut_conv_cuda_backend.cu`：保留此前已验证的 inactive lane 非有限梯度修复；
+  本次未再修改 CUDA kernel。
+- `run_phase2.sh`、`scripts/analyze_training_run.py`、`scripts/audit_active_route.py`：固化
+  当前 Phase1/2/3 路线的启动与可复用审计工具。
+- `scripts/analyze_checkpoint_nonfinite.py`、`scripts/analyze_nonfinite_gradient_report.py`、
+  `scripts/analyze_lut_reference_gap.py`、`scripts/analyze_dominance_occupancy.py`：纳入已用于
+  实验分析的可复用脚本。
+- 删除旧 `run_phase2_complex_bireal.sh`、`run_phase3_pair_analytic.sh`、
+  `run_phase3_real_compatible.sh`、旧 pair-LUT 分析脚本、旧独立测试文件和未使用的
+  `lut_conv_bafw_cuda_backend_top1.cu`，使活动目录只呈现当前 Phase1/2/3 路线。

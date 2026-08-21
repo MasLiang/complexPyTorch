@@ -21,7 +21,12 @@ from torch.nn import (
     PReLU
 )
 
-from .lut_backend import LUTConvFP32Function, LUTBafwConvFunction, LUTBffbConvFunction, LUTBinaryConvFunction
+from .lut_backend import (
+    LUT6Function,
+    LUTBafwConvFunction,
+    LUTBffbConvFunction,
+    LUTConvFP32Function,
+)
 from .complexFunctions import (
     complex_relu,
     complex_tanh,
@@ -33,10 +38,38 @@ from .complexFunctions import (
     complex_opposite,
     complex_binary_activation,
     complex_binary_weight,
-    binary_scale_weight_complex,
-    binary_sign,
 )
 
+def bimodal_initialization(tensor, init_cfg=[-1, 0.2, 1, 0.1]):
+    mode1_mean, mode1_std = init_cfg[0], init_cfg[1]
+    mode2_mean, mode2_std = init_cfg[2], init_cfg[3]
+    if mode1_mean!=0 and mode2_mean!=0:
+        mask = torch.bernoulli(torch.full_like(tensor, 0.5))
+
+        mean = mask * mode1_mean + (1 - mask) * mode2_mean
+        std  = mask * mode1_std  + (1 - mask) * mode2_std
+
+        output = torch.normal(mean, std)
+
+        with torch.no_grad():
+            tensor.copy_(output)
+
+def binary_gumbel_softmax(logits, tau=1.0, hard=1, w0y1=0):
+    #if w0y1==0:
+    #    if hard:
+    #        y = logits*tau
+    #    else:
+    #        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits)))/tau
+    #        y = (logits + gumbel_noise) * tau
+    #else:
+    if hard==1:
+        binary_hard = torch.where(logits >= 0.0, 1.0, 0.0)
+        binary_sample = (binary_hard - logits).detach() + logits
+    else:
+        y = logits * tau
+        y = F.tanh(y)
+        binary_sample = (y+1)*0.5
+    return binary_sample
 
 def apply_complex(fr, fi, input, dtype=torch.complex64):
     return (fr(input.real)-fi(input.imag)).type(dtype) \
@@ -226,6 +259,28 @@ class BinaryComplexActivation(Module):
 
     def forward(self, inp):
         return complex_binary_activation(inp, grad_mode=self.grad_mode)
+
+
+class BinaryComplexBitActivation(BinaryComplexActivation):
+    """Apply Bi-Real activation, then encode {-1, +1} as {0, 1}."""
+
+    @staticmethod
+    def _encode_component(signed, value):
+        hard_signed = torch.where(
+            value > 0.0,
+            torch.ones_like(value),
+            -torch.ones_like(value),
+        )
+        signed_pm_one = signed + (hard_signed - signed).detach()
+        return (signed_pm_one + 1.0) * 0.5
+
+    def forward(self, inp):
+        signed = super().forward(inp)
+        if not torch.is_complex(inp):
+            return self._encode_component(signed, inp)
+        real = self._encode_component(signed.real, inp.real)
+        imag = self._encode_component(signed.imag, inp.imag)
+        return torch.complex(real, imag)
 
 
 class BinaryComplexConv2d(Module):
@@ -897,1086 +952,199 @@ class ComplexLSTM(Module):
 
         return h_new
 
-class LUTAwareComplexBinaryConv2d(Module):
-    """
-    硬件感知复数二值卷积层 (Phase 3: LUT-Aware Transition Phase)。
-    将局部复数乘法映射为 1-LUT 承载，严格输出 {0, 1} 物理非对称累加结果。
-    通过无损布尔多项式展开，彻底解决 unfold 带来的显存 OOM 灾难。
-    """
-    def __init__(
-        self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, 
-        dilation=1, groups=1, bias=False, per_channel=True, weight_grad_mode="ste"
-    ):
-        super().__init__()
-        self.stride = stride
-        self.padding = padding
-        self.kernel_size = kernel_size
+
+def _initialize_bimodal_(
+    tensor,
+    negative_mean=-1.0,
+    negative_std=0.1,
+    positive_mean=1.0,
+    positive_std=0.1,
+):
+    """Initialize LUT logits with the real Bi-Real LUT recipe."""
+    with torch.no_grad():
+        positive = torch.rand_like(tensor) >= 0.5
+        means = torch.where(
+            positive,
+            torch.full_like(tensor, positive_mean),
+            torch.full_like(tensor, negative_mean),
+        )
+        stds = torch.where(
+            positive,
+            torch.full_like(tensor, positive_std),
+            torch.full_like(tensor, negative_std),
+        )
+        tensor.copy_(torch.normal(means, stds))
+
+
+def hard_binary_table(logits):
+    """Use a hard Boolean table in forward and identity STE in backward."""
+    hard = (logits >= 0.0).to(logits.dtype)
+    return logits + (hard - logits).detach()
+
+
+def annealed_binary_table(logits, temperature):
+    """Map LUT logits to continuous 0/1 entries for temperature annealing."""
+    if temperature <= 0.0:
+        raise ValueError("LUT temperature must be positive")
+    return 0.5 * (torch.tanh(logits * float(temperature)) + 1.0)
+
+
+class LUTBffbConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, group_num=1, init_cfg=[-1, 0.1, 1, 0.1]):
+        super(LUTBffbConv2d, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.dilation = dilation
-        self.groups = groups
-        self.per_channel = per_channel
-        self.weight_grad_mode = weight_grad_mode
+        self.groups = group_num
+        self.K = kernel_size
+        self.stride = stride
+        self.padding = padding
 
-        # 硬件累加的极限范围 [0, N]
-        self.N = in_channels * kernel_size * kernel_size // groups
+        self.lut_num = (in_channels // group_num) * kernel_size * kernel_size // 6
 
-        # 必须叫 conv_r 和 conv_i，与 BinaryComplexConv2d 100% 对齐，实现无缝 Load
-        self.conv_r = Conv2d(in_channels, out_channels, kernel_size, stride, 0, dilation, groups, bias)
-        self.conv_i = Conv2d(in_channels, out_channels, kernel_size, stride, 0, dilation, groups, bias)
+        self.weight = nn.Parameter(torch.randn(self.lut_num, 64, out_channels))
+        bimodal_initialization(self.weight, init_cfg=init_cfg)
 
-    def forward(self, inp):
-        # =====================================================================
-        # 1. 边缘物理对齐补丁 (The Padding Alignment)
-        # 强行用 -1.0 填充边缘，使其在布尔逻辑中等效于输入全 0 (物理低电平)
-        # =====================================================================
-        if self.padding > 0:
-            pad_tuple = (self.padding, self.padding, self.padding, self.padding)
-            x_r_pad = F.pad(inp.real, pad_tuple, "constant", -1.0)
-            x_i_pad = F.pad(inp.imag, pad_tuple, "constant", -1.0)
-        else:
-            x_r_pad = inp.real
-            x_i_pad = inp.imag
+        self.register_buffer('offsets', None)
+        self.register_buffer('shifts', None)
+        self.register_buffer('tau', torch.tensor([1.0], dtype=torch.float32))
+        self.offsets_padded_W = -1
 
-        # =====================================================================
-        # 2. 原始 BNN 二值化 (提取比例因子 alpha)
-        # =====================================================================
-        weight_r = self.conv_r.weight
-        weight_i = self.conv_i.weight
-        complex_w = torch.complex(weight_r, weight_i)
-        
-        # 复数统一缩放因子 (alpha)
-        alpha = binary_scale_weight_complex(complex_w, per_channel=self.per_channel)
-        alpha = alpha.view(1, -1, 1, 1)
+    def _precompute_offsets(self, device, padded_W):
+        packed_C = (self.in_channels + 31) // 32
+        ic_per_g = self.in_channels // self.groups
+        K_sq = self.K * self.K
 
-        w_r_bin = binary_sign(weight_r, grad_mode=self.weight_grad_mode)
-        w_i_bin = binary_sign(weight_i, grad_mode=self.weight_grad_mode)
-        x_r_bin = binary_sign(x_r_pad, grad_mode="ste")
-        x_i_bin = binary_sign(x_i_pad, grad_mode="ste")
+        l = torch.arange(self.lut_num, device=device).unsqueeze(1)
+        i = torch.arange(6, device=device).unsqueeze(0)
 
-        # =====================================================================
-        # 3. 原始 BNN 数学理想输出 (用于反向传播的平滑梯度)
-        # =====================================================================
-        conv_rr = F.conv2d(x_r_bin, w_r_bin, stride=self.stride, dilation=self.dilation, groups=self.groups)
-        conv_ii = F.conv2d(x_i_bin, w_i_bin, stride=self.stride, dilation=self.dilation, groups=self.groups)
-        conv_ri = F.conv2d(x_r_bin, w_i_bin, stride=self.stride, dilation=self.dilation, groups=self.groups)
-        conv_ir = F.conv2d(x_i_bin, w_r_bin, stride=self.stride, dilation=self.dilation, groups=self.groups)
-        
-        y_orig_r = alpha * (conv_rr - conv_ii)
-        y_orig_i = alpha * (conv_ri + conv_ir)
+        group_id = (l * self.groups) // self.lut_num
+        ic_start = group_id * ic_per_g
 
-        # =====================================================================
-        # 4. 硬件真实的 0/1 LUT 截断结果 (无损 O(1) 空间展开)
-        # =====================================================================
-        with torch.no_grad():
-            # 交叉项：用来捕获阶跃函数的非对称截断误差
-            conv_cross = F.conv2d(x_r_bin * x_i_bin, w_r_bin * w_i_bin, stride=self.stride, dilation=self.dilation, groups=self.groups)
+        initial_idx = (l * 6 + i) % (ic_per_g * K_sq)
+        ic = ic_start + (initial_idx // K_sq)
+        sp = initial_idx % K_sq
 
-            # LUT 查表后的物理累加值，严格在 [0, N] 之间
-            y_lut_r = 0.25 * (3 * self.N + conv_rr - conv_ii + conv_cross)
-            y_lut_i = 0.25 * (3 * self.N + conv_ri + conv_ir - conv_cross)
+        dy = sp // self.K
+        dx = sp % self.K
+        c_word = ic // 32
+        c_shift = ic % 32
 
-        # =====================================================================
-        # 5. 零震荡对齐 (Zero-Shock Alignment) & STE 穿透
-        # =====================================================================
-        # 将 [0, N] 的硬件输出映射回数学期望域，使得 BN 层不会崩溃！
-        y_hw_math_r = (y_lut_r - self.N / 2.0) * 4.0 * alpha
-        y_hw_math_i = (y_lut_i - self.N / 2.0) * 4.0 * alpha
+        abs_offset = (dy * padded_W + dx) * packed_C + c_word
 
-        # 魔法：前向是包含硬件误差的 LUT 结果，反向是平滑的复数乘加真实梯度！
-        y_r = y_hw_math_r.detach() - y_orig_r.detach() + y_orig_r
-        y_i = y_hw_math_i.detach() - y_orig_i.detach() + y_orig_i
+        self.offsets = abs_offset.flatten().to(torch.int32)
+        self.shifts = c_shift.flatten().to(torch.int32)
 
-        # 加入原始偏差
-        if self.conv_r.bias is not None:
-            y_r += self.conv_r.bias.view(1, -1, 1, 1)
-            y_i += self.conv_i.bias.view(1, -1, 1, 1)
+    def forward(self, x_bin, x_float):
+        padded_W = x_bin.shape[3] + 2 * self.padding
+        if self.offsets is None or self.offsets_padded_W != padded_W:
+            self._precompute_offsets(x_bin.device, padded_W)
+            self.offsets_padded_W = padded_W
 
-        return torch.complex(y_r, y_i)
+        w_q = binary_gumbel_softmax(self.weight, tau=1, hard=True)
 
-# =====================================================================
-# 1. 核心算子：原汁原味的 BNN 直通估计器 (STE)
-# =====================================================================
-class SignWithSTE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        # 前向传播：严格二值化为 0.0 和 1.0 (完美契合查表索引概率)
-        return torch.where(x >= 0, 
-                           torch.tensor(1.0, dtype=x.dtype, device=x.device), 
-                           torch.tensor(0.0, dtype=x.dtype, device=x.device))
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        # 反向传播：梯度直接穿透 (STE 原理)
-        # 如果需要更稳定的训练，可以加上 clamp: return grad_output.clamp(-1, 1)
-        return grad_output
-
-
-# =====================================================================
-# 2. 核心算子：全局真值表的退火函数
-# =====================================================================
-def binary_annealing(logits, tau=1.0, hard=False):
-    """
-    连续退火与直通估计器，专用于将 Logits 挤压为 0~1 的物理逻辑状态。
-    tau 越大，曲线越陡峭，越逼近绝对二值。
-    """
-    y = F.tanh(logits * tau)
-    soft_sample = (y + 1.0) / 2.0
-    binary_hard = (logits >= 0).to(logits.dtype)
-    hard_sample = (binary_hard - logits).detach() + logits
-
-    if torch.is_tensor(hard):
-        return torch.where(hard.to(device=logits.device, dtype=torch.bool), hard_sample, soft_sample)
-    return hard_sample if hard else soft_sample
-
-
-def annealed_binary_table(
-    logits,
-    tau,
-    hard_ratio,
-    training_mode="anneal",
-):
-    """Return annealed entries or hard entries with an identity logit STE."""
-    if training_mode == "real_compatible":
-        hard = (logits >= 0.0).to(logits.dtype)
-        return (hard - logits).detach() + logits
-    if training_mode != "anneal":
-        raise ValueError(
-            "Unknown pair-LUT training mode: {}".format(training_mode)
+        return LUTBffbConvFunction.apply(
+            x_bin, x_float, w_q,
+            self.offsets, self.shifts, self.groups,
+            self.K, self.stride, self.padding, self.tau
         )
-    soft = (torch.tanh(logits * tau) + 1.0) / 2.0
-    hard = (logits >= 0.0).to(logits.dtype)
-    ratio = torch.as_tensor(
-        hard_ratio,
-        dtype=logits.dtype,
-        device=logits.device,
-    ).clamp(0.0, 1.0)
-    return soft + ratio * (hard - soft).detach()
 
-
-class _HardForwardProxyBackward(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, hard_output, proxy_output):
-        return hard_output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return None, grad_output
-
-
-class PairLUTNeuronConv2d(Module):
-    """LUT-as-neuron convolution consuming two binary complex activations."""
-
-    LUT_K = 4
-
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=3,
-        stride=1,
-        padding=0,
-        dilation=1,
-        groups=1,
-        bias=False,
-        per_channel=True,
-        logit_init=1.0,
-        tau_init=0.5,
-        training_mode="anneal",
-        kernel_mode="auto",
-        trainable_entries=True,
-    ):
+class LUTBafwConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, group_num=1, init_cfg=[-1, 0.2, 1, 0.1]):
         super().__init__()
-        if not isinstance(kernel_size, int):
-            raise TypeError("PairLUTNeuronConv2d requires an integer kernel_size")
-        if groups != 1:
-            raise ValueError("PairLUTNeuronConv2d currently supports groups=1")
-        if dilation != 1:
-            raise ValueError("PairLUTNeuronConv2d currently supports dilation=1")
-        if bias:
-            raise ValueError("PairLUTNeuronConv2d does not use convolution bias")
-        if logit_init <= 0.0:
-            raise ValueError("logit_init must be positive")
-        if tau_init <= 0.0:
-            raise ValueError("tau_init must be positive")
-        if training_mode not in ("anneal", "real_compatible"):
-            raise ValueError(
-                "Unknown pair-LUT training mode: {}".format(training_mode)
-            )
-        if kernel_mode not in ("auto", "floating", "binary"):
-            raise ValueError(
-                "Unknown pair-LUT kernel mode: {}".format(kernel_mode)
-            )
-        if kernel_mode == "binary" and training_mode != "real_compatible":
-            raise ValueError(
-                "The binary LUT kernel requires real_compatible hard tables"
-            )
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.groups = group_num
 
-        self.in_channels = int(in_channels)
-        self.out_channels = int(out_channels)
-        self.kernel_size = int(kernel_size)
-        self.stride = int(stride)
-        self.padding = int(padding)
-        self.dilation = int(dilation)
-        self.groups = int(groups)
-        self.per_channel = bool(per_channel)
-        self.logit_init = float(logit_init)
-        self.training_mode = training_mode
-        self.kernel_mode = kernel_mode
-        self.trainable_entries = bool(trainable_entries)
-        self.logical_positions = (
-            self.in_channels * self.kernel_size * self.kernel_size
-        )
-        self.pair_num = (self.logical_positions + 1) // 2
+        self.lut_num = math.ceil((in_channels // group_num) * kernel_size * kernel_size / 6)
 
-        table_shape = (self.pair_num, 1 << self.LUT_K, self.out_channels)
-        if self.trainable_entries:
-            self.lut_r = Parameter(torch.zeros(table_shape))
-            self.lut_i = Parameter(torch.zeros(table_shape))
-        else:
-            self.register_buffer("lut_r", torch.zeros(table_shape))
-            self.register_buffer("lut_i", torch.zeros(table_shape))
-        self.register_buffer(
-            "initial_lut_r_sign",
-            torch.zeros(table_shape, dtype=torch.bool),
-        )
-        self.register_buffer(
-            "initial_lut_i_sign",
-            torch.zeros(table_shape, dtype=torch.bool),
-        )
-        self.register_buffer(
-            "output_scale",
-            torch.ones(self.out_channels, dtype=torch.float32),
-        )
-        self.register_buffer("tau", torch.tensor(float(tau_init)))
-        self.register_buffer("hard_ratio", torch.tensor(0.0))
-        self.register_buffer(
-            "initialized",
-            torch.tensor(False, dtype=torch.bool),
+        self.register_buffer('tau', torch.tensor([1.0], dtype=torch.float32))
+        self.register_buffer('hard', torch.tensor([0], dtype=torch.float32))
+
+        self.lut_weight = nn.Parameter(torch.empty(self.lut_num, 64, out_channels))
+        bimodal_initialization(self.lut_weight, init_cfg=init_cfg)
+
+        self.register_buffer('offsets', None)
+        self.register_buffer('shifts', None)
+        self.offsets_padded_W = -1
+
+    def _precompute_offsets(self, device, padded_W):
+        packed_C = (self.in_channels + 31) // 32
+        ic_per_g = self.in_channels // self.groups
+        K_sq = self.kernel_size * self.kernel_size
+
+        l = torch.arange(self.lut_num, device=device).unsqueeze(1)
+        i = torch.arange(6, device=device).unsqueeze(0)
+
+        group_id = (l * self.groups) // self.lut_num
+        ic_start = group_id * ic_per_g
+
+        initial_idx = (l * 6 + i) % (ic_per_g * K_sq)
+        ic = ic_start + (initial_idx // K_sq)
+        sp = initial_idx % K_sq
+
+        dy = sp // self.kernel_size
+        dx = sp % self.kernel_size
+        c_word = ic // 32
+        c_shift = ic % 32
+
+        abs_offset = (dy * padded_W + dx) * packed_C + c_word
+
+        self.offsets = abs_offset.flatten().to(torch.int32)
+        self.shifts = c_shift.flatten().to(torch.int32)
+
+    def forward(self, x):
+        padded_W = x.shape[3] + 2 * self.padding
+        if self.offsets is None or self.offsets_padded_W != padded_W:
+            self._precompute_offsets(x.device, padded_W)
+            self.offsets_padded_W = padded_W
+
+        w_soft = binary_gumbel_softmax(self.lut_weight, tau=self.tau, hard=self.hard)
+
+        return LUTBafwConvFunction.apply(
+            x, w_soft,
+            self.offsets, self.shifts,
+            self.padding, self.stride, self.tau
         )
 
-        state_ids = torch.arange(1 << self.LUT_K, dtype=torch.long)
-        state_bits = torch.stack(
-            [
-                ((state_ids >> shift) & 1).to(torch.float32)
-                for shift in (3, 2, 1, 0)
-            ],
-            dim=1,
+class LUTFPConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, lut_k=6, kernel_size=3, stride=1, padding=1, group_num=1, init_cfg=[-1, 0.2, 1, 0.1]):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.groups = group_num
+
+        oc_per_g = out_channels // group_num
+        if oc_per_g % 32 != 0 and group_num > 1:
+            raise ValueError(f"由于 TILE_OC=32 约束，每组通道数({oc_per_g})必须是32的倍数")
+
+        self.lut_num = math.ceil((in_channels // group_num) * kernel_size * kernel_size / 6)
+
+        self.register_buffer('tau', torch.tensor([1.0], dtype=torch.float32))
+        self.register_buffer('hard', torch.tensor([0], dtype=torch.float32))
+        self.weight = nn.Parameter(torch.empty(self.lut_num, 64, out_channels))
+        bimodal_initialization(self.weight, init_cfg=init_cfg)
+
+    def reset_parameters(self):
+        nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
+
+    def forward(self, x):
+        if self.out_channels % 8 != 0:
+            raise ValueError("out_channels 必须是 8 的倍数以支持向量化访存")
+
+        w_q = binary_gumbel_softmax(self.weight, tau=self.tau, hard=self.hard)
+        return LUTConvFP32Function.apply(
+            x, w_q, self.groups, self.kernel_size, self.stride, self.padding
         )
-        self.register_buffer("state_bits", state_bits)
-
-        kernel_area = self.kernel_size * self.kernel_size
-        positions = torch.arange(self.logical_positions, dtype=torch.long)
-        channels = positions // kernel_area
-        spatial = positions % kernel_area
-        dy = spatial // self.kernel_size
-        dx = spatial % self.kernel_size
-
-        if self.logical_positions % 2:
-            channels = torch.cat(
-                [channels, torch.tensor([-1], dtype=torch.long)]
-            )
-            dy = torch.cat([dy, torch.tensor([0], dtype=torch.long)])
-            dx = torch.cat([dx, torch.tensor([0], dtype=torch.long)])
-
-        pair_channels = channels.view(self.pair_num, 2)
-        pair_dy = dy.view(self.pair_num, 2)
-        pair_dx = dx.view(self.pair_num, 2)
-        input_channels = torch.empty(
-            self.pair_num,
-            self.LUT_K,
-            dtype=torch.long,
-        )
-        input_dy = torch.empty_like(input_channels)
-        input_dx = torch.empty_like(input_channels)
-        for pair_index in range(self.pair_num):
-            for item_index in range(2):
-                channel = int(pair_channels[pair_index, item_index])
-                bit_base = item_index * 2
-                if channel < 0:
-                    raise ValueError(
-                        "Encountered invalid negative channel index while "
-                        "building LUT input mapping"
-                    )
-                input_channels[pair_index, bit_base] = 2 * channel
-                input_channels[pair_index, bit_base + 1] = 2 * channel + 1
-                input_dy[pair_index, bit_base:bit_base + 2] = pair_dy[
-                    pair_index,
-                    item_index,
-                ]
-                input_dx[pair_index, bit_base:bit_base + 2] = pair_dx[
-                    pair_index,
-                    item_index,
-                ]
-
-        unfold_indices = (
-            input_channels * kernel_area
-            + input_dy * self.kernel_size
-            + input_dx
-        )
-        self.register_buffer("input_channels", input_channels.to(torch.int32))
-        self.register_buffer("input_dy", input_dy.to(torch.int32))
-        self.register_buffer("input_dx", input_dx.to(torch.int32))
-        self.register_buffer("unfold_indices", unfold_indices)
-
-        self.initialize_bimodal()
-
-    def initialize_from_phase2_weights(
-        self,
-        weight_r,
-        weight_i,
-        logit_init=None,
-    ):
-        expected_shape = (
-            self.out_channels,
-            self.in_channels,
-            self.kernel_size,
-            self.kernel_size,
-        )
-        if tuple(weight_r.shape) != expected_shape:
-            raise ValueError(
-                "Unexpected real weight shape {}; expected {}".format(
-                    tuple(weight_r.shape),
-                    expected_shape,
-                )
-            )
-        if tuple(weight_i.shape) != expected_shape:
-            raise ValueError(
-                "Unexpected imaginary weight shape {}; expected {}".format(
-                    tuple(weight_i.shape),
-                    expected_shape,
-                )
-            )
-        magnitude = self.logit_init if logit_init is None else float(logit_init)
-        if magnitude <= 0.0:
-            raise ValueError("logit_init must be positive")
-
-        with torch.no_grad():
-            complex_weight = torch.complex(weight_r, weight_i)
-            scale = binary_scale_weight_complex(
-                complex_weight,
-                per_channel=self.per_channel,
-            )
-            if self.per_channel:
-                scale = scale.reshape(self.out_channels)
-            else:
-                scale = scale.reshape(1).expand(self.out_channels)
-            weight_r_bits = torch.where(
-                weight_r >= 0.0,
-                torch.ones_like(weight_r),
-                -torch.ones_like(weight_r),
-            ).reshape(self.out_channels, self.logical_positions)
-            weight_i_bits = torch.where(
-                weight_i >= 0.0,
-                torch.ones_like(weight_i),
-                -torch.ones_like(weight_i),
-            ).reshape(self.out_channels, self.logical_positions)
-            zero_components = int(
-                (weight_r == 0.0).sum().item()
-                + (weight_i == 0.0).sum().item()
-            )
-
-            if self.logical_positions % 2:
-                zero_column = torch.zeros(
-                    self.out_channels,
-                    1,
-                    dtype=weight_r.dtype,
-                    device=weight_r.device,
-                )
-                weight_r_bits = torch.cat([weight_r_bits, zero_column], dim=1)
-                weight_i_bits = torch.cat([weight_i_bits, zero_column], dim=1)
-
-            pair_wr = weight_r_bits.view(
-                self.out_channels,
-                self.pair_num,
-                2,
-            )
-            pair_wi = weight_i_bits.view(
-                self.out_channels,
-                self.pair_num,
-                2,
-            )
-            activation = self.state_bits.to(
-                device=weight_r.device,
-                dtype=weight_r.dtype,
-            ) * 2.0 - 1.0
-            x0r = activation[:, 0].view(1, 1, -1)
-            x0i = activation[:, 1].view(1, 1, -1)
-            x1r = activation[:, 2].view(1, 1, -1)
-            x1i = activation[:, 3].view(1, 1, -1)
-
-            w0r = pair_wr[:, :, 0].unsqueeze(-1)
-            w0i = pair_wi[:, :, 0].unsqueeze(-1)
-            w1r = pair_wr[:, :, 1].unsqueeze(-1)
-            w1i = pair_wi[:, :, 1].unsqueeze(-1)
-            sum_r = (
-                x0r * w0r
-                - x0i * w0i
-                + x1r * w1r
-                - x1i * w1i
-            )
-            sum_i = (
-                x0r * w0i
-                + x0i * w0r
-                + x1r * w1i
-                + x1i * w1r
-            )
-            table_r = (sum_r >= 0.0).permute(1, 2, 0)
-            table_i = (sum_i >= 0.0).permute(1, 2, 0)
-            positive = torch.tensor(
-                magnitude,
-                dtype=self.lut_r.dtype,
-                device=self.lut_r.device,
-            )
-            self.lut_r.copy_(
-                torch.where(table_r.to(self.lut_r.device), positive, -positive)
-            )
-            self.lut_i.copy_(
-                torch.where(table_i.to(self.lut_i.device), positive, -positive)
-            )
-            self.initial_lut_r_sign.copy_(table_r.to(self.lut_r.device))
-            self.initial_lut_i_sign.copy_(table_i.to(self.lut_i.device))
-            self.output_scale.copy_(
-                scale.to(
-                    device=self.output_scale.device,
-                    dtype=self.output_scale.dtype,
-                )
-            )
-            self.initialized.fill_(True)
-
-        return {
-            "mode": "phase2_truth_table",
-            "logical_positions": self.logical_positions,
-            "pairs": self.pair_num,
-            "odd_tail": bool(self.logical_positions % 2),
-            "zero_weight_components": zero_components,
-            "real_ones": int(table_r.sum().item()),
-            "imag_ones": int(table_i.sum().item()),
-            "table_entries_per_output": self.pair_num * (1 << self.LUT_K),
-        }
-
-    def initialize_random(self, logit_std=None):
-        """Initialize an independent random truth-table logit distribution."""
-        std = self.logit_init if logit_std is None else float(logit_std)
-        if std <= 0.0:
-            raise ValueError("logit_std must be positive")
-        with torch.no_grad():
-            self.lut_r.normal_(mean=0.0, std=std)
-            self.lut_i.normal_(mean=0.0, std=std)
-            self.initial_lut_r_sign.copy_(self.lut_r >= 0.0)
-            self.initial_lut_i_sign.copy_(self.lut_i >= 0.0)
-            self.output_scale.fill_(1.0)
-            self.initialized.fill_(True)
-        return {
-            "mode": "random_normal",
-            "logical_positions": self.logical_positions,
-            "pairs": self.pair_num,
-            "odd_tail": bool(self.logical_positions % 2),
-            "logit_mean": float(
-                torch.cat([self.lut_r.flatten(), self.lut_i.flatten()])
-                .mean()
-                .item()
-            ),
-            "logit_std": float(
-                torch.cat([self.lut_r.flatten(), self.lut_i.flatten()])
-                .std(unbiased=False)
-                .item()
-            ),
-            "real_ones": int(self.initial_lut_r_sign.sum().item()),
-            "imag_ones": int(self.initial_lut_i_sign.sum().item()),
-            "table_entries_per_output": self.pair_num * (1 << self.LUT_K),
-        }
-
-    def initialize_bimodal(
-        self,
-        negative_mean=-1.0,
-        negative_std=0.2,
-        positive_mean=1.0,
-        positive_std=0.1,
-    ):
-        """Initialize logits from the real LUT-BiReal bimodal mixture."""
-        if negative_std <= 0.0 or positive_std <= 0.0:
-            raise ValueError("Bimodal standard deviations must be positive")
-
-        with torch.no_grad():
-            for logits in (self.lut_r, self.lut_i):
-                positive_mask = torch.rand_like(logits) >= 0.5
-                negative = torch.empty_like(logits).normal_(
-                    mean=float(negative_mean),
-                    std=float(negative_std),
-                )
-                positive = torch.empty_like(logits).normal_(
-                    mean=float(positive_mean),
-                    std=float(positive_std),
-                )
-                logits.copy_(torch.where(positive_mask, positive, negative))
-            self.initial_lut_r_sign.copy_(self.lut_r >= 0.0)
-            self.initial_lut_i_sign.copy_(self.lut_i >= 0.0)
-            self.output_scale.fill_(1.0)
-            self.initialized.fill_(True)
-
-        combined = torch.cat([self.lut_r.flatten(), self.lut_i.flatten()])
-        return {
-            "mode": "bimodal",
-            "logical_positions": self.logical_positions,
-            "pairs": self.pair_num,
-            "odd_tail": bool(self.logical_positions % 2),
-            "logit_mean": float(combined.mean().item()),
-            "logit_std": float(combined.std(unbiased=False).item()),
-            "real_ones": int(self.initial_lut_r_sign.sum().item()),
-            "imag_ones": int(self.initial_lut_i_sign.sum().item()),
-            "table_entries_per_output": self.pair_num * (1 << self.LUT_K),
-        }
-
-    def hard_sign_diff(self):
-        current_r = self.lut_r.detach() >= 0.0
-        current_i = self.lut_i.detach() >= 0.0
-        diff_r = int((current_r != self.initial_lut_r_sign).sum().item())
-        diff_i = int((current_i != self.initial_lut_i_sign).sum().item())
-        total_per_part = self.lut_r.numel()
-        return {
-            "real": diff_r,
-            "imag": diff_i,
-            "total": diff_r + diff_i,
-            "entries": total_per_part * 2,
-        }
-
-    def hard_tables(self):
-        return {
-            "real": (self.lut_r.detach() >= 0.0).to(torch.uint8).cpu(),
-            "imag": (self.lut_i.detach() >= 0.0).to(torch.uint8).cpu(),
-        }
-
-    def _reference_forward(self, x_prob, table):
-        patches = F.unfold(
-            x_prob,
-            kernel_size=self.kernel_size,
-            dilation=1,
-            padding=self.padding,
-            stride=self.stride,
-        )
-        batch_size, _, locations = patches.shape
-        values = patches[:, self.unfold_indices.reshape(-1), :].view(
-            batch_size,
-            self.pair_num,
-            self.LUT_K,
-            locations,
-        )
-        bits = self.state_bits.view(
-            1,
-            1,
-            1 << self.LUT_K,
-            self.LUT_K,
-            1,
-        ).to(device=values.device, dtype=values.dtype)
-        basis = torch.where(
-            bits > 0.5,
-            values.unsqueeze(2),
-            1.0 - values.unsqueeze(2),
-        ).prod(dim=3)
-        output = torch.einsum("bpsl,pso->bol", basis, table)
-        height = (
-            x_prob.size(2)
-            + 2 * self.padding
-            - self.kernel_size
-        ) // self.stride + 1
-        width = (
-            x_prob.size(3)
-            + 2 * self.padding
-            - self.kernel_size
-        ) // self.stride + 1
-        return output.view(batch_size, self.out_channels, height, width)
-
-    def _lut_forward(self, x_prob, table):
-        if not x_prob.is_cuda:
-            return self._reference_forward(x_prob, table)
-        padded_width = x_prob.size(3) + 2 * self.padding
-        offsets = (
-            (
-                self.input_dy * padded_width
-                + self.input_dx
-            ) * x_prob.size(1)
-            + self.input_channels
-        ).reshape(-1)
-        return LUTFloatingConvFunction.apply(
-            x_prob,
-            table,
-            offsets,
-            self.groups,
-            self.LUT_K,
-            self.kernel_size,
-            self.stride,
-            self.padding,
-        )
-
-    def _binary_lut_forward(self, x_prob, table):
-        if not x_prob.is_cuda:
-            return self._reference_forward(x_prob, table)
-        padded_width = x_prob.size(3) + 2 * self.padding
-        packed_channels = (x_prob.size(1) + 31) // 32
-        offsets = (
-            (self.input_dy * padded_width + self.input_dx)
-            * packed_channels
-            + self.input_channels // 32
-        ).reshape(-1)
-        shifts = (self.input_channels % 32).reshape(-1)
-        return LUTBinaryConvFunction.apply(
-            x_prob,
-            table,
-            offsets,
-            shifts,
-            self.groups,
-            self.LUT_K,
-            self.kernel_size,
-            self.stride,
-            self.padding,
-            "probability",
-        )
-
-    def forward(self, inp):
-        if not bool(self.initialized):
-            raise RuntimeError(
-                "PairLUTNeuronConv2d must be initialized before forward"
-            )
-        hard_r = torch.where(
-            inp.real >= 0.0,
-            torch.ones_like(inp.real),
-            -torch.ones_like(inp.real),
-        )
-        hard_i = torch.where(
-            inp.imag >= 0.0,
-            torch.ones_like(inp.imag),
-            -torch.ones_like(inp.imag),
-        )
-        signed_r = inp.real + (hard_r - inp.real).detach()
-        signed_i = inp.imag + (hard_i - inp.imag).detach()
-
-        # Interleave real/imag values in the flattened spatial-major order
-        # used by the CUDA kernel: for each spatial location, the linearized
-        # channel order becomes [r0, i0, r1, i1, ...], so the real and
-        # imaginary parts of the same logical input sit next to each other.
-        x_prob = torch.zeros(
-            inp.size(0),
-            2 * self.in_channels,
-            inp.size(2),
-            inp.size(3),
-            dtype=inp.real.dtype,
-            device=inp.device,
-        )
-        x_prob[:, 0 : 2 * self.in_channels : 2, :, :] = (signed_r + 1.0) / 2.0
-        x_prob[:, 1 : 2 * self.in_channels : 2, :, :] = (signed_i + 1.0) / 2.0
-        table_r = annealed_binary_table(
-            self.lut_r,
-            self.tau,
-            self.hard_ratio,
-            self.training_mode,
-        )
-        table_i = annealed_binary_table(
-            self.lut_i,
-            self.tau,
-            self.hard_ratio,
-            self.training_mode,
-        )
-        use_binary_kernel = (
-            self.kernel_mode == "binary"
-            or (
-                self.kernel_mode == "auto"
-                and self.training_mode == "real_compatible"
-            )
-        )
-        lut_forward = (
-            self._binary_lut_forward
-            if use_binary_kernel
-            else self._lut_forward
-        )
-        count_r = lut_forward(x_prob, table_r)
-        count_i = lut_forward(x_prob, table_i)
-        #scale = self.output_scale.view(1, -1, 1, 1)
-        #output_r = (count_r - self.pair_num / 2.0) * 4.0 * scale
-        #output_i = (count_i - self.pair_num / 2.0) * 4.0 * scale
-        output_r = count_r
-        output_i = count_i
-        return torch.complex(output_r, output_i)
 
     def extra_repr(self):
-        return (
-            "in_channels={}, out_channels={}, kernel_size={}, stride={}, "
-            "padding={}, pairs={}, per_channel={}, training_mode={}, "
-            "kernel_mode={}, trainable_entries={}, entries={}"
-        ).format(
-            self.in_channels,
-            self.out_channels,
-            self.kernel_size,
-            self.stride,
-            self.padding,
-            self.pair_num,
-            self.per_channel,
-            self.training_mode,
-            self.kernel_mode,
-            self.trainable_entries,
-            self.lut_r.numel() + self.lut_i.numel(),
-        )
-
-
-class AnalyticPairComparatorConv2d(BinaryComplexConv2d):
-    """
-    Train latent binary-complex weights with the exact hard pair-LUT forward.
-
-    The hard output is regenerated from the current weight signs. Backward
-    uses the identity-STE pair comparator, whose summed proxy is twice the
-    corresponding binary complex convolution.
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=3,
-        stride=1,
-        padding=0,
-        dilation=1,
-        groups=1,
-        bias=False,
-        per_channel=True,
-        weight_grad_mode="ste",
-        weight_proxy_mode="scaled_ste",
-        kernel_mode="auto",
-    ):
-        if not isinstance(kernel_size, int):
-            raise TypeError(
-                "AnalyticPairComparatorConv2d requires an integer kernel_size"
-            )
-        if dilation != 1:
-            raise ValueError(
-                "AnalyticPairComparatorConv2d currently supports dilation=1"
-            )
-        if groups != 1:
-            raise ValueError(
-                "AnalyticPairComparatorConv2d currently supports groups=1"
-            )
-        if bias:
-            raise ValueError(
-                "AnalyticPairComparatorConv2d does not use convolution bias"
-            )
-        super().__init__(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=False,
-            per_channel=per_channel,
-            weight_grad_mode=weight_grad_mode,
-            weight_proxy_mode=weight_proxy_mode,
-        )
-        self.pair_lut = PairLUTNeuronConv2d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=False,
-            per_channel=per_channel,
-            training_mode="real_compatible",
-            kernel_mode=kernel_mode,
-            trainable_entries=False,
-        )
-        self.pair_lut.hard_ratio.fill_(1.0)
-
-    @staticmethod
-    def _hard_identity(value):
-        hard = torch.where(
-            value >= 0.0,
-            torch.ones_like(value),
-            -torch.ones_like(value),
-        )
-        return value + (hard - value).detach()
-
-    def _binary_weight_proxy(self):
-        weight_r = self.conv_r.weight
-        weight_i = self.conv_i.weight
-        complex_weight = torch.complex(weight_r, weight_i)
-        if self.weight_proxy_mode == "bireal":
-            proxy = complex_binary_weight(
-                complex_weight,
-                per_channel=self.per_channel,
-                grad_mode=self.weight_grad_mode,
-                proxy_mode="bireal",
-            )
-            return proxy.real, proxy.imag
-        alpha = binary_scale_weight_complex(
-            complex_weight,
-            per_channel=self.per_channel,
-        )
-        proxy_r = binary_sign(
-            weight_r,
-            grad_mode=self.weight_grad_mode,
-        )
-        proxy_i = binary_sign(
-            weight_i,
-            grad_mode=self.weight_grad_mode,
-        )
-        hard_r = torch.where(
-            weight_r >= 0.0,
-            torch.ones_like(weight_r),
-            -torch.ones_like(weight_r),
-        )
-        hard_i = torch.where(
-            weight_i >= 0.0,
-            torch.ones_like(weight_i),
-            -torch.ones_like(weight_i),
-        )
-        signed_r = proxy_r + (hard_r - proxy_r).detach()
-        signed_i = proxy_i + (hard_i - proxy_i).detach()
-        return signed_r * alpha, signed_i * alpha
-
-    def _identity_comparator_proxy(self, inp):
-        input_r = self._hard_identity(inp.real)
-        input_i = self._hard_identity(inp.imag)
-        if self.padding:
-            padding = (self.padding,) * 4
-            input_r = F.pad(input_r, padding, value=-1.0)
-            input_i = F.pad(input_i, padding, value=-1.0)
-
-        weight_r, weight_i = self._binary_weight_proxy()
-        conv_kwargs = {
-            "stride": self.stride,
-            "padding": 0,
-            "dilation": self.dilation,
-            "groups": self.groups,
-        }
-        output_r = F.conv2d(input_r, weight_r, **conv_kwargs)
-        output_r = output_r - F.conv2d(input_i, weight_i, **conv_kwargs)
-        output_i = F.conv2d(input_r, weight_i, **conv_kwargs)
-        output_i = output_i + F.conv2d(input_i, weight_r, **conv_kwargs)
-        return 2.0 * torch.complex(output_r, output_i)
-
-    def forward(self, inp):
-        with torch.no_grad():
-            self.pair_lut.initialize_from_phase2_weights(
-                self.conv_r.weight,
-                self.conv_i.weight,
-            )
-            hard_output = self.pair_lut(inp)
-        proxy_output = self._identity_comparator_proxy(inp)
-        return _HardForwardProxyBackward.apply(hard_output, proxy_output)
-
-
-# =====================================================================
-# 3. 终极硬件感知复数 LUT 卷积层 (5-Phase Architecture)
-# =====================================================================
-class ComplexLUTConv2d(Module):
-    """
-    Phase 3: LUT-Aware BNN (真值表固定，仅用 STE 训练空间权重)
-    Phase 4: Joint Annealing (真值表解锁退火，空间权重继续 STE)
-    Phase 5: Hard Binary (物理部署，全二值纯逻辑门运行)
-
-    lut_sets controls how many independently learnable real/imag LUT pairs are
-    available when LUT allocation is layer-level. With channel-level allocation,
-    lut_sets_per_channel controls how many LUT pairs each output channel owns,
-    so the physical LUT count is out_channels * lut_sets_per_channel.
-    """
-    def __init__(
-        self, in_channels, out_channels, kernel_size=3, stride=1, padding=1,
-        groups=1, phase=3, lut_sets=1, lut_allocation="layer", lut_sets_per_channel=1
-    ):
-        super().__init__()
-        if lut_sets < 1:
-            raise ValueError("lut_sets must be at least 1")
-        if lut_sets_per_channel < 1:
-            raise ValueError("lut_sets_per_channel must be at least 1")
-        if lut_allocation not in ("layer", "channel"):
-            raise ValueError("lut_allocation must be 'layer' or 'channel'")
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.groups = groups
-        self.phase = phase
-        self.lut_allocation = lut_allocation
-        self.layer_lut_sets = lut_sets
-        self.lut_sets_per_channel = lut_sets_per_channel
-        self.lut_sets = lut_sets if lut_allocation == "layer" else out_channels * lut_sets_per_channel
-        
-        # 折叠魔法：16状态LUT吸收固定权重后，底层CUDA内核只需处理 K=2
-        self.LUT_K = 2 
-        self.lut_num = in_channels * kernel_size * kernel_size // groups
-
-        # ---------------------------------------------------------------------
-        # A. 经典复数空间权重 (潜权重 Logits)
-        # ---------------------------------------------------------------------
-        self.weight_r = Parameter(torch.Tensor(out_channels, in_channels // groups, kernel_size, kernel_size))
-        self.weight_i = Parameter(torch.Tensor(out_channels, in_channels // groups, kernel_size, kernel_size))
-        nn.init.kaiming_uniform_(self.weight_r, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.weight_i, a=math.sqrt(5))
-
-        # ---------------------------------------------------------------------
-        # B. 可配置分配粒度的 LUT (转换为 Logits)
-        # ---------------------------------------------------------------------
-        # 标准复数乘法的布尔逻辑 (16种状态)
-        init_lut_r = torch.tensor([1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 1, 1], dtype=torch.float32)
-        init_lut_i = torch.tensor([1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1], dtype=torch.float32)
-
-        # 🌟 将 0/1 映射为极端的 Logits (-5.0 和 5.0)，保证退火初期的绝对记忆
-        logit_lut_r = torch.where(init_lut_r == 1, 5.0, -5.0)
-        logit_lut_i = torch.where(init_lut_i == 1, 5.0, -5.0)
-
-        self.lut_r = Parameter(logit_lut_r.repeat(self.lut_sets, 1))
-        self.lut_i = Parameter(logit_lut_i.repeat(self.lut_sets, 1))
-
-        # 只有在 Phase 4 (联合优化) 时，LUT 才是可学习的参数
-        if self.phase != 4:
-            self.lut_r.requires_grad = False
-            self.lut_i.requires_grad = False
-
-        # ---------------------------------------------------------------------
-        # C. 预计算硬件寻址连接 (Hardware Offsets) & 状态寄存器
-        # ---------------------------------------------------------------------
-        conn_c = torch.arange(in_channels).repeat_interleave(kernel_size * kernel_size)
-        conn_dy = (torch.arange(kernel_size * kernel_size) // kernel_size).repeat(in_channels)
-        conn_dx = (torch.arange(kernel_size * kernel_size) % kernel_size).repeat(in_channels)
-
-        # 构建 K=2 交叉采样 (偶数取 X_r, 奇数取 X_i)
-        flat_c = torch.empty(self.lut_num * 2, dtype=torch.int32)
-        flat_c[0::2] = conn_c              
-        flat_c[1::2] = conn_c + in_channels 
-
-        flat_dy = torch.empty(self.lut_num * 2, dtype=torch.int32)
-        flat_dy[0::2], flat_dy[1::2] = conn_dy, conn_dy
-
-        flat_dx = torch.empty(self.lut_num * 2, dtype=torch.int32)
-        flat_dx[0::2], flat_dx[1::2] = conn_dx, conn_dx
-
-        self.register_buffer('flat_c', flat_c)
-        self.register_buffer('flat_dy', flat_dy)
-        self.register_buffer('flat_dx', flat_dx)
-        self.register_buffer('shifts', flat_c % 32)
-
-        if lut_allocation == "layer":
-            # Layer-level allocation: output channels share a fixed pool of LUT
-            # sets round-robin. This is the original multi-LUT behavior.
-            output_lut_set_ids = torch.arange(out_channels, dtype=torch.long) % lut_sets
-            lut_set_ids = output_lut_set_ids.unsqueeze(0).expand(self.lut_num, -1).clone()
-        else:
-            # Channel-level allocation: each output channel owns
-            # lut_sets_per_channel LUT sets. Within a channel, logical LUTs from
-            # different input/kernel positions use that channel-local pool
-            # round-robin.
-            channel_base = torch.arange(out_channels, dtype=torch.long).unsqueeze(0) * lut_sets_per_channel
-            channel_local_ids = (torch.arange(self.lut_num, dtype=torch.long) % lut_sets_per_channel).unsqueeze(1)
-            lut_set_ids = channel_base + channel_local_ids
-        self.register_buffer('lut_set_ids', lut_set_ids)
-        
-        # 退火超参数控制台
-        self.register_buffer("tau", torch.tensor(1.0))
-        self.register_buffer("hard", torch.tensor(0.0 if self.phase != 5 else 1.0))
-
-    def forward(self, inp):
-        x_r, x_i = inp.real, inp.imag
-        x_cat = torch.cat([x_r, x_i], dim=1) # [B, 2*in_C, H, W]
-        B, _, H, W = x_cat.shape
-        
-        padded_W = W + 2 * self.padding
-        packed_C = (2 * self.in_channels + 31) // 32
-        
-        # 动态计算绝对内存偏移 (支持任意分辨率输入)
-        offsets = (self.flat_dy * padded_W + self.flat_dx) * packed_C + (self.flat_c // 32)
-
-        complex_w = torch.complex(self.weight_r, self.weight_i)
-        alpha = binary_scale_weight_complex(complex_w, per_channel=True).view(1, -1, 1, 1)
-
-        # 展平空间权重 Logits
-        wr = self.weight_r.view(self.out_channels, self.lut_num).t() 
-        wi = self.weight_i.view(self.out_channels, self.lut_num).t()
-
-        current_tau = self.tau
-        is_hard = self.hard
-
-        if self.phase in [3, 4]:
-            # =================================================================
-            # Phase 3/4 核心：异构向前传播 (Heterogeneous Forward Pass)
-            # =================================================================
-            
-            # 1. 空间权重坚守阵地：原生纯二值化 + STE，保留前序特征提取能力
-            pr = SignWithSTE.apply(wr)
-            pi = SignWithSTE.apply(wi)
-            
-            # 由于 pr/pi 是纯 One-Hot (非0即1)，这里变成了纯粹的离散路由选择
-            p00 = (1 - pr) * (1 - pi)
-            p01 = (1 - pr) * pi
-            p10 = pr * (1 - pi)
-            p11 = pr * pi
-
-            # 2. 多组 LUT 探索空间：退火映射
-            L_r = binary_annealing(self.lut_r, tau=current_tau, hard=is_hard)
-            L_i = binary_annealing(self.lut_i, tau=current_tau, hard=is_hard)
-
-            # 3. 概率折叠：将 16 状态 LUT 吸纳权重，坍缩为 K=2 的 4 状态浮点表
-            selected_r = L_r[self.lut_set_ids]
-            selected_i = L_i[self.lut_set_ids]
-
-            v00_r = p00 * selected_r[..., 0] + p01 * selected_r[..., 1] + p10 * selected_r[..., 2] + p11 * selected_r[..., 3]
-            v01_r = p00 * selected_r[..., 4] + p01 * selected_r[..., 5] + p10 * selected_r[..., 6] + p11 * selected_r[..., 7]
-            v10_r = p00 * selected_r[..., 8] + p01 * selected_r[..., 9] + p10 * selected_r[..., 10] + p11 * selected_r[..., 11]
-            v11_r = p00 * selected_r[..., 12] + p01 * selected_r[..., 13] + p10 * selected_r[..., 14] + p11 * selected_r[..., 15]
-            w_folded_r = torch.stack([v00_r, v01_r, v10_r, v11_r], dim=1)
-
-            v00_i = p00 * selected_i[..., 0] + p01 * selected_i[..., 1] + p10 * selected_i[..., 2] + p11 * selected_i[..., 3]
-            v01_i = p00 * selected_i[..., 4] + p01 * selected_i[..., 5] + p10 * selected_i[..., 6] + p11 * selected_i[..., 7]
-            v10_i = p00 * selected_i[..., 8] + p01 * selected_i[..., 9] + p10 * selected_i[..., 10] + p11 * selected_i[..., 11]
-            v11_i = p00 * selected_i[..., 12] + p01 * selected_i[..., 13] + p10 * selected_i[..., 14] + p11 * selected_i[..., 15]
-            w_folded_i = torch.stack([v00_i, v01_i, v10_i, v11_i], dim=1)
-
-            # 上一层传递过来的激活是 [-1, 1]，映射为浮点多项式期望的 [0, 1] 概率
-            x_prob = (x_cat + 1.0) / 2.0
-            float_offsets = (self.flat_dy * padded_W + self.flat_dx) * (2 * self.in_channels) + self.flat_c
-            
-            # 交给底层的 C++ 极速浮点多线性插值引擎；offsets 决定每个 LUT 的 K 个输入连接。
-            out_r = LUTFloatingConvFunction.apply(x_prob, w_folded_r, float_offsets, self.groups, self.LUT_K, self.kernel_size, self.stride, self.padding)
-            out_i = LUTFloatingConvFunction.apply(x_prob, w_folded_i, float_offsets, self.groups, self.LUT_K, self.kernel_size, self.stride, self.padding)
-
-        else:
-            # =================================================================
-            # Phase 5: Hard Binary (物理部署，彻底转换为位运算)
-            # =================================================================
-            # 空间权重纯粹硬截断
-            wr_bit = (wr > 0).long()
-            wi_bit = (wi > 0).long()
-            base_idx = wr_bit * 2 + wi_bit
-            
-            # LUT 也进行硬截断
-            L_r_int = (self.lut_r >= 0).long()
-            L_i_int = (self.lut_i >= 0).long()
-
-            # 将被吸收后的 4状态 K=2 真值表打包为 int64 喂给底层
-            w_packed_r = (
-                (L_r_int[self.lut_set_ids, 12 + base_idx] << 3)
-                | (L_r_int[self.lut_set_ids, 8 + base_idx] << 2)
-                | (L_r_int[self.lut_set_ids, 4 + base_idx] << 1)
-                | L_r_int[self.lut_set_ids, base_idx]
-            )
-            w_packed_i = (
-                (L_i_int[self.lut_set_ids, 12 + base_idx] << 3)
-                | (L_i_int[self.lut_set_ids, 8 + base_idx] << 2)
-                | (L_i_int[self.lut_set_ids, 4 + base_idx] << 1)
-                | L_i_int[self.lut_set_ids, base_idx]
-            )
-
-            # 交给底层的 C++ __ballot_sync 按位同或并发位运算引擎
-            out_r = LUTBinaryConvFunction.apply(x_cat, w_packed_r, offsets, self.shifts, self.groups, self.LUT_K, self.stride, self.padding)
-            out_i = LUTBinaryConvFunction.apply(x_cat, w_packed_i, offsets, self.shifts, self.groups, self.LUT_K, self.stride, self.padding)
-
-        # 零震荡对齐，并恢复 phase3 中使用的复数权重缩放因子。
-        out_r = (out_r - (self.lut_num / 2.0)) * 4.0 * alpha
-        out_i = (out_i - (self.lut_num / 2.0)) * 4.0 * alpha
-
-        return torch.complex(out_r, out_i)
+        return (f"in_channels={self.in_channels}, out_channels={self.out_channels}, "
+                f"kernel_size={self.kernel_size}, groups={self.groups}, lut_num={self.lut_num}")
 
 class LUTBinaryConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, group_num=1, init_cfg=[-1, 0.1, 1, 0.1]):
@@ -1988,55 +1156,67 @@ class LUTBinaryConv2d(nn.Module):
         self.stride = stride
         self.padding = padding
 
-        self.lut_num = (in_channels // group_num) * kernel_size * kernel_size // 6
-        
-        self.weight = nn.Parameter(torch.randn(self.lut_num, 64, out_channels))
+        if in_channels % group_num:
+            raise ValueError("in_channels must be divisible by group_num")
+        if out_channels % group_num:
+            raise ValueError("out_channels must be divisible by group_num")
+
+        self.logical_positions = (
+            (in_channels // group_num) * kernel_size * kernel_size
+        )
+        self.lut_num = math.ceil(self.logical_positions / 6)
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, self.lut_num, 64)
+        )
         bimodal_initialization(self.weight, init_cfg=init_cfg)
 
-        self.register_buffer('offsets', None)
-        self.register_buffer('shifts', None)
-        self.offsets_padded_W = -1 
-
-    def _precompute_offsets(self, device, padded_W):
-        packed_C = (self.in_channels + 31) // 32
-        ic_per_g = self.in_channels // self.groups
-        K_sq = self.K * self.K
-        
-        l = torch.arange(self.lut_num, device=device).unsqueeze(1)
-        i = torch.arange(6, device=device).unsqueeze(0)
-        
-        group_id = (l * self.groups) // self.lut_num 
-        ic_start = group_id * ic_per_g
-        
-        initial_idx = (l * 6 + i) % (ic_per_g * K_sq)
-        ic = ic_start + (initial_idx // K_sq)
-        sp = initial_idx % K_sq
-        
-        dy = sp // self.K
-        dx = sp % self.K
-        c_word = ic // 32
-        c_shift = ic % 32
-        
-        abs_offset = (dy * padded_W + dx) * packed_C + c_word
-        
-        self.offsets = abs_offset.flatten().to(torch.int32)
-        self.shifts = c_shift.flatten().to(torch.int32)
-
     def forward(self, x):
-        padded_W = x.shape[3] + 2 * self.padding
-        if self.offsets is None or self.offsets_padded_W != padded_W:
-            self._precompute_offsets(x.device, padded_W)
-            self.offsets_padded_W = padded_W
+        x = F.pad(
+            x,
+            (self.padding, self.padding, self.padding, self.padding),
+        )
+        batch_size, _, padded_h, padded_w = x.shape
+        out_h = (padded_h - self.K) // self.stride + 1
+        out_w = (padded_w - self.K) // self.stride + 1
 
-        w_q = binary_gumbel_softmax(self.weight, tau=1, hard=True)
-
-        return LUTBinaryConvFunction.apply(
-            x, w_q, 
-            self.offsets, self.shifts, 
-            self.groups, self.K, self.stride, self.padding
+        patches = x.unfold(2, self.K, self.stride).unfold(
+            3,
+            self.K,
+            self.stride,
+        )
+        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+        patches = patches.view(
+            batch_size,
+            out_h * out_w,
+            self.groups,
+            self.logical_positions,
         )
 
-class BinaryLUTComplexConv2d(Module):
+        total_positions = self.lut_num * 6
+        repeats = (total_positions - 1) // self.logical_positions + 1
+        patches = patches.repeat(1, 1, 1, repeats)[..., :total_positions]
+        patches = patches.view(
+            batch_size,
+            out_h * out_w,
+            self.groups,
+            self.lut_num,
+            6,
+        )
+
+        w_q = binary_gumbel_softmax(self.weight, tau=1, hard=True)
+        output = LUT6Function.apply(
+            patches.contiguous(),
+            w_q.contiguous(),
+            self.groups,
+        )
+        output = output.sum(dim=-1).permute(0, 2, 1).contiguous()
+        return output.view(batch_size, self.out_channels, out_h, out_w)
+
+
+class PairLUT4ComplexConv2d(Module):
+    """Map grouped binary complex activations through two LUT4/LUT6 banks."""
+
     def __init__(
         self,
         in_channels,
@@ -2045,58 +1225,679 @@ class BinaryLUTComplexConv2d(Module):
         stride=1,
         padding=0,
         dilation=1,
-        groups=1,
-        bias=True,
-        per_channel=True,
-        weight_grad_mode="ste",
-        weight_proxy_mode="scaled_ste",
+        init_cfg=(-1.0, 0.1, 1.0, 0.1),
+        parameterization="independent",
+        categorical_temperature=1.0,
+        lut_inputs=4,
+        activation_encoding="standard",
+        dominance_grad_mode="stop",
+        dominance_ste_margin=1.0,
     ):
         super().__init__()
-        if weight_proxy_mode not in ("scaled_ste", "bireal"):
+        if not isinstance(kernel_size, int):
+            raise TypeError("PairLUT4ComplexConv2d requires an integer kernel_size")
+        if dilation != 1:
+            raise ValueError("PairLUT4ComplexConv2d currently supports dilation=1")
+        if parameterization not in (
+            "independent",
+            "categorical",
+            "categorical_residual",
+        ):
             raise ValueError(
-                "Unknown binary-weight proxy mode: {}".format(
-                    weight_proxy_mode
+                "Unknown PairLUT4 parameterization: {}".format(parameterization)
+            )
+        if categorical_temperature <= 0:
+            raise ValueError("categorical_temperature must be positive")
+        if lut_inputs not in (4, 6):
+            raise ValueError("PairLUT4 lut_inputs must be 4 or 6")
+        if activation_encoding not in ("standard", "dominance"):
+            raise ValueError(
+                "Unknown PairLUT4 activation encoding: {}".format(
+                    activation_encoding
                 )
             )
-        self.conv_r = Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            group_num=groups,
+        if activation_encoding == "dominance":
+            if lut_inputs != 6:
+                raise ValueError("Dominance encoding requires lut_inputs=6")
+            if parameterization not in (
+                "categorical",
+                "categorical_residual",
+            ):
+                raise ValueError(
+                    "Dominance encoding requires categorical parameterization"
+                )
+        if parameterization == "categorical_residual" and (
+            activation_encoding != "dominance" or lut_inputs != 6
+        ):
+            raise ValueError(
+                "Categorical residual parameterizations require dominance LUT6"
+            )
+        if dominance_ste_margin <= 0:
+            raise ValueError("dominance_ste_margin must be positive")
+        if dominance_grad_mode not in ("stop", "ste"):
+            raise ValueError(
+                "Unknown dominance gradient mode: {}".format(
+                    dominance_grad_mode
+                )
+            )
+
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.kernel_size = int(kernel_size)
+        self.stride = int(stride)
+        self.padding = int(padding)
+        self.parameterization = parameterization
+        self.categorical_temperature = float(categorical_temperature)
+        self.lut_inputs = int(lut_inputs)
+        self.activation_encoding = activation_encoding
+        self.dominance_ste_margin = float(dominance_ste_margin)
+        self.dominance_grad_mode = dominance_grad_mode
+        self.LUT_INPUTS = self.lut_inputs
+        self.complex_inputs_per_lut = (
+            2 if self.activation_encoding == "dominance" else self.lut_inputs // 2
         )
-        self.conv_i = Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            group_num=groups,
+        self.table_size = 1 << self.lut_inputs
+        self.logical_positions = (
+            self.in_channels * self.kernel_size * self.kernel_size
         )
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
-        self.per_channel = per_channel
-        self.weight_grad_mode = weight_grad_mode
-        self.weight_proxy_mode = weight_proxy_mode
+        self.group_num = math.ceil(
+            self.logical_positions / self.complex_inputs_per_lut
+        )
+        self.pair_num = self.group_num
+
+        if self.parameterization == "independent":
+            self.weight = nn.Parameter(
+                torch.empty(
+                    2 * self.out_channels,
+                    self.group_num,
+                    self.table_size,
+                )
+            )
+            bimodal_initialization(self.weight, init_cfg=init_cfg)
+        elif self.parameterization == "categorical":
+            self.weight = nn.Parameter(
+                torch.empty(
+                    self.out_channels,
+                    self.group_num,
+                    self.table_size,
+                    4,
+                )
+            )
+            nn.init.normal_(self.weight, mean=0.0, std=0.01)
+        else:
+            self.weight = nn.Parameter(
+                torch.zeros(
+                    self.out_channels,
+                    self.group_num,
+                    self.table_size,
+                    4,
+                )
+            )
+            self.register_buffer(
+                "dominance_base",
+                torch.zeros(self.out_channels, self.group_num, 16, 4),
+            )
+            self.register_buffer(
+                "dominance_residual_alpha",
+                torch.tensor(0.1, dtype=torch.float32),
+            )
+
+        state_ids = torch.arange(self.table_size, dtype=torch.long)
+        state_bits = torch.stack(
+            [
+                ((state_ids >> shift) & 1).to(torch.float32)
+                for shift in reversed(range(self.lut_inputs))
+            ],
+            dim=-1,
+        )
+        self.register_buffer("state_bits", state_bits)
+        if self.parameterization == "categorical_residual":
+            old_addresses = (
+                state_bits[:, 0].long() * 8
+                + state_bits[:, 1].long() * 4
+                + state_bits[:, 3].long() * 2
+                + state_bits[:, 4].long()
+            )
+            self.register_buffer("dominance_old_addresses", old_addresses)
+            self.register_buffer(
+                "dominance_assignment",
+                F.one_hot(old_addresses, num_classes=16).to(torch.float32),
+            )
+        self.register_buffer(
+            "output_codebook",
+            torch.tensor(
+                [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+            ),
+        )
+
+    @torch.no_grad()
+    def initialize_from_binary_complex_weights(
+        self,
+        weight_real,
+        weight_imag,
+        logit_magnitude=1.0,
+    ):
+        """Compile Phase 2 binary complex weights into hard LUT categories."""
+        if self.activation_encoding != "standard":
+            raise RuntimeError(
+                "Dominance LUT6 tables must keep their random initialization"
+            )
+        expected_shape = (
+            self.out_channels,
+            self.in_channels,
+            self.kernel_size,
+            self.kernel_size,
+        )
+        if tuple(weight_real.shape) != expected_shape:
+            raise ValueError(
+                "Unexpected real-weight shape {}; expected {}".format(
+                    tuple(weight_real.shape), expected_shape
+                )
+            )
+        if tuple(weight_imag.shape) != expected_shape:
+            raise ValueError(
+                "Unexpected imaginary-weight shape {}; expected {}".format(
+                    tuple(weight_imag.shape), expected_shape
+                )
+            )
+        if logit_magnitude <= 0:
+            raise ValueError("logit_magnitude must be positive")
+
+        device = self.weight.device
+        dtype = self.weight.dtype
+        weight_real = weight_real.to(device=device, dtype=dtype).sign()
+        weight_imag = weight_imag.to(device=device, dtype=dtype).sign()
+
+        group_ids = torch.arange(self.group_num, device=device).unsqueeze(1)
+        offsets = torch.arange(
+            self.complex_inputs_per_lut, device=device
+        ).unsqueeze(0)
+        positions = group_ids * self.complex_inputs_per_lut + offsets
+        valid = positions < self.logical_positions
+        positions = positions.remainder(self.logical_positions)
+        kernel_area = self.kernel_size * self.kernel_size
+        channels = torch.div(positions, kernel_area, rounding_mode="floor")
+        spatial = positions.remainder(kernel_area)
+        kernel_y = torch.div(
+            spatial, self.kernel_size, rounding_mode="floor"
+        )
+        kernel_x = spatial.remainder(self.kernel_size)
+
+        wr = weight_real[:, channels, kernel_y, kernel_x]
+        wi = weight_imag[:, channels, kernel_y, kernel_x]
+        valid = valid.to(dtype=dtype).unsqueeze(0)
+        wr = wr * valid
+        wi = wi * valid
+
+        signed_states = self.state_bits.to(device=device, dtype=dtype) * 2.0 - 1.0
+        states = signed_states.view(
+            self.table_size,
+            self.complex_inputs_per_lut,
+            2,
+        )
+        xr = states[..., 0].view(
+            1, 1, self.table_size, self.complex_inputs_per_lut
+        )
+        xi = states[..., 1].view(
+            1, 1, self.table_size, self.complex_inputs_per_lut
+        )
+        wr = wr.unsqueeze(2)
+        wi = wi.unsqueeze(2)
+        output_real = (xr * wr - xi * wi).sum(dim=-1)
+        output_imag = (xi * wr + xr * wi).sum(dim=-1)
+
+        real_bits = output_real >= 0.0
+        imag_bits = output_imag >= 0.0
+        if self.parameterization == "independent":
+            magnitude = self.weight.new_tensor(float(logit_magnitude))
+            real_logits = torch.where(real_bits, magnitude, -magnitude)
+            imag_logits = torch.where(imag_bits, magnitude, -magnitude)
+            self.weight[: self.out_channels].copy_(real_logits)
+            self.weight[self.out_channels :].copy_(imag_logits)
+        else:
+            target_classes = 2 * real_bits.long() + imag_bits.long()
+            self.weight.zero_()
+            self.weight.scatter_(
+                dim=-1,
+                index=target_classes.unsqueeze(-1),
+                value=0.25,
+            )
+
+    def _dominance_bit(self, source):
+        # delta = source.real.abs() - source.imag.abs()
+        delta = torch.sign(source.imag)*source.real - torch.sign(source.real)*source.imag
+        hard = (delta >= 0.0).to(delta.dtype)
+        if self.dominance_grad_mode == "stop":
+            return hard.detach()
+        delta = binary_gumbel_softmax(delta, tau=1, hard=True)
+        return delta
+
+    def _group_patches(self, inp, dominance_source=None):
+        real = F.unfold(
+            inp.real,
+            kernel_size=self.kernel_size,
+            dilation=1,
+            padding=self.padding,
+            stride=self.stride,
+        )
+        imag = F.unfold(
+            inp.imag,
+            kernel_size=self.kernel_size,
+            dilation=1,
+            padding=self.padding,
+            stride=self.stride,
+        )
+        batch_size, _, locations = real.shape
+        if self.activation_encoding == "dominance":
+            if dominance_source is None:
+                raise ValueError(
+                    "Dominance encoding requires the pre-binary activation"
+                )
+            if not torch.is_complex(dominance_source):
+                raise TypeError("dominance_source must be complex")
+            if dominance_source.shape != inp.shape:
+                raise ValueError(
+                    "dominance_source shape {} does not match input {}".format(
+                        tuple(dominance_source.shape), tuple(inp.shape)
+                    )
+                )
+            dominance = F.unfold(
+                self._dominance_bit(dominance_source),
+                kernel_size=self.kernel_size,
+                dilation=1,
+                padding=self.padding,
+                stride=self.stride,
+            )
+            values = torch.stack((real, imag, dominance), dim=-1)
+        else:
+            values = torch.stack((real, imag), dim=-1)
+        values = values.permute(0, 2, 1, 3).contiguous()
+        remainder = self.logical_positions % self.complex_inputs_per_lut
+        if remainder:
+            padding = self.complex_inputs_per_lut - remainder
+            values = torch.cat((values, values[:, :, :padding, :]), dim=2)
+        return values.view(
+            batch_size,
+            locations,
+            self.group_num,
+            self.lut_inputs,
+        )
+
+    def _pair_patches(self, inp, dominance_source=None):
+        """Backward-compatible name for the generalized LUT input grouping."""
+        return self._group_patches(inp, dominance_source=dominance_source)
+
+    def set_dominance_residual_alpha(self, alpha):
+        if self.parameterization != "categorical_residual":
+            return
+        self.dominance_residual_alpha.fill_(float(alpha))
+
+    def _categorical_logits(self):
+        if self.parameterization != "categorical_residual":
+            return self.weight
+        addresses = self.dominance_old_addresses
+        expanded_base = self.dominance_base.index_select(2, addresses)
+        assignment = self.dominance_assignment.to(self.weight.dtype)
+        residual_mean = torch.einsum(
+            "ogsc,sa->ogac", self.weight, assignment
+        ) / 4.0
+        centered_residual = self.weight - residual_mean.index_select(
+            2, addresses
+        )
+        return expanded_base + self.dominance_residual_alpha * centered_residual
+
+    def _categorical_table(self):
+        probabilities = F.softmax(
+            self._categorical_logits() / self.categorical_temperature,
+            dim=-1,
+        )
+        hard_selection = F.one_hot(
+            probabilities.argmax(dim=-1),
+            num_classes=4,
+        ).to(probabilities.dtype)
+        selection = probabilities + (hard_selection - probabilities).detach()
+        table = torch.matmul(selection, self.output_codebook)
+        return table.permute(3, 0, 1, 2).reshape(
+            2 * self.out_channels,
+            self.group_num,
+            self.table_size,
+        )
+
+    def materialize_table(self):
+        """Return the two hard LUT banks with the configured STE proxy."""
+        if self.parameterization == "independent":
+            return hard_binary_table(self.weight)
+        return self._categorical_table()
+
+    def _reference_forward(self, patches, table):
+        bits = self.state_bits.to(device=patches.device, dtype=patches.dtype)
+        basis = torch.where(
+            bits.view(
+                1, 1, 1, self.table_size, self.lut_inputs
+            ) > 0.5,
+            patches.unsqueeze(-2),
+            1.0 - patches.unsqueeze(-2),
+        ).prod(dim=-1)
+        return torch.einsum("brps,ops->brop", basis, table).sum(dim=-1)
+
+    @staticmethod
+    def _expand_lut4_for_lut6(table):
+        return table.unsqueeze(-1).expand(-1, -1, -1, 4).reshape(
+            table.size(0),
+            table.size(1),
+            64,
+        )
+
+    def forward(self, inp, dominance_source=None):
+        if not torch.is_complex(inp):
+            raise TypeError("PairLUT4ComplexConv2d requires a complex input")
+        patches = self._group_patches(
+            inp,
+            dominance_source=dominance_source,
+        )
+        table = self.materialize_table()
+
+        if patches.is_cuda:
+            if self.lut_inputs == 4:
+                dummy = patches.new_zeros(*patches.shape[:-1], 2)
+                lut6_inputs = torch.cat((patches, dummy), dim=-1)
+                lut6_table = self._expand_lut4_for_lut6(table)
+            else:
+                lut6_inputs = patches
+                lut6_table = table
+            output = LUT6Function.apply(
+                lut6_inputs.unsqueeze(2).contiguous(),
+                lut6_table.contiguous(),
+                1,
+            ).sum(dim=-1)
+        else:
+            output = self._reference_forward(patches, table)
+
+        output = output.permute(0, 2, 1).contiguous()
+        output_r, output_i = output.split(self.out_channels, dim=1)
+        out_h = (
+            inp.size(2) + 2 * self.padding - self.kernel_size
+        ) // self.stride + 1
+        out_w = (
+            inp.size(3) + 2 * self.padding - self.kernel_size
+        ) // self.stride + 1
+        return torch.complex(
+            output_r.view(inp.size(0), self.out_channels, out_h, out_w),
+            output_i.view(inp.size(0), self.out_channels, out_h, out_w),
+        )
+
+    def extra_repr(self):
+        return (
+            "in_channels={}, out_channels={}, kernel_size={}, stride={}, "
+            "padding={}, groups={}, lut_inputs={}, parameterization={}, "
+            "activation_encoding={}"
+        ).format(
+            self.in_channels,
+            self.out_channels,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.group_num,
+            self.lut_inputs,
+            self.parameterization,
+            self.activation_encoding,
+        )
+
+
+class TripleLUT6ComplexConv2d(Module):
+    """Map triples of binary complex activations through real/imag LUT6s."""
+
+    LUT_INPUTS = 6
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        dilation=1,
+        init_cfg=(-1.0, 0.1, 1.0, 0.1),
+    ):
+        super().__init__()
+        if not isinstance(kernel_size, int):
+            raise TypeError(
+                "TripleLUT6ComplexConv2d requires an integer kernel_size"
+            )
+        if dilation != 1:
+            raise ValueError(
+                "TripleLUT6ComplexConv2d currently supports dilation=1"
+            )
+
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.kernel_size = int(kernel_size)
+        self.stride = int(stride)
+        self.padding = int(padding)
+        self.groups_per_position = math.ceil(self.in_channels / 3)
+        self.lut_num = (
+            self.kernel_size
+            * self.kernel_size
+            * self.groups_per_position
+        )
+
+        # The first out_channels tables produce real bits; the remainder
+        # produce imaginary bits.
+        self.weight = nn.Parameter(
+            torch.empty(2 * self.out_channels, self.lut_num, 64)
+        )
+        bimodal_initialization(self.weight, init_cfg=init_cfg)
+
+        state_ids = torch.arange(64, dtype=torch.long)
+        state_bits = torch.stack(
+            [
+                ((state_ids >> shift) & 1).to(torch.float32)
+                for shift in (5, 4, 3, 2, 1, 0)
+            ],
+            dim=-1,
+        )
+        self.register_buffer("state_bits", state_bits)
+
+    @torch.no_grad()
+    def initialize_from_binary_complex_weights(
+        self,
+        weight_real,
+        weight_imag,
+        logit_magnitude=1.0,
+    ):
+        """Compile a Phase 2 binary complex convolution into LUT4 tables."""
+        expected_shape = (
+            self.out_channels,
+            self.in_channels,
+            self.kernel_size,
+            self.kernel_size,
+        )
+        if tuple(weight_real.shape) != expected_shape:
+            raise ValueError(
+                "Unexpected real-weight shape {}; expected {}".format(
+                    tuple(weight_real.shape), expected_shape
+                )
+            )
+        if tuple(weight_imag.shape) != expected_shape:
+            raise ValueError(
+                "Unexpected imaginary-weight shape {}; expected {}".format(
+                    tuple(weight_imag.shape), expected_shape
+                )
+            )
+        if logit_magnitude <= 0:
+            raise ValueError("logit_magnitude must be positive")
+
+        device = self.weight.device
+        dtype = self.weight.dtype
+        weight_real = weight_real.to(device=device, dtype=dtype).sign()
+        weight_imag = weight_imag.to(device=device, dtype=dtype).sign()
+
+        pair_ids = torch.arange(self.pair_num, device=device)
+        spatial_ids = torch.div(
+            pair_ids,
+            self.pairs_per_position,
+            rounding_mode="floor",
+        )
+        pair_slots = pair_ids.remainder(self.pairs_per_position)
+        channel0 = 2 * pair_slots
+        channel1 = channel0 + 1
+        channel1_valid = channel1 < self.in_channels
+        channel1 = channel1.clamp(max=self.in_channels - 1)
+        kernel_y = torch.div(
+            spatial_ids,
+            self.kernel_size,
+            rounding_mode="floor",
+        )
+        kernel_x = spatial_ids.remainder(self.kernel_size)
+
+        wr0 = weight_real[:, channel0, kernel_y, kernel_x]
+        wi0 = weight_imag[:, channel0, kernel_y, kernel_x]
+        wr1 = weight_real[:, channel1, kernel_y, kernel_x]
+        wi1 = weight_imag[:, channel1, kernel_y, kernel_x]
+        valid = channel1_valid.to(dtype=dtype).unsqueeze(0)
+        wr1 = wr1 * valid
+        wi1 = wi1 * valid
+
+        signed_states = self.state_bits.to(device=device, dtype=dtype) * 2.0 - 1.0
+        xr0, xi0, xr1, xi1 = (
+            component.view(1, 1, 16)
+            for component in signed_states.unbind(dim=-1)
+        )
+        wr0, wi0, wr1, wi1 = (
+            component.unsqueeze(-1)
+            for component in (wr0, wi0, wr1, wi1)
+        )
+        output_real = xr0 * wr0 - xi0 * wi0 + xr1 * wr1 - xi1 * wi1
+        output_imag = xi0 * wr0 + xr0 * wi0 + xi1 * wr1 + xr1 * wi1
+
+        magnitude = self.weight.new_tensor(float(logit_magnitude))
+        real_logits = torch.where(output_real >= 0.0, magnitude, -magnitude)
+        imag_logits = torch.where(output_imag >= 0.0, magnitude, -magnitude)
+        self.weight[: self.out_channels].copy_(real_logits)
+        self.weight[self.out_channels :].copy_(imag_logits)
+
+    def _triple_patches(self, inp):
+        real = F.unfold(
+            inp.real,
+            kernel_size=self.kernel_size,
+            dilation=1,
+            padding=self.padding,
+            stride=self.stride,
+        )
+        imag = F.unfold(
+            inp.imag,
+            kernel_size=self.kernel_size,
+            dilation=1,
+            padding=self.padding,
+            stride=self.stride,
+        )
+        batch_size, _, locations = real.shape
+        kernel_area = self.kernel_size * self.kernel_size
+        real = real.view(
+            batch_size,
+            self.in_channels,
+            kernel_area,
+            locations,
+        ).permute(0, 3, 2, 1)
+        imag = imag.view(
+            batch_size,
+            self.in_channels,
+            kernel_area,
+            locations,
+        ).permute(0, 3, 2, 1)
+        values = torch.stack((real, imag), dim=-1).contiguous()
+
+        tail = (-self.in_channels) % 3
+        if tail:
+            values = torch.cat((values, values[:, :, :, :tail, :]), dim=3)
+        return values.view(batch_size, locations, self.lut_num, 6)
+
+    def _reference_forward(self, patches, table):
+        bits = self.state_bits.to(device=patches.device, dtype=patches.dtype)
+        basis = torch.where(
+            bits.view(1, 1, 1, 64, 6) > 0.5,
+            patches.unsqueeze(-2),
+            1.0 - patches.unsqueeze(-2),
+        ).prod(dim=-1)
+        return torch.einsum("brls,ols->brol", basis, table).sum(dim=-1)
 
     def forward(self, inp):
-        weight = torch.complex(self.conv_r.weight, self.conv_i.weight)
-        weight = complex_binary_weight(
-            weight,
-            per_channel=self.per_channel,
-            grad_mode=self.weight_grad_mode,
-            proxy_mode=self.weight_proxy_mode,
+        if not torch.is_complex(inp):
+            raise TypeError("TripleLUT6ComplexConv2d requires a complex input")
+        patches = self._triple_patches(inp)
+        table = hard_binary_table(self.weight)
+
+        if patches.is_cuda:
+            lut6_inputs = patches.unsqueeze(2)
+            output = LUT6Function.apply(
+                lut6_inputs.contiguous(),
+                table.contiguous(),
+                1,
+            ).sum(dim=-1)
+        else:
+            output = self._reference_forward(patches, table)
+
+        output = output.permute(0, 2, 1).contiguous()
+        output_r, output_i = output.split(self.out_channels, dim=1)
+        out_h = (
+            inp.size(2) + 2 * self.padding - self.kernel_size
+        ) // self.stride + 1
+        out_w = (
+            inp.size(3) + 2 * self.padding - self.kernel_size
+        ) // self.stride + 1
+        return torch.complex(
+            output_r.view(inp.size(0), self.out_channels, out_h, out_w),
+            output_i.view(inp.size(0), self.out_channels, out_h, out_w),
         )
-        w_r = weight.real
-        w_i = weight.imag
 
-        real = self.conv_r(inp.real)
-        real = real - self.conv_i(inp.imag)
+    def extra_repr(self):
+        return (
+            "in_channels={}, out_channels={}, kernel_size={}, stride={}, "
+            "padding={}, lut_num={}"
+        ).format(
+            self.in_channels,
+            self.out_channels,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.lut_num,
+        )
 
-        imag = self.conv_r(inp.imag)
-        imag = imag + self.conv_i(inp.real)
 
-        return torch.complex(real, imag)
+class TwoLUTComplexConv2d(Module):
+    """Complex convolution with shared real- and imaginary-weight LUTConvs."""
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        dilation=1,
+        group_num=1,
+        init_cfg=(-1.0, 0.1, 1.0, 0.1),
+    ):
+        super().__init__()
+        if dilation != 1:
+            raise ValueError("TwoLUTComplexConv2d currently supports dilation=1")
+        branch_kwargs = {
+            "in_channels": in_channels,
+            "out_channels": out_channels,
+            "kernel_size": kernel_size,
+            "stride": stride,
+            "padding": padding,
+            "group_num": group_num,
+            "init_cfg": init_cfg,
+        }
+        self.conv_r = LUTBinaryConv2d(**branch_kwargs)
+        self.conv_i = LUTBinaryConv2d(**branch_kwargs)
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, inp):
+        rr = self.conv_r(inp.real)
+        ii = self.conv_i(inp.imag)
+        ri = self.conv_r(inp.imag)
+        ir = self.conv_i(inp.real)
+        return torch.complex(rr - ii, ri + ir)

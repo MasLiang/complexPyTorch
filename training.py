@@ -26,15 +26,21 @@ from complexPyTorch.complexBinaryResNet import (
     BinaryComplexResNet,
 )
 from complexPyTorch.complexLayers import (
+    BinaryComplexBitActivation,
     BinaryComplexConv2d,
-    PairLUTNeuronConv2d,
+    ComplexBatchNorm2d,
+    LUTBinaryConv2d,
+    NaiveComplexBatchNorm2d,
+    PairLUT4ComplexConv2d,
+    TripleLUT6ComplexConv2d,
+    TwoLUTComplexConv2d,
 )
 
 
 PHASE_DESCRIPTIONS = {
     1: "full-precision BiReal",
-    2: "binary BiReal",
-    3: "pair-LUT neuron network",
+    2: "complex BiReal",
+    3: "complex BiReal with 0/1 activation bits and configurable LUT convolution",
 }
 PHASE_CHECKPOINT_TEMPLATE = "Bestmodel_phase{}.pt"
 LAST_CHECKPOINT_TEMPLATE = "Lastmodel_phase{}.pt"
@@ -210,22 +216,195 @@ def load_phase_checkpoint(
     return checkpoint
 
 
-def initialize_phase3_from_phase2(
+def _load_dominance_lut6_warm_start(
     model,
+    checkpoint,
     checkpoint_path,
-    device="cpu",
-    logit_init=1.0,
 ):
-    """Replace each Phase 2 binary spatial convolution with pair LUTs."""
+    """Expand a categorical LUT4 Phase 3 checkpoint into dominance LUT6."""
+    base_model = unwrap_model(model)
+    source_state = {
+        _strip_state_wrappers(key): value
+        for key, value in _checkpoint_state_dict(checkpoint).items()
+    }
+    target_state = base_model.state_dict()
+    target_luts = [
+        (name, module)
+        for name, module in base_model.named_modules()
+        if isinstance(module, PairLUT4ComplexConv2d)
+    ]
+    if not target_luts or any(
+        module.activation_encoding != "dominance"
+        for _, module in target_luts
+    ):
+        raise ValueError(
+            "A Phase 3 checkpoint can warm-start only dominance PairLUT6 models"
+        )
+
+    lut_state_names = set()
+    lut_parameter_names = set()
+    for module_name, module in target_luts:
+        prefix = module_name + "." if module_name else ""
+        own_parameters = [
+            name for name, _ in module.named_parameters(recurse=False)
+        ]
+        lut_state_names.update(
+            prefix + name for name in own_parameters
+        )
+        lut_state_names.update(
+            prefix + name
+            for name, _ in module.named_buffers(recurse=False)
+        )
+        lut_parameter_names.update(
+            prefix + name for name in own_parameters
+        )
+
+    def source_value_for_target(key):
+        value = source_state.get(key)
+        if value is not None:
+            return value
+        for target_index in (1, 2):
+            marker = ".proj.{}.".format(target_index)
+            if marker not in key:
+                continue
+            legacy_key = key.replace(
+                marker,
+                ".proj.{}.".format(target_index - 1),
+                1,
+            )
+            value = source_state.get(legacy_key)
+            if value is not None:
+                return value
+        return None
+
+    mapped_state = {}
+    shape_mismatches = []
+    for key, target_value in target_state.items():
+        if key in lut_state_names:
+            continue
+        source_value = source_value_for_target(key)
+        if source_value is None:
+            continue
+        if source_value.shape != target_value.shape:
+            shape_mismatches.append(
+                (key, tuple(source_value.shape), tuple(target_value.shape))
+            )
+            continue
+        mapped_state[key] = source_value
+    if shape_mismatches:
+        raise RuntimeError(
+            "LUT4 warm-start shared tensors have incompatible shapes: {}".format(
+                shape_mismatches
+            )
+        )
+
+    missing_keys, unexpected_keys = base_model.load_state_dict(
+        mapped_state,
+        strict=False,
+    )
+    parameter_names = set(dict(base_model.named_parameters()))
+    missing_shared_parameters = [
+        key
+        for key in missing_keys
+        if key in parameter_names and key not in lut_parameter_names
+    ]
+    if missing_shared_parameters:
+        raise RuntimeError(
+            "LUT4 checkpoint did not initialize shared parameters: {}".format(
+                missing_shared_parameters
+            )
+        )
+    if unexpected_keys:
+        raise RuntimeError(
+            "Unexpected LUT4 warm-start keys: {}".format(unexpected_keys)
+        )
+
+    expanded_luts = 0
+    for module_name, module in target_luts:
+        prefix = module_name + "." if module_name else ""
+        source_key = prefix + "weight"
+        source_weight = source_state.get(source_key)
+        if source_weight is None:
+            raise RuntimeError(
+                "LUT4 checkpoint is missing {}".format(source_key)
+            )
+        expected_source_shape = (
+            module.out_channels,
+            module.group_num,
+            16,
+            4,
+        )
+        if tuple(source_weight.shape) != expected_source_shape:
+            raise RuntimeError(
+                "{} has shape {}; expected categorical LUT4 shape {}".format(
+                    source_key,
+                    tuple(source_weight.shape),
+                    expected_source_shape,
+                )
+            )
+
+        bits = module.state_bits.long()
+        old_addresses = (
+            bits[:, 0] * 8
+            + bits[:, 1] * 4
+            + bits[:, 3] * 2
+            + bits[:, 4]
+        )
+        expanded = source_weight.index_select(
+            dim=2,
+            index=old_addresses.to(source_weight.device),
+        )
+        with torch.no_grad():
+            if module.parameterization == "categorical_residual":
+                module.dominance_base.copy_(
+                    source_weight.to(
+                        device=module.dominance_base.device,
+                        dtype=module.dominance_base.dtype,
+                    )
+                )
+                module.weight.zero_()
+            else:
+                module.weight.copy_(
+                    expanded.to(
+                        device=module.weight.device,
+                        dtype=module.weight.dtype,
+                    )
+                )
+        expanded_luts += 1
+
+    print(
+        "==> Loaded {} shared tensors and expanded {} categorical LUT4 "
+        "operators into dominance LUT6 from '{}'.".format(
+            len(mapped_state),
+            expanded_luts,
+            checkpoint_path,
+        )
+    )
+    return checkpoint
+
+
+
+def load_phase3_shared_checkpoint(model, checkpoint_path, device="cpu"):
+    """Load shared Phase 2 state and compile compatible weights into LUTs."""
     checkpoint_path = os.fspath(checkpoint_path)
-    print("==> Converting Phase 2 weights from '{}' ...".format(checkpoint_path))
+    print("==> Loading Phase 3 initialization from '{}' ...".format(checkpoint_path))
     checkpoint = torch.load(checkpoint_path, map_location=device)
     stored_phase = _checkpoint_phase(checkpoint)
+    if stored_phase == 3:
+        stored_args = checkpoint.get("args", {})
+        if stored_args.get("pair_lut_parameterization") == "categorical_residual":
+            return load_phase_checkpoint(
+                model, checkpoint_path, device=device, expected_phase=3
+            )
+        return _load_dominance_lut6_warm_start(
+            model,
+            checkpoint,
+            checkpoint_path,
+        )
     if stored_phase is not None and stored_phase != 2:
         raise ValueError(
             "Checkpoint {} belongs to Phase {}, but Phase 2 is required.".format(
-                checkpoint_path,
-                stored_phase,
+                checkpoint_path, stored_phase
             )
         )
 
@@ -235,68 +414,66 @@ def initialize_phase3_from_phase2(
         for key, value in _checkpoint_state_dict(checkpoint).items()
     }
     target_state = base_model.state_dict()
+    lut_parameter_names = set()
+    for module_name, module in base_model.named_modules():
+        if isinstance(module, (LUTBinaryConv2d, PairLUT4ComplexConv2d, TripleLUT6ComplexConv2d)):
+            prefix = module_name + "." if module_name else ""
+            lut_parameter_names.update(
+                prefix + name
+                for name, _ in module.named_parameters(recurse=False)
+            )
+
+    def source_value_for_target(key):
+        value = source_state.get(key)
+        if value is not None:
+            return value
+        for target_index in (1, 2):
+            marker = ".proj.{}.".format(target_index)
+            if marker not in key:
+                continue
+            legacy_key = key.replace(
+                marker,
+                ".proj.{}.".format(target_index - 1),
+                1,
+            )
+            value = source_state.get(legacy_key)
+            if value is not None:
+                return value
+        return None
     mapped_state = {}
     shape_mismatches = []
-    for target_key, target_value in target_state.items():
-        source_value = source_state.get(target_key)
+    for key, target_value in target_state.items():
+        if key in lut_parameter_names:
+            continue
+        source_value = source_value_for_target(key)
         if source_value is None:
             continue
-        if target_value.shape != source_value.shape:
+        if source_value.shape != target_value.shape:
             shape_mismatches.append(
-                (
-                    target_key,
-                    tuple(source_value.shape),
-                    tuple(target_value.shape),
-                )
+                (key, tuple(source_value.shape), tuple(target_value.shape))
             )
             continue
-        mapped_state[target_key] = source_value
+        mapped_state[key] = source_value
     if shape_mismatches:
         raise RuntimeError(
-            "Checkpoint tensors have incompatible shapes: {}".format(
+            "Shared checkpoint tensors have incompatible shapes: {}".format(
                 shape_mismatches
             )
         )
 
-    layer_reports = {}
-    for module_name, module in base_model.named_modules():
-        if not isinstance(module, PairLUTNeuronConv2d):
-            continue
-        real_key = module_name + ".conv_r.weight"
-        imag_key = module_name + ".conv_i.weight"
-        missing = [
-            key for key in (real_key, imag_key) if key not in source_state
-        ]
-        if missing:
-            raise RuntimeError(
-                "Phase 2 checkpoint is missing source weights for {}: {}".format(
-                    module_name,
-                    missing,
-                )
-            )
-        layer_reports[module_name] = module.initialize_from_phase2_weights(
-            source_state[real_key],
-            source_state[imag_key],
-            logit_init=logit_init,
-        )
-    if not layer_reports:
-        raise RuntimeError("Phase 3 model contains no PairLUTNeuronConv2d layers")
-
     missing_keys, unexpected_keys = base_model.load_state_dict(
-        mapped_state,
-        strict=False,
+        mapped_state, strict=False
     )
-    pair_prefixes = tuple(name + "." for name in layer_reports)
-    missing_parameters = [
+    parameter_names = set(dict(base_model.named_parameters()))
+    missing_shared_parameters = [
         key
         for key in missing_keys
-        if key in dict(base_model.named_parameters())
-        and not key.startswith(pair_prefixes)
+        if key in parameter_names and key not in lut_parameter_names
     ]
-    if missing_parameters:
+    if missing_shared_parameters:
         raise RuntimeError(
-            "Checkpoint did not initialize shared Phase 3 parameters: {}".format(
-                missing_parameters
+            "Phase 2 checkpoint did not initialize shared parameters: {}".format(
+                missing_shared_parameters
             )
         )
     if unexpected_keys:
@@ -304,88 +481,44 @@ def initialize_phase3_from_phase2(
             "Unexpected mapped checkpoint keys: {}".format(unexpected_keys)
         )
 
-    report = {
-        "checkpoint": checkpoint_path,
-        "source_phase": stored_phase,
-        "layers": len(layer_reports),
-        "pairs": sum(item["pairs"] for item in layer_reports.values()),
-        "odd_tail_layers": sum(
-            int(item["odd_tail"]) for item in layer_reports.values()
-        ),
-        "zero_weight_components": sum(
-            item["zero_weight_components"] for item in layer_reports.values()
-        ),
-        "layer_reports": layer_reports,
-    }
-    print(
-        "==> Converted {} layers into {} pair LUT neurons ({} odd tails).".format(
-            report["layers"],
-            report["pairs"],
-            report["odd_tail_layers"],
-        )
-    )
-    return checkpoint, report
-
-
-def initialize_phase3_random(
-    model,
-    logit_std=1.0,
-    init_mode="normal",
-    bimodal_negative_mean=-1.0,
-    bimodal_negative_std=0.2,
-    bimodal_positive_mean=1.0,
-    bimodal_positive_std=0.1,
-):
-    """Initialize every pair-LUT neuron independently without a checkpoint."""
-    base_model = unwrap_model(model)
-    layer_reports = {}
+    compiled_pair_luts = 0
+    random_pair_luts = 0
     for module_name, module in base_model.named_modules():
-        if isinstance(module, PairLUTNeuronConv2d):
-            if init_mode == "normal":
-                layer_reports[module_name] = module.initialize_random(
-                    logit_std=logit_std
+        if not isinstance(module, PairLUT4ComplexConv2d):
+            continue
+        if module.activation_encoding == "dominance":
+            random_pair_luts += 1
+            continue
+        prefix = module_name + "." if module_name else ""
+        real_key = prefix + "conv_r.weight"
+        imag_key = prefix + "conv_i.weight"
+        missing_source = [
+            key for key in (real_key, imag_key) if key not in source_state
+        ]
+        if missing_source:
+            raise RuntimeError(
+                "Phase 2 checkpoint cannot initialize {}: missing {}".format(
+                    module_name, missing_source
                 )
-            elif init_mode == "bimodal":
-                layer_reports[module_name] = module.initialize_bimodal(
-                    negative_mean=bimodal_negative_mean,
-                    negative_std=bimodal_negative_std,
-                    positive_mean=bimodal_positive_mean,
-                    positive_std=bimodal_positive_std,
-                )
-            else:
-                raise ValueError(
-                    "Unknown pair-LUT initialization mode: {}".format(
-                        init_mode
-                    )
-                )
-    if not layer_reports:
-        raise RuntimeError("Phase 3 model contains no PairLUTNeuronConv2d layers")
-    report = {
-        "mode": "random_{}".format(init_mode),
-        "checkpoint": None,
-        "layers": len(layer_reports),
-        "pairs": sum(item["pairs"] for item in layer_reports.values()),
-        "odd_tail_layers": sum(
-            int(item["odd_tail"]) for item in layer_reports.values()
-        ),
-        "logit_std_requested": float(logit_std),
-        "bimodal": {
-            "negative_mean": float(bimodal_negative_mean),
-            "negative_std": float(bimodal_negative_std),
-            "positive_mean": float(bimodal_positive_mean),
-            "positive_std": float(bimodal_positive_std),
-        },
-        "layer_reports": layer_reports,
-    }
+            )
+        module.initialize_from_binary_complex_weights(
+            source_state[real_key],
+            source_state[imag_key],
+        )
+        compiled_pair_luts += 1
+
+    random_lut_tables = len(lut_parameter_names) - compiled_pair_luts
     print(
-        "==> Randomly initialized {} layers containing {} pair LUT neurons "
-        "using {} logits.".format(
-            report["layers"],
-            report["pairs"],
-            init_mode,
+        "==> Loaded {} shared tensors; compiled {} PairLUT4 operators from "
+        "Phase 2 weights; {} LUT parameter sets keep random initialization "
+        "({} dominance LUT6 operators).".format(
+            len(mapped_state),
+            compiled_pair_luts,
+            random_lut_tables,
+            random_pair_luts,
         )
     )
-    return report
+    return checkpoint
 
 
 def setup_logger(workdir, loglevel, is_main):
@@ -653,64 +786,62 @@ def build_model(args, num_classes):
         is_sar_input=False,
         is_binary=args.phase >= 2,
         phase=args.phase,
-        lut_logit_init=args.lut_logit_init,
-        lut_tau_init=args.lut_tau_min,
-        lut_training_mode=args.lut_training_mode,
-        lut_kernel_mode=args.lut_kernel_mode,
-        phase3_mode=args.phase3_mode,
-        pre_bn_mode=args.pre_bn_mode,
         post_bn_mode=args.post_bn_mode,
-        bireal_topology=args.bireal_topology,
+        phase3_operator=args.phase3_operator,
+        pair_lut_parameterization=args.pair_lut_parameterization,
+        pair_lut_inputs=args.pair_lut_inputs,
+        pair_lut_encoding=args.pair_lut_encoding,
+        dominance_grad_mode=args.dominance_grad_mode,
+        dominance_ste_margin=args.dominance_ste_margin,
     )
 
 
 def split_weight_decay_params(model):
     base_model = unwrap_model(model)
-    normalization_parameter_ids = set()
-    binary_weight_ids = set()
-    lut_parameter_ids = set()
+    no_decay_ids = set()
     for module in base_model.modules():
         if "BatchNorm" in module.__class__.__name__:
-            normalization_parameter_ids.update(
-                id(param)
-                for param in module.parameters(recurse=False)
+            no_decay_ids.update(
+                id(parameter)
+                for parameter in module.parameters(recurse=False)
             )
-        if isinstance(module, BinaryComplexConv2d):
-            binary_weight_ids.update(
-                id(param)
-                for param in module.parameters(recurse=False)
-            )
-            binary_weight_ids.update(
-                id(param)
-                for child in module.children()
-                for param in child.parameters(recurse=False)
-            )
-        if isinstance(module, PairLUTNeuronConv2d):
-            lut_parameter_ids.update(
-                id(param)
-                for param in module.parameters(recurse=False)
+        if isinstance(
+            module,
+            (BinaryComplexConv2d, LUTBinaryConv2d, PairLUT4ComplexConv2d, TripleLUT6ComplexConv2d),
+        ):
+            no_decay_ids.update(
+                id(parameter) for parameter in module.parameters()
             )
 
     decay = []
     no_decay = []
-    lut = []
     for name, parameter in base_model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if id(parameter) in lut_parameter_ids:
-            lut.append(parameter)
-            continue
-        no_decay_parameter = (
-            name.endswith(".bias")
-            or id(parameter) in normalization_parameter_ids
-            or id(parameter) in binary_weight_ids
-        )
-        (no_decay if no_decay_parameter else decay).append(parameter)
-    return decay, no_decay, lut
+        target = no_decay if (
+            name.endswith(".bias") or id(parameter) in no_decay_ids
+        ) else decay
+        target.append(parameter)
+    return decay, no_decay
 
 
 def build_optimizer(args, model):
-    decay_params, no_decay_params, lut_params = split_weight_decay_params(model)
+    decay_params, no_decay_params = split_weight_decay_params(model)
+    residual_params = [
+        module.weight
+        for module in unwrap_model(model).modules()
+        if isinstance(module, PairLUT4ComplexConv2d)
+        and module.parameterization == "categorical_residual"
+    ]
+    residual_ids = {id(parameter) for parameter in residual_params}
+    decay_params = [
+        parameter for parameter in decay_params
+        if id(parameter) not in residual_ids
+    ]
+    no_decay_params = [
+        parameter for parameter in no_decay_params
+        if id(parameter) not in residual_ids
+    ]
     parameter_groups = [
         {
             "name": "decay",
@@ -723,13 +854,13 @@ def build_optimizer(args, model):
             "weight_decay": 0.0,
         },
     ]
-    if lut_params:
+    if residual_params:
         parameter_groups.append(
             {
-                "name": "lut",
-                "params": lut_params,
+                "name": "dominance_residual",
+                "params": residual_params,
                 "weight_decay": 0.0,
-                "lr": args.lut_lr,
+                "lr_scale": args.dominance_residual_lr / args.lr,
             }
         )
     if args.optimizer in ("sgd", "nag"):
@@ -759,7 +890,7 @@ def build_optimizer(args, model):
 def learning_rate_for_epoch(epoch, args):
     if args.schedule == "constant":
         return args.lr
-    if args.schedule == "bireal_reference":
+    if args.schedule == "multistep":
         decay_count = sum(
             epoch >= milestone
             for milestone in (90, 140, 180, 220)
@@ -774,7 +905,7 @@ def learning_rate_for_epoch(epoch, args):
                 1.0 + math.cos(math.pi * progress)
             ),
         )
-    if args.schedule == "linear":
+    if args.schedule in ("linear", "bireal_reference"):
         return args.lr * max(
             1.0 - epoch / float(max(args.num_epochs, 1)),
             0.0,
@@ -796,118 +927,193 @@ def learning_rate_for_epoch(epoch, args):
     raise ValueError("Unknown schedule: {}".format(args.schedule))
 
 
-def lut_learning_rate_for_epoch(epoch, args):
-    if args.lut_schedule == "constant":
-        return args.lut_lr
-    if args.lut_schedule == "cosine":
-        progress = epoch / float(max(args.num_epochs - 1, 1))
-        minimum = args.lut_lr * args.min_lr_factor
-        return minimum + 0.5 * (args.lut_lr - minimum) * (
-            1.0 + math.cos(math.pi * progress)
-        )
-    if args.lut_schedule == "linear":
-        return args.lut_lr * max(
-            1.0 - epoch / float(max(args.num_epochs, 1)),
-            0.0,
-        )
-    raise ValueError("Unknown LUT schedule: {}".format(args.lut_schedule))
-
-
-def set_optimizer_lr(optimizer, learning_rate, lut_learning_rate=None):
+def set_optimizer_lr(optimizer, learning_rate):
     for group in optimizer.param_groups:
-        if group.get("name") == "lut" and lut_learning_rate is not None:
-            group["lr"] = lut_learning_rate
-        else:
-            group["lr"] = learning_rate
+        group["lr"] = learning_rate * group.get("lr_scale", 1.0)
 
 
-def update_pair_lut_annealing(model, epoch, args):
-    if args.phase != 3 or getattr(args, "phase3_mode", "lut") != "lut":
-        return {
-            "tau": 0.0,
-            "hard_ratio": 1.0,
-            "fully_hard": True,
-        }
-    if getattr(args, "lut_training_mode", "anneal") == "real_compatible":
-        layers = 0
-        for module in unwrap_model(model).modules():
-            if isinstance(module, PairLUTNeuronConv2d):
-                module.tau.fill_(args.lut_tau_max)
-                module.hard_ratio.fill_(1.0)
-                layers += 1
-        if layers == 0:
-            raise RuntimeError("Phase 3 model contains no pair-LUT layers")
-        return {
-            "tau": float(args.lut_tau_max),
-            "hard_ratio": 1.0,
-            "fully_hard": True,
-        }
-    if args.lut_anneal_epochs < 0 or args.lut_hard_transition_epochs < 0:
-        raise ValueError("LUT anneal durations must be non-negative")
-    if args.lut_tau_min <= 0.0 or args.lut_tau_max <= 0.0:
-        raise ValueError("LUT tau values must be positive")
-    if args.lut_tau_max < args.lut_tau_min:
-        raise ValueError("--lut-tau-max must be at least --lut-tau-min")
-
-    if args.lut_anneal_epochs == 0:
-        tau = args.lut_tau_max
-    else:
-        progress = min(
-            epoch / float(max(args.lut_anneal_epochs - 1, 1)),
-            1.0,
-        )
-        tau = args.lut_tau_min * (
-            args.lut_tau_max / args.lut_tau_min
-        ) ** progress
-
-    if epoch < args.lut_anneal_epochs:
-        hard_ratio = 0.0
-    elif args.lut_hard_transition_epochs == 0:
-        hard_ratio = 1.0
-    else:
-        hard_ratio = min(
-            (epoch - args.lut_anneal_epochs + 1)
-            / float(args.lut_hard_transition_epochs),
-            1.0,
-        )
-
-    layers = 0
-    for module in unwrap_model(model).modules():
-        if isinstance(module, PairLUTNeuronConv2d):
-            module.tau.fill_(tau)
-            module.hard_ratio.fill_(hard_ratio)
-            layers += 1
-    if layers == 0:
-        raise RuntimeError("Phase 3 model contains no pair-LUT layers")
-    return {
-        "tau": float(tau),
-        "hard_ratio": float(hard_ratio),
-        "fully_hard": math.isclose(hard_ratio, 1.0),
-    }
-
-
-def pair_lut_sign_diff(model):
-    result = {"real": 0, "imag": 0, "total": 0, "entries": 0}
-    for module in unwrap_model(model).modules():
-        if not isinstance(module, PairLUTNeuronConv2d):
-            continue
-        current = module.hard_sign_diff()
-        for key in result:
-            result[key] += current[key]
-    result["fraction"] = (
-        result["total"] / float(result["entries"])
-        if result["entries"]
-        else 0.0
+def dominance_residual_alpha_for_epoch(epoch, args):
+    if args.dominance_residual_ramp_epochs <= 1:
+        return args.dominance_residual_alpha_end
+    progress = min(
+        max(epoch, 0) / float(args.dominance_residual_ramp_epochs - 1),
+        1.0,
     )
-    return result
+    return (
+        args.dominance_residual_alpha_start
+        + progress * (
+            args.dominance_residual_alpha_end
+            - args.dominance_residual_alpha_start
+        )
+    )
 
 
-def capture_pair_lut_tables(model):
+def configure_lut_training_flow(model, epoch, args):
+    """Report the always-hard binary Phase 3 LUT configuration."""
+    modules = dict(model.named_modules())
+    units = [
+        (
+            name,
+            module,
+            modules.get(name.rsplit(".", 1)[0] + ".act"),
+        )
+        for name, module in model.named_modules()
+        if isinstance(module, (TwoLUTComplexConv2d, PairLUT4ComplexConv2d, TripleLUT6ComplexConv2d))
+    ]
+    operator_count = len(units)
+    residual_operators = [
+        operator
+        for _, operator, _ in units
+        if isinstance(operator, PairLUT4ComplexConv2d)
+        and operator.parameterization == "categorical_residual"
+    ]
+    residual_alpha = None
+    if residual_operators:
+        residual_alpha = dominance_residual_alpha_for_epoch(epoch, args)
+        for operator in residual_operators:
+            operator.set_dominance_residual_alpha(residual_alpha)
+    if args.phase != 3 or not units:
+        return {
+            "flow": "not_applicable",
+            "stage": "not_applicable",
+            "temperature": None,
+            "hard_operators": operator_count,
+            "total_operators": operator_count,
+            "fully_hard": True,
+            "dominance_residual_alpha": residual_alpha,
+        }
+
+    for name, operator, activation in units:
+        if not isinstance(activation, BinaryComplexBitActivation):
+            raise TypeError(
+                "Phase 3 operator {} is not paired with bit activation".format(
+                    name
+                )
+            )
     return {
-        name: module.hard_tables()
-        for name, module in unwrap_model(model).named_modules()
-        if isinstance(module, PairLUTNeuronConv2d)
+        "flow": "hard",
+        "stage": (
+            "dominance_residual_ramp"
+            if residual_alpha is not None
+            and epoch < args.dominance_residual_ramp_epochs - 1
+            else "fully_hard"
+        ),
+        "temperature": None,
+        "hard_operators": operator_count,
+        "total_operators": operator_count,
+        "fully_hard": True,
+        "dominance_residual_alpha": residual_alpha,
     }
+
+
+def _gradient_tensor_stats(name, parameter):
+    gradient = parameter.grad.detach()
+    finite_mask = torch.isfinite(gradient)
+    finite_count = int(finite_mask.sum().item())
+    total = gradient.numel()
+    finite_values = gradient[finite_mask]
+    stats = {
+        "name": name,
+        "shape": list(gradient.shape),
+        "dtype": str(gradient.dtype),
+        "total": total,
+        "finite": finite_count,
+        "nan": int(torch.isnan(gradient).sum().item()),
+        "pos_inf": int(torch.isposinf(gradient).sum().item()),
+        "neg_inf": int(torch.isneginf(gradient).sum().item()),
+    }
+    if finite_values.numel():
+        finite_double = finite_values.double()
+        stats["finite_max_abs"] = float(finite_double.abs().max().item())
+        stats["finite_l2_norm_float64"] = float(
+            torch.linalg.vector_norm(finite_double).item()
+        )
+    return stats
+
+
+def _write_nonfinite_gradient_report(
+    model,
+    workdir,
+    epoch,
+    batch_index,
+    loss,
+    output,
+    clipnorm,
+    clip_error,
+):
+    base_model = unwrap_model(model)
+    gradient_stats = [
+        _gradient_tensor_stats(name, parameter)
+        for name, parameter in base_model.named_parameters()
+        if parameter.grad is not None
+    ]
+    nonfinite = [
+        stats for stats in gradient_stats if stats["finite"] != stats["total"]
+    ]
+    finite_ranked = sorted(
+        (
+            stats
+            for stats in gradient_stats
+            if stats["finite"] == stats["total"]
+        ),
+        key=lambda stats: stats.get("finite_l2_norm_float64", 0.0),
+        reverse=True,
+    )
+    squared_norm_sum = sum(
+        stats.get("finite_l2_norm_float64", 0.0) ** 2
+        for stats in gradient_stats
+    )
+    quantization = []
+    for name, module in base_model.named_modules():
+        if isinstance(module, (LUTBinaryConv2d, PairLUT4ComplexConv2d, TripleLUT6ComplexConv2d)):
+            quantization.append(
+                {
+                    "name": name,
+                    "kind": "lut",
+                    "tau": None,
+                    "hard": True,
+                }
+            )
+        elif isinstance(module, BinaryComplexBitActivation):
+            quantization.append(
+                {
+                    "name": name,
+                    "kind": "activation",
+                    "tau": float(module.tau.item()),
+                    "hard": bool(module.hard.item()),
+                }
+            )
+    report = {
+        "epoch": int(epoch),
+        "batch_index": int(batch_index),
+        "loss": float(loss.detach().item()),
+        "output_max_abs": float(output.detach().abs().max().item()),
+        "clipnorm": float(clipnorm),
+        "clip_error": str(clip_error),
+        "diagnosis": (
+            "nonfinite_gradient_elements"
+            if nonfinite
+            else "float32_global_norm_overflow_with_finite_elements"
+        ),
+        "gradient_tensor_count": len(gradient_stats),
+        "nonfinite_gradient_tensor_count": len(nonfinite),
+        "global_finite_l2_norm_float64": math.sqrt(squared_norm_sum),
+        "nonfinite_gradients": nonfinite,
+        "largest_finite_gradients": finite_ranked[:20],
+        "quantization_state": quantization,
+    }
+    report_dir = Path(workdir) / "debug"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "nonfinite_grad_epoch{:04d}_batch{:04d}.json".format(
+        epoch,
+        batch_index,
+    )
+    temporary = report_path.with_suffix(report_path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, report_path)
+    return report_path, report
 
 
 def train_one_epoch(
@@ -918,12 +1124,18 @@ def train_one_epoch(
     clipnorm,
     clipval,
     label_smoothing=0.0,
+    epoch=0,
+    workdir=".",
+    logger=None,
+    log_interval=0,
 ):
     model.train()
     loss_sum = 0.0
     correct = 0
     count = 0
-    for data, target in loader:
+    max_preclip_grad_norm = 0.0
+    max_preclip_grad_norm_batch = None
+    for batch_index, (data, target) in enumerate(loader):
         data = data.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -933,9 +1145,51 @@ def train_one_epoch(
             target,
             label_smoothing=label_smoothing,
         )
+        if not torch.isfinite(loss).item():
+            poisoned = [
+                name
+                for name, parameter in model.named_parameters()
+                if not torch.isfinite(parameter).all().item()
+            ]
+            raise FloatingPointError(
+                "Non-finite training loss at batch {}. "
+                "Non-finite parameters before backward: {}".format(
+                    batch_index,
+                    poisoned[:8] if poisoned else "none",
+                )
+            )
         loss.backward()
         if clipnorm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clipnorm)
+            try:
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    clipnorm,
+                    error_if_nonfinite=True,
+                )
+            except RuntimeError as error:
+                report_path, report = _write_nonfinite_gradient_report(
+                    model,
+                    workdir,
+                    epoch,
+                    batch_index,
+                    loss,
+                    output,
+                    clipnorm,
+                    error,
+                )
+                raise FloatingPointError(
+                    "Non-finite gradient norm at epoch {}, batch {}. "
+                    "Diagnosis: {}. Report: {}".format(
+                        epoch,
+                        batch_index,
+                        report["diagnosis"],
+                        report_path,
+                    )
+                ) from error
+            total_norm_value = float(total_norm.detach().item())
+            if total_norm_value > max_preclip_grad_norm:
+                max_preclip_grad_norm = total_norm_value
+                max_preclip_grad_norm_batch = batch_index
         if clipval > 0:
             torch.nn.utils.clip_grad_value_(model.parameters(), clipval)
         optimizer.step()
@@ -944,7 +1198,24 @@ def train_one_epoch(
         loss_sum += loss.item() * batch_size
         correct += (output.argmax(dim=1) == target).sum().item()
         count += batch_size
-    return loss_sum, correct, count
+        completed_batches = batch_index + 1
+        if logger is not None and log_interval > 0 and (
+            completed_batches % log_interval == 0
+            or completed_batches == len(loader)
+        ):
+            logger.info(
+                "Epoch %d batch %d/%d train_loss: %.6f train_acc: %.4f",
+                epoch,
+                completed_batches,
+                len(loader),
+                loss_sum / count,
+                correct / float(count),
+            )
+    gradient_summary = {
+        "max_preclip_norm": max_preclip_grad_norm,
+        "max_preclip_norm_batch": max_preclip_grad_norm_batch,
+    }
+    return loss_sum, correct, count, gradient_summary
 
 
 def evaluate(model, loader, device):
@@ -1013,8 +1284,6 @@ def checkpoint_payload(
         "args": vars(args),
         "metrics": metrics,
     }
-    if args.phase == 3 and getattr(args, "phase3_mode", "lut") == "lut":
-        payload["hard_lut_tables"] = capture_pair_lut_tables(model)
     return payload
 
 
@@ -1076,38 +1345,22 @@ def train(args):
         raise ValueError("--num-epochs must be at least 1")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
+    if args.lr <= 0.0:
+        raise ValueError("--lr must be positive")
+    if args.dominance_residual_lr <= 0.0:
+        raise ValueError("--dominance-residual-lr must be positive")
+    if args.dominance_residual_ramp_epochs < 1:
+        raise ValueError("--dominance-residual-ramp-epochs must be at least 1")
+    if not 0.0 <= args.dominance_residual_alpha_start <= 1.0:
+        raise ValueError("--dominance-residual-alpha-start must be in [0, 1]")
+    if not 0.0 <= args.dominance_residual_alpha_end <= 1.0:
+        raise ValueError("--dominance-residual-alpha-end must be in [0, 1]")
+    if args.dominance_residual_alpha_start > args.dominance_residual_alpha_end:
+        raise ValueError("dominance residual alpha start must not exceed end")
     if not 0.0 <= args.min_lr_factor <= 1.0:
         raise ValueError("--min-lr-factor must be between 0 and 1")
     if not 0.0 <= args.label_smoothing < 1.0:
         raise ValueError("--label-smoothing must be in [0, 1)")
-    if args.phase == 3 and args.phase3_mode == "lut":
-        if args.lut_lr <= 0.0:
-            raise ValueError("--lut-lr must be positive")
-        if args.lut_logit_init <= 0.0:
-            raise ValueError("--lut-logit-init must be positive")
-        if args.lut_anneal_epochs < 0:
-            raise ValueError("--lut-anneal-epochs must be non-negative")
-        if args.lut_hard_transition_epochs < 0:
-            raise ValueError(
-                "--lut-hard-transition-epochs must be non-negative"
-            )
-        if args.lut_tau_min <= 0.0 or args.lut_tau_max <= 0.0:
-            raise ValueError("LUT tau values must be positive")
-        if args.lut_tau_max < args.lut_tau_min:
-            raise ValueError(
-                "--lut-tau-max must be at least --lut-tau-min"
-            )
-        if args.lut_training_mode == "anneal":
-            epochs_to_hard = args.lut_anneal_epochs + max(
-                args.lut_hard_transition_epochs,
-                1,
-            )
-            if args.num_epochs < epochs_to_hard:
-                raise ValueError(
-                    "Phase 3 needs at least {} epochs to reach fully hard "
-                    "mode; got {}".format(epochs_to_hard, args.num_epochs)
-                )
-
     ddp_enabled, rank, local_rank, world_size = init_distributed(args)
     is_main = rank == 0
     if ddp_enabled and torch.cuda.is_available() and not args.cpu:
@@ -1120,15 +1373,8 @@ def train(args):
         logger.info("INVOCATION: %s", " ".join(sys.argv))
         logger.info("HOSTNAME: %s", socket.gethostname())
         logger.info("PWD: %s", os.getcwd())
-        logger.info(
-            "Phase %d: %s",
-            args.phase,
-            PHASE_DESCRIPTIONS[args.phase],
-        )
-        logger.info(
-            "Configuration: %s",
-            json.dumps(vars(args), sort_keys=True),
-        )
+        logger.info("Phase %d: %s", args.phase, PHASE_DESCRIPTIONS[args.phase])
+        logger.info("Configuration: %s", json.dumps(vars(args), sort_keys=True))
         logger.info(
             "Distributed: enabled=%s rank=%d world_size=%d",
             ddp_enabled,
@@ -1143,12 +1389,7 @@ def train(args):
         num_classes,
         pixel_mean,
         train_sampler,
-    ) = build_datasets(
-        args,
-        logger,
-        ddp_enabled,
-        is_main,
-    )
+    ) = build_datasets(args, logger, ddp_enabled, is_main)
     if is_main:
         torch.save(pixel_mean, Path(args.workdir) / "pixel_mean.pt")
 
@@ -1168,39 +1409,21 @@ def train(args):
     test_loader = None
     if is_main:
         if val_dataset is not None:
-            val_loader = DataLoader(
-                val_dataset,
-                shuffle=False,
-                **loader_kwargs
-            )
-        test_loader = DataLoader(
-            test_dataset,
-            shuffle=False,
-            **loader_kwargs
-        )
+            val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
 
     device = torch.device(
-        "cuda"
-        if torch.cuda.is_available() and not args.cpu
-        else "cpu"
+        "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     )
     model = build_model(args, num_classes).to(device)
-    phase3_initialization = None
     checkpoint_path, expected_phase = _resolve_initial_checkpoint(args)
     if checkpoint_path is not None:
         if not os.path.isfile(checkpoint_path):
             raise FileNotFoundError(
-                "Initialization checkpoint not found: {}".format(
-                    checkpoint_path
-                )
+                "Initialization checkpoint not found: {}".format(checkpoint_path)
             )
-        if args.phase == 3 and args.phase3_mode == "lut":
-            _, phase3_initialization = initialize_phase3_from_phase2(
-                model,
-                checkpoint_path,
-                device=device,
-                logit_init=args.lut_logit_init,
-            )
+        if args.phase == 3:
+            load_phase3_shared_checkpoint(model, checkpoint_path, device=device)
         else:
             load_phase_checkpoint(
                 model,
@@ -1209,41 +1432,43 @@ def train(args):
                 expected_phase=expected_phase,
             )
         if is_main:
-            logger.info(
-                "Initialized Phase %d from %s",
-                args.phase,
-                checkpoint_path,
-            )
-    else:
-        if args.phase == 3 and args.phase3_mode == "lut":
-            phase3_initialization = initialize_phase3_random(
-                model,
-                logit_std=args.lut_logit_init,
-                init_mode=args.lut_init_mode,
-                bimodal_negative_mean=args.lut_bimodal_negative_mean,
-                bimodal_negative_std=args.lut_bimodal_negative_std,
-                bimodal_positive_mean=args.lut_bimodal_positive_mean,
-                bimodal_positive_std=args.lut_bimodal_positive_std,
-            )
-        if is_main:
-            logger.info("Training Phase %d from scratch.", args.phase)
+            logger.info("Initialized Phase %d from %s", args.phase, checkpoint_path)
+    elif is_main:
+        logger.info("Training Phase %d from scratch.", args.phase)
 
     if is_main:
         logger.info(
             "Model parameters: %d",
             sum(parameter.numel() for parameter in model.parameters()),
         )
+        if args.phase == 3:
+            lut_operators = sum(
+                isinstance(
+                    module,
+                    (TwoLUTComplexConv2d, PairLUT4ComplexConv2d, TripleLUT6ComplexConv2d),
+                )
+                for module in model.modules()
+            )
+            logger.info(
+                "Phase 3 operator=%s count=%d",
+                args.phase3_operator,
+                lut_operators,
+            )
+            logger.info(
+                "PairLUT4 parameterization=%s inputs=%d encoding=%s dominance_grad=%s",
+                args.pair_lut_parameterization,
+                args.pair_lut_inputs,
+                args.pair_lut_encoding,
+                args.dominance_grad_mode,
+            )
+            logger.info("Phase 3 LUT training flow: fully hard with STE")
         if args.summary:
             logger.info("Model:\n%s", model)
 
     model = _compile_model(model, args, logger, is_main)
     if ddp_enabled:
         if device.type == "cuda":
-            model = DDP(
-                model,
-                device_ids=[local_rank],
-                output_device=local_rank,
-            )
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         else:
             model = DDP(model)
     optimizer = build_optimizer(args, model)
@@ -1259,7 +1484,8 @@ def train(args):
     best_acc = -math.inf
     best_metrics = None
     previous_lr = None
-    previous_lut_lr = None
+    previous_lut_stage = None
+    previous_hard_operators = None
     if is_main:
         logger.info("Entering training loop.")
 
@@ -1267,44 +1493,53 @@ def train(args):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         current_lr = learning_rate_for_epoch(epoch, args)
-        current_lut_lr = lut_learning_rate_for_epoch(epoch, args)
-        set_optimizer_lr(optimizer, current_lr, current_lut_lr)
-        annealing = update_pair_lut_annealing(model, epoch, args)
+        set_optimizer_lr(optimizer, current_lr)
         if is_main and (
-            previous_lr is None
-            or not math.isclose(current_lr, previous_lr)
+            previous_lr is None or not math.isclose(current_lr, previous_lr)
         ):
-            logger.info(
-                "Epoch %d learning rate: %.8g",
-                epoch + 1,
-                current_lr,
-            )
+            logger.info("Epoch %d learning rate: %.8g", epoch + 1, current_lr)
         previous_lr = current_lr
-        if is_main and args.phase == 3 and args.phase3_mode == "lut" and (
-            previous_lut_lr is None
-            or not math.isclose(current_lut_lr, previous_lut_lr)
+
+        lut_state = configure_lut_training_flow(
+            unwrap_model(model),
+            epoch,
+            args,
+        )
+        if is_main and (
+            lut_state["stage"] != previous_lut_stage
+            or lut_state["hard_operators"] != previous_hard_operators
         ):
             logger.info(
-                "Epoch %d LUT learning rate: %.8g",
+                (
+                    "Epoch %d LUT flow: stage=%s tau=%s alpha=%s hard_operators=%d/%d"
+                ),
                 epoch + 1,
-                current_lut_lr,
+                lut_state["stage"],
+                (
+                    "n/a"
+                    if lut_state["temperature"] is None
+                    else "{:.6g}".format(lut_state["temperature"])
+                ),
+                (
+                    "n/a"
+                    if lut_state["dominance_residual_alpha"] is None
+                    else "{:.6g}".format(
+                        lut_state["dominance_residual_alpha"]
+                    )
+                ),
+                lut_state["hard_operators"],
+                lut_state["total_operators"],
             )
-        if is_main and args.phase == 3 and args.phase3_mode == "lut" and (
-            epoch == 0
-            or epoch % 10 == 0
-            or annealing["fully_hard"]
-        ):
-            logger.info(
-                "[Pair-LUT Annealing] Epoch %d: tau=%.6f, hard_ratio=%.4f, fully_hard=%s",
-                epoch + 1,
-                annealing["tau"],
-                annealing["hard_ratio"],
-                annealing["fully_hard"],
-            )
-        previous_lut_lr = current_lut_lr
+        previous_lut_stage = lut_state["stage"]
+        previous_hard_operators = lut_state["hard_operators"]
 
         start = time.time()
-        train_loss_sum, train_correct, train_count = train_one_epoch(
+        (
+            train_loss_sum,
+            train_correct,
+            train_count,
+            gradient_summary,
+        ) = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -1312,6 +1547,10 @@ def train(args):
             clipnorm=args.clipnorm,
             clipval=args.clipval,
             label_smoothing=args.label_smoothing,
+            epoch=epoch + 1,
+            workdir=args.workdir,
+            logger=logger if is_main else None,
+            log_interval=args.log_interval,
         )
         elapsed = time.time() - start
         if ddp_enabled:
@@ -1327,21 +1566,11 @@ def train(args):
         train_loss = train_loss_sum / max(train_count, 1.0)
         train_acc = train_correct / max(train_count, 1.0)
 
-        val_loss, val_acc = 0.0, 0.0
-        test_loss, test_acc = 0.0, 0.0
-        evaluation_model = unwrap_model(model)
         if is_main:
+            val_loss, val_acc = 0.0, 0.0
             if val_loader is not None:
-                val_loss, val_acc = evaluate(
-                    evaluation_model,
-                    val_loader,
-                    device,
-                )
-            test_loss, test_acc = evaluate(
-                evaluation_model,
-                test_loader,
-                device,
-            )
+                val_loss, val_acc = evaluate(unwrap_model(model), val_loader, device)
+            test_loss, test_acc = evaluate(unwrap_model(model), test_loader, device)
             histories["train_loss"].append(train_loss)
             histories["train_acc"].append(train_acc)
             histories["val_loss"].append(val_loss)
@@ -1364,38 +1593,25 @@ def train(args):
                     elapsed,
                 )
             )
+            if gradient_summary["max_preclip_norm_batch"] is not None:
+                logger.info(
+                    "Epoch %d maximum pre-clip gradient norm: %.6g at batch %d",
+                    epoch + 1,
+                    gradient_summary["max_preclip_norm"],
+                    gradient_summary["max_preclip_norm_batch"],
+                )
 
             metric_loss, metric_acc = (
                 (val_loss, val_acc)
                 if val_loader is not None
                 else (test_loss, test_acc)
             )
-            sign_diff = (
-                pair_lut_sign_diff(evaluation_model)
-                if args.phase == 3 and args.phase3_mode == "lut"
-                else None
-            )
-            if sign_diff is not None and (
-                epoch == 0
-                or epoch % 10 == 0
-                or annealing["fully_hard"]
-            ):
-                logger.info(
-                    "[Pair-LUT Sign Diff] %d/%d (%.6f), real=%d, imag=%d",
-                    sign_diff["total"],
-                    sign_diff["entries"],
-                    sign_diff["fraction"],
-                    sign_diff["real"],
-                    sign_diff["imag"],
-                )
             epoch_metrics = {
                 "phase": args.phase,
                 "phase_name": PHASE_DESCRIPTIONS[args.phase],
                 "epoch": epoch + 1,
                 "selection_split": (
-                    "validation"
-                    if val_loader is not None
-                    else "test"
+                    "validation" if val_loader is not None else "test"
                 ),
                 "selection_acc": float(metric_acc),
                 "selection_loss": float(metric_loss),
@@ -1406,33 +1622,24 @@ def train(args):
                 "test_acc": float(test_acc),
                 "test_loss": float(test_loss),
                 "learning_rate": float(current_lr),
+                "lut_training_stage": lut_state["stage"],
+                "lut_temperature": lut_state["temperature"],
+                "lut_hard_operators": lut_state["hard_operators"],
+                "lut_total_operators": lut_state["total_operators"],
+                "hardware_ready": lut_state["fully_hard"],
+                "dominance_residual_alpha": lut_state[
+                    "dominance_residual_alpha"
+                ],
             }
-            if args.phase == 3 and args.phase3_mode == "lut":
-                epoch_metrics.update(
-                    {
-                        "lut_learning_rate": float(current_lut_lr),
-                        "lut_tau": annealing["tau"],
-                        "lut_hard_ratio": annealing["hard_ratio"],
-                        "lut_fully_hard": annealing["fully_hard"],
-                        "lut_sign_diff": sign_diff,
-                    }
-                )
             payload = checkpoint_payload(
-                model,
-                optimizer,
-                args,
-                epoch + 1,
-                epoch_metrics,
+                model, optimizer, args, epoch + 1, epoch_metrics
             )
-            if phase3_initialization is not None:
-                payload["phase3_initialization"] = phase3_initialization
             last_path = save_checkpoint(
                 payload,
                 args.workdir,
                 last_checkpoint_filename(args.phase),
             )
-            can_select_best = annealing["fully_hard"]
-            if can_select_best and metric_acc > best_acc:
+            if lut_state["fully_hard"] and metric_acc > best_acc:
                 best_acc = metric_acc
                 best_metrics = dict(epoch_metrics)
                 best_metrics["best_acc"] = float(metric_acc)
@@ -1444,14 +1651,10 @@ def train(args):
                     phase_checkpoint_filename(args.phase),
                 )
                 metrics_path = update_phase_metrics(
-                    args.workdir,
-                    args.phase,
-                    best_metrics,
+                    args.workdir, args.phase, best_metrics
                 )
                 logger.info(
-                    "Saved best Phase %d checkpoint to %s",
-                    args.phase,
-                    best_path,
+                    "Saved best Phase %d checkpoint to %s", args.phase, best_path
                 )
                 logger.info("Updated metrics at %s", metrics_path)
             logger.debug("Saved last checkpoint to %s", last_path)
@@ -1461,10 +1664,6 @@ def train(args):
 
     if is_main:
         _save_histories(args.workdir, args.phase, histories)
-        if best_metrics is None:
-            raise RuntimeError(
-                "No deployable best checkpoint was produced; Phase 3 must reach fully hard mode"
-            )
         logger.info(
             "Finished Phase %d; best selection accuracy %.4f at epoch %d.",
             args.phase,
@@ -1477,21 +1676,15 @@ def train(args):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Train the active Phase 1/2/3 complex ResNet route"
+        description="Train the clean Phase 1/2/3 complex Bi-Real route"
     )
     parser.add_argument("-d", "--datadir", default=".", type=str)
     parser.add_argument("-w", "--workdir", default=".", type=str)
     parser.add_argument(
-        "-l",
-        "--loglevel",
-        default="info",
-        choices=sorted(LOG_LEVELS),
+        "-l", "--loglevel", default="info", choices=sorted(LOG_LEVELS)
     )
     parser.add_argument(
-        "-s",
-        "--seed",
-        default=0xE4223644E98B8E64,
-        type=int,
+        "-s", "--seed", default=0xE4223644E98B8E64, type=int
     )
     parser.add_argument(
         "--dataset",
@@ -1499,33 +1692,27 @@ def parse_args(argv=None):
         choices=["cifar10", "cifar100", "svhn"],
     )
     parser.add_argument(
-        "--phase",
-        default=1,
-        type=int,
-        choices=sorted(PHASE_DESCRIPTIONS),
+        "--phase", default=1, type=int, choices=sorted(PHASE_DESCRIPTIONS)
     )
     parser.add_argument(
         "--checkpoint",
         default=None,
         help=(
-            "Initialization checkpoint; Phase 2 expects Phase 1 and "
-            "Phase 3 expects Phase 2"
+            "Initialization checkpoint. Phase 2 loads Phase 1; Phase 3 loads "
+            "shared state from Phase 2, or dominance LUT6 expands a "
+            "categorical LUT4 Phase 3 checkpoint."
         ),
     )
     parser.add_argument(
         "--train-from-scratch",
         action="store_true",
-        help="Skip checkpoint initialization and randomly initialize the model",
+        help="Skip checkpoint initialization",
     )
     parser.add_argument("-n", "--num-epochs", default=200, type=int)
     parser.add_argument("-b", "--batch-size", default=128, type=int)
-    parser.add_argument("--start-filter", "--sf", default=11, type=int)
+    parser.add_argument("--start-filter", "--sf", default=16, type=int)
     parser.add_argument("--num-blocks", "--nb", default=3, type=int)
-    parser.add_argument(
-        "--spectral-pool-gamma",
-        default=0.5,
-        type=float,
-    )
+    parser.add_argument("--spectral-pool-gamma", default=0.5, type=float)
     parser.add_argument(
         "--spectral-pool-scheme",
         default="none",
@@ -1533,40 +1720,78 @@ def parse_args(argv=None):
     )
     parser.add_argument("--binary-stem", action="store_true")
     parser.add_argument(
-        "--binary-weight-scale",
-        default="channel",
-        choices=["channel", "layer"],
+        "--binary-weight-scale", default="channel", choices=["channel", "layer"]
     )
     parser.add_argument(
-        "--weight-grad-mode",
-        default="ste",
-        choices=["ste", "bireal"],
+        "--weight-grad-mode", default="ste", choices=["ste", "bireal"]
     )
     parser.add_argument(
-        "--activation-grad-mode",
-        default="bireal",
-        choices=["ste", "bireal"],
+        "--activation-grad-mode", default="bireal", choices=["ste", "bireal"]
     )
     parser.add_argument(
-        "--pre-bn-mode",
-        default="covariance",
-        choices=["covariance", "naive", "none"],
-        help="Complex normalization before each residual activation",
+        "--phase3-operator",
+        default="pair_lut4",
+        choices=["pair_lut4", "triple_lut6", "shared_lut6"],
+        help="Phase 3 main convolution implementation",
+    )
+    parser.add_argument(
+        "--pair-lut-parameterization",
+        default="independent",
+        choices=[
+            "independent",
+            "categorical",
+            "categorical_residual",
+        ],
+        help="PairLUT4 table parameterization",
+    )
+    parser.add_argument(
+        "--pair-lut-inputs",
+        default=4,
+        type=int,
+        choices=[4, 6],
+        help="Number of activation bits per grouped complex LUT",
+    )
+    parser.add_argument(
+        "--pair-lut-encoding",
+        default="standard",
+        choices=["standard", "dominance"],
+        help=(
+            "standard groups signed real/imag bits; dominance groups two "
+            "complex activations as [sr, si, phase/Gray comparator bit]"
+        ),
+    )
+    parser.add_argument(
+        "--dominance-grad-mode",
+        default="stop",
+        choices=["stop", "ste"],
+        help="Whether the hard dominance bit propagates a surrogate gradient",
+    )
+
+    parser.add_argument(
+        "--dominance-residual-lr",
+        default=0.002,
+        type=float,
+        help="Learning rate for zero-mean dominance LUT residuals",
+    )
+    parser.add_argument(
+        "--dominance-residual-alpha-start", default=0.1, type=float
+    )
+    parser.add_argument(
+        "--dominance-residual-alpha-end", default=1.0, type=float
+    )
+    parser.add_argument(
+        "--dominance-residual-ramp-epochs", default=120, type=int
+    )
+    parser.add_argument(
+        "--dominance-ste-margin",
+        default=1.0,
+        type=float,
+        help="Linear STE half-width for the hard |real|>|imag| bit",
     )
     parser.add_argument(
         "--post-bn-mode",
         default="covariance",
         choices=["covariance", "naive", "none"],
-        help="Complex normalization after main and projection convolutions",
-    )
-    parser.add_argument(
-        "--bireal-topology",
-        default="legacy",
-        choices=["legacy", "standard"],
-        help=(
-            "Residual topology: legacy keeps the existing pre-BN path; "
-            "standard matches CIFAR Bi-Real after the LearnImagBlock"
-        ),
     )
     parser.add_argument("--no-validation", action="store_true")
     parser.add_argument(
@@ -1577,6 +1802,7 @@ def parse_args(argv=None):
     parser.add_argument("--label-smoothing", default=0.0, type=float)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--num-workers", default=4, type=int)
+    parser.add_argument("--log-interval", default=0, type=int)
     parser.add_argument("--summary", action="store_true")
 
     parser.add_argument(
@@ -1588,11 +1814,7 @@ def parse_args(argv=None):
     parser.add_argument("--lr", default=0.1, type=float)
     parser.add_argument("--momentum", "--mom", default=0.9, type=float)
     parser.add_argument(
-        "--weight-decay",
-        "--l2",
-        dest="weight_decay",
-        default=1e-4,
-        type=float,
+        "--weight-decay", "--l2", dest="weight_decay", default=1e-4, type=float
     )
     parser.add_argument("--clipnorm", "--cn", default=1.0, type=float)
     parser.add_argument("--clipval", "--cv", default=1.0, type=float)
@@ -1602,52 +1824,13 @@ def parse_args(argv=None):
         choices=[
             "bireal",
             "bireal_reference",
+            "multistep",
             "cosine",
             "constant",
             "linear",
         ],
     )
     parser.add_argument("--min-lr-factor", default=0.01, type=float)
-    parser.add_argument("--lut-lr", default=0.01, type=float)
-    parser.add_argument(
-        "--lut-schedule",
-        default="constant",
-        choices=["constant", "cosine", "linear"],
-    )
-    parser.add_argument(
-        "--lut-training-mode",
-        default="anneal",
-        choices=["anneal", "real_compatible"],
-    )
-    parser.add_argument(
-        "--phase3-mode",
-        default="lut",
-        choices=["lut", "analytic_pair"],
-        help="Phase 3 main-path operator",
-    )
-    parser.add_argument(
-        "--lut-kernel-mode",
-        default="auto",
-        choices=["auto", "floating", "binary"],
-    )
-    parser.add_argument(
-        "--lut-init-mode",
-        default="normal",
-        choices=["normal", "bimodal"],
-    )
-    parser.add_argument("--lut-logit-init", default=1.0, type=float)
-    parser.add_argument("--lut-bimodal-negative-mean", default=-1.0, type=float)
-    parser.add_argument("--lut-bimodal-negative-std", default=0.2, type=float)
-    parser.add_argument("--lut-bimodal-positive-mean", default=1.0, type=float)
-    parser.add_argument("--lut-bimodal-positive-std", default=0.1, type=float)
-    parser.add_argument("--lut-tau-min", default=0.5, type=float)
-    parser.add_argument("--lut-tau-max", default=10.0, type=float)
-    parser.add_argument("--lut-anneal-epochs", default=160, type=int)
-    parser.add_argument(
-        "--lut-hard-transition-epochs",
-        default=40,
-        type=int,
-    )
     parser.add_argument("--beta1", default=0.9, type=float)
     parser.add_argument("--beta2", default=0.999, type=float)
 

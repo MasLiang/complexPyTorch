@@ -1,278 +1,334 @@
-# Current Technical Route
+# 当前技术路线：复数 Bi-Real 网络到双 LUTConv 网络
 
-## Scope
+## 1. 路线目标
 
-As of 2026-07-29, the active training system contains Phase 1, Phase 2, and
-the new LUT-as-neuron Phase 3. Retired LUT-as-operator, LUT5/LUT6, C8, and MLP
-routes remain archived.
+这条路线的目标是在保留复数神经网络结构和复数运算语义的前提下，将二值复数卷积替换为适合 FPGA 实现的 LUT 卷积。
 
-## Active Phases
+整个过程分为三个阶段：
 
-### Phase 1
+1. 使用全精度复数网络建立基础模型。
+2. 将网络训练为复数 Bi-Real 二值网络。
+3. 保持网络拓扑不变，仅将二值复数卷积替换为可学习的 LUTConv。
 
-Phase 1 trains the full-precision complex Bi-Real residual network.
-Residual-block activations use `ComplexReLU`, and their convolutions use
-`ComplexConv2d`.
+这条路线不再把 LUT 设计成额外的复杂算子，也不改变残差网络结构。LUTConv 直接承担原二值卷积的功能。
 
-### Phase 2
+## 2. Phase 1：全精度复数网络
 
-Phase 2 keeps the same architecture and state-dict keys, then replaces
-residual-block activations with `BinaryComplexActivation` and convolutions
-with `BinaryComplexConv2d`. The stem remains full precision unless
-`--binary-stem` is explicitly supplied.
+Phase 1 使用全精度复数激活和全精度复数卷积。
 
-Phase 2 normally initializes from a Phase 1 checkpoint. The loader requires
-all trainable parameters to map and rejects a checkpoint whose recorded
-phase is not Phase 1. `--train-from-scratch` is available as an explicit
-alternative.
+对于复数输入和权重
 
-### Phase 3
+\[
+x=x_r+jx_i, \qquad w=w_r+jw_i,
+\]
 
-Phase 3 replaces every residual main-path `BinaryComplexConv2d` with
-`PairLUTNeuronConv2d`. The default starts from a Phase 2 checkpoint: for each
-output channel, the Phase 2
-complex kernel is flattened in `[input_channel, ky, kx]` order and grouped into
-pairs. Each pair becomes one neuron:
+复数卷积为
 
-- Inputs: two binary complex activations, ordered as
-  `[x0_real, x0_imag, x1_real, x1_imag]`.
-- Outputs: one real bit and one imaginary bit, represented by two independent
-  16-entry truth tables with the same four inputs.
-- Initialization: enumerate all 16 input states, evaluate the two fixed Phase 2
-  binary complex weights, add the two products, and threshold each real or
-  imaginary sum with `>= 0`.
-- Odd tails: a missing second flattened position is represented by a fixed-low
-  dummy input and a zero mathematical weight during initialization.
-- Scale: the Phase 2 complex-weight alpha is retained as a fixed per-output
-  buffer; hard LUT counts use `(count - pair_count / 2) * 4 * alpha`.
+\[
+y_r=\operatorname{Conv}_{w_r}(x_r)-\operatorname{Conv}_{w_i}(x_i),
+\]
 
-With `--train-from-scratch`, no checkpoint is loaded. Stem, projection,
-BatchNorm, classifier, and other ordinary parameters keep their framework
-random initialization. `--lut-init-mode normal` samples every real/imag LUT
-entry independently from `Normal(0, LUT_LOGIT_INIT)`. The optional
-`--lut-init-mode bimodal` uses a 50/50 mixture of `Normal(-1, 0.2)` and
-`Normal(+1, 0.1)`. Both modes record the initial sign as the sign-diff baseline,
-and use a fixed LUT output scale of 1.0.
+\[
+y_i=\operatorname{Conv}_{w_r}(x_i)+\operatorname{Conv}_{w_i}(x_r).
+\]
 
-After conversion, the residual main path has no spatial weight parameters.
-The LUT logits are trainable and receive gradients through multilinear LUT
-interpolation; activation bits keep an STE path to preceding layers. Stem,
-projection, BatchNorm, and classifier parameters remain trainable.
+因此，一个复数卷积只有两套可学习的实数卷积参数：实部权重和虚部权重。两套权重分别在实部、虚部交叉计算中复用。
 
-The default schedule uses 160 soft epochs with geometric temperature annealing
-from 0.5 to 10.0, followed by 40 epochs of gradual soft-to-hard forward
-blending. Backpropagation always follows the soft table derivative. Only
-fully-hard epochs may create `Bestmodel_phase3.pt`, and checkpoints include
-explicit hard real/imag truth tables plus sign-difference diagnostics.
+Phase 1 的作用是学习完整的复数特征表达，并为后续二值化提供基础。
 
-`--lut-training-mode real_compatible` is an isolated controlled-comparison
-path. LUT entries are hard `0/1` from epoch 1, while
-`(hard - logit).detach() + logit` gives every selected logit an identity STE.
-It does not use tau or a soft-to-hard transition, so every epoch is deployable.
-The dedicated launcher additionally selects bimodal initialization, Adam,
-LR=0.01 for ordinary and LUT parameters, linear decay over 256 epochs, no
-gradient clipping or weight decay, batch size 256, CIFAR-10 AutoAugment and
-standard normalization, label smoothing 0.1, and all 50k training images.
-The LUT neuron remains the complex 4-input/2-output design; this mode aligns
-the optimization recipe, not the network topology.
+## 3. Phase 2：复数 Bi-Real 二值网络
 
-The LUT execution backend is independently selectable with
-`--lut-kernel-mode {auto,floating,binary}`. The default `auto` keeps the
-multilinear floating kernel for the annealing route and selects the packed
-binary CUDA kernel for `real_compatible`. Binary mode packs activation bits
-into 32-bit words, performs an exact hard truth-table lookup, and uses the same
-selected-entry LUT gradient and neighboring-entry input gradient as the
-real-domain implementation. Its inputs are the `0/1` values produced by
-`(binary_activation + 1) / 2` and are thresholded at `0.5`; combined with the
-complex Bi-Real activation STE, this gives the same input-gradient scale as the
-real network's `0/1` activation. Binary and floating backends are regression
-tested for exact forward and backward equality at hard Boolean corners,
-including channel counts that cross both 32-bit packing boundaries.
+Phase 2 保留 Phase 1 的网络拓扑，将残差主分支中的激活和卷积权重二值化。
 
-### Analytic Pair-Comparator Control
+复数激活被表示为两个二值分量：
 
-`--phase3-mode analytic_pair` is an isolated diagnostic for the current
-pairwise local truncation. It retains trainable latent binary-complex spatial
-weights. On every forward, each two-position weight group is converted into
-the same hard real/imag truth tables used by `PairLUTNeuronConv2d`; packed
-binary lookup therefore produces the exact deployable 4-input/2-output
-forward, including fixed-low padding and odd-tail behavior.
+\[
+x_b=\operatorname{sign}(x_r)+j\operatorname{sign}(x_i).
+\]
 
-The hard result is returned exactly. Backward does not optimize free LUT
-entries: it follows the identity-STE comparator proxy through the latent
-weights and activations. Since each pair comparator contributes
-`2 * alpha * sign(pair_sum)`, its identity proxy reduces to twice the
-corresponding binary complex convolution with the same fixed-low padding.
+复数权重同样由二值实部和二值虚部组成。前向传播继续使用标准复数卷积公式，因此仍然只有两套二值卷积权重，并在四个实数卷积项之间交叉复用。
 
-This mode distinguishes two failure sources:
+Bi-Real 的代理梯度用于绕过二值符号函数，使二值网络能够通过反向传播训练。除二值激活和二值卷积外，残差连接、归一化、下采样和分类器结构保持不变。
 
-- If it remains near the random pair-LUT result, the local two-bit truncation
-  or four-input grouping is the representation bottleneck.
-- If it approaches Phase 2 while free pair-LUT training remains poor, the
-  bottleneck is direct truth-table optimization.
+Phase 2 建立了 LUTConv 需要替代的直接基线：一个能够正常训练的二值复数网络。
 
-The dedicated launcher `run_phase3_pair_analytic.sh` uses the same scratch
-Adam/0.01/linear/real-LUT data recipe as the completed Phase 2 control. The
-default `--phase3-mode lut` and all existing LUT commands are unchanged.
+## 4. Phase 3：可配置分组复数 LUT 卷积
 
-Residual normalization is independently selectable with
-`--pre-bn-mode` and `--post-bn-mode` (or launcher variables `PRE_BN_MODE` and
-`POST_BN_MODE`). Both accept `covariance`, `naive`, and `none`, and default to
-`covariance` so existing checkpoints and commands retain the previous model.
-`naive` applies independent real/imag BatchNorm; `none` uses identity. The
-post mode controls both the main path after the convolution and the projection
-shortcut, avoiding a mixed projection definition during ablations. These
-switches apply to the shared Phase 1/2/3 residual-block implementation, while
-the stem's `bn1` remains covariance BatchNorm.
+Phase3 保持 Phase2 的 Bi-Real activation、残差、复数 BatchNorm、stem、projection
+和 classifier，只替换主分支卷积。Activation 的实部和虚部先各自二值化，再从
+`{-1,+1}` 编码为严格 `{0,1}`。
 
-## Commands
+通过 `lut_inputs=k` 配置单张 LUT 的输入 bit 数，当前支持 `k in {4,6}`。每个
+二值复数占两个 bit，所以一组包含
 
-Phase 1:
+\[
+n=k/2
+\]
 
-```bash
-GPU_ID=0 WORKDIR=runs/phase1 ./run_phase1.sh
+个复数 activation：
+
+- `k=4`：两个复数输入，两张 LUT4 分别输出实部、虚部 bit；
+- `k=6`：三个复数输入，两张 LUT6 分别输出实部、虚部 bit。
+
+卷积窗口通过 `F.unfold` 按
+
+```text
+channel -> kernel_row -> kernel_col
 ```
 
-Phase 2 from the retained canonical Phase 1 model:
+展开为 `Cin*kernel²` 个复数位置，再按每 `n` 个连续复数分组。每组地址顺序始终为
+
+```text
+[x0_real,x0_imag,x1_real,x1_imag,...]
+```
+
+组数为
+
+\[
+G=\left\lceil\frac{C_{in}kernel^2}{n}\right\rceil.
+\]
+
+尾组不足时，从当前卷积窗口的开头复制输入位置补齐；Phase2 解析初始化将这些补齐
+位置的数学权重设为 0。每组的两路 LUT 输出分别沿 group 维累加，得到实部、虚部
+`[0,G]` 计数，再进入 post complex-BN 与残差路径。
+
+### Phase2 checkpoint 初始化
+
+提供 Phase2 checkpoint 时，对每组对应的 `n` 个二值复权重遍历全部 `2^k` 个输入
+状态，计算
+
+\[
+z=\sum_{t=0}^{n-1}x_tw_t,
+\]
+
+并以 `real(z)>=0`、`imag(z)>=0` 生成初始双 LUT 表。该解析初始化只是一个可复现
+起点，不意味着局部截断运算与原 Phase2 整层累加等价。共享 BN、projection、stem
+和 classifier 继续从 Phase2 checkpoint 加载。
+
+## 5. LUT 参数化与硬件映射
+
+两种训练参数化均支持 `k=4/6`，默认仍是 `k=4 + independent`。
+
+### Independent（默认）
+
+维护
+
+```text
+[2*Cout, G, 2^k]
+```
+
+个 logits；实部和虚部表独立 hard threshold，反向使用 identity STE。
+
+### Categorical complex output（可选）
+
+维护
+
+```text
+[Cout, G, 2^k, 4]
+```
+
+个 logits。每个地址的四个类别共同表示一个合法二值复数输出：
+
+```text
+0 -> 00 -> -1-j
+1 -> 01 -> -1+j
+2 -> 10 ->  1-j
+3 -> 11 ->  1+j
+```
+
+forward 使用 hard argmax，乘固定 `[4,2]` 码本后生成两张严格 `{0,1}` 的
+`2^k`-entry LUT；backward 使用 `softmax(logits/tau)` 作为 argmax 代理，当前
+`tau=1.0`。Phase2 初始化时目标类别 logit 为 0.25，其余类别为 0；from-scratch
+时使用 `N(0,0.01)`。
+
+### CUDA 与 FPGA
+
+- `k=4`：将两个 dummy 0 bit 追加到地址，并把 16-entry 表复制扩展成 64-entry，
+  调用现有 LUT6 backend；
+- `k=6`：64-entry 表和六位地址直接调用现有 LUT6 backend；
+- 两种 categorical 配置最终都只导出两张硬表，训练期增加的四分类 logits 不进入
+  FPGA，因此不会额外增加推理逻辑。
+
+`complexPyTorch/lut_backend.py` 和 CUDA 源文件均不需要修改。
+
+### 已完成 LUT4 categorical 基线
+
+`runs/phase3_pair_lut4_categorical_phase2init_sf11_lr002` 已完成 256 epochs：
+
+- optimizer Adam，initial LR `0.02`，multistep schedule；
+- best test accuracy `82.53%`，epoch 248；
+- final test accuracy `81.80%`；
+- 全程 256 epochs finite，无 NaN/Inf。
+
+这是本次三复数 LUT6 实验的直接比较基线。
+
+### LUT6 categorical 命令
 
 ```bash
 GPU_ID=1 \
-WORKDIR=runs/phase2 \
-CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase1.pt \
-./run_phase2.sh
-```
-
-Phase 3 from the retained canonical Phase 2 model:
-
-```bash
-GPU_ID=2 \
-WORKDIR=runs/phase3_pair_lut \
 CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase2.pt \
+START_FILTER=11 \
+NUM_BLOCKS=3 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical \
+LUT_INPUTS=6 \
+LR=0.02 \
+SCHEDULE=multistep \
+WORKDIR=runs/phase3_lut6_categorical_phase2init_sf11_lr002 \
 ./run_phase3.sh
 ```
 
-Phase 3 overrides are explicit environment variables:
+batch 中间日志默认关闭，每个 epoch 打印一次汇总。
+
+## 6. 已完成扩宽实验
+
+此前 same-spatial/channel-priority PairLUT4 的 256-epoch from-scratch 实验：
+
+- best test：`81.10%`，epoch 116；
+- final test：`77.83%`；
+- Phase2 baseline：`85.05%`。
+
+随后测试了 TripleLUT6：同一 spatial tap 内每三个复数输入六个 bit，两张 LUT6
+分别输出实部和虚部。该实验同样训练 256 epoch：
+
+- best test：`76.94%`，epoch 120；
+- final test：`67.42%`；
+- 相对 PairLUT4 best 下降 `4.16 pp`；
+- 完整模型参数约从 `2.03M` 增至 `5.63M`；
+- 对 \(C_{in}=11,k=3\)，物理 LUT site 估算从 当前 channel-major PairLUT4 的 50 增至
+  TripleLUT6 的 72，约增加 44%。
+
+恢复后的 channel-major PairLUT4 尚未用当前 Phase2 解析初始化重新训练，因此上述 81.10% 仅作为历史布局结果，不能视为当前配置成绩。
+
+因此 TripleLUT6 没有带来精度收益，且后期回落更严重、资源更多，不再作为默认
+路线。实现保留用于复现：
 
 ```bash
-GPU_ID=2 LUT_LR=0.005 LUT_LOGIT_INIT=1.0 \
-LUT_TAU_MIN=0.5 LUT_TAU_MAX=10 \
-LUT_ANNEAL_EPOCHS=160 LUT_HARD_TRANSITION_EPOCHS=40 \
-WORKDIR=runs/phase3_pair_lut_lr005 ./run_phase3.sh
+PHASE3_OPERATOR=triple_lut6 ./run_phase3.sh
 ```
 
-Phase 3 from scratch with random LUT logits:
+旧 shared-LUT6 complex-convolution 对照也继续保留：
 
 ```bash
-GPU_ID=2 TRAIN_FROM_SCRATCH=1 LUT_LOGIT_INIT=1.0 LR=0.01 \
-WORKDIR=runs/phase3_pair_lut_scratch ./run_phase3.sh
+PHASE3_OPERATOR=shared_lut6 ./run_phase3.sh
 ```
 
-Phase 3 real-compatible controlled comparison:
+## 7. 路线总结
+
+\[
+\text{全精度复数网络}
+\rightarrow
+\text{复数 Bi-Real 网络}
+\rightarrow
+\text{成对 LUT4 复数网络}.
+\]
+
+当前结论不是 PairLUT4 已超过 Phase2，而是它在已测试的 LUT-neuron 粒度中优于
+TripleLUT6，并使用更少资源，因此恢复为后续优化的基础版本。
+
+
+## 8. 并行 dominance-bit LUT6 分支
+
+该分支不替换默认 PairLUT4，而是增加一个独立对照。每个量化前复数激活并行产生：
+
+\[
+s_r=1[x_r>0],\quad s_i=1[x_i>0],\quad p=1[|x_r|>|x_i|].
+\]
+
+每两个复数形成一个六位地址：
+
+```text
+[sr0, si0, p0, sr1, si1, p1]
+```
+
+一组 categorical logits 的 shape 为 `[Cout, group_num, 64, 4]`，四个类别映射为
+复数输出 bit `00/01/10/11`。forward 使用 hard argmax，backward 使用 softmax STE。
+`p` 的 forward 是严格比较器。默认 `dominance_grad_mode=stop`，因此 LUT 输出不会
+经由 `p` 回传到量化前实部和虚部，但 categorical LUT slice 仍正常学习。旧的
+clipped-linear STE 代理保留为 `dominance_grad_mode=ste`，只用于复现实验。
+
+dominance LUT6 的主初始化方式是读取训练完成的 categorical LUT4 Phase3 checkpoint。
+对新地址 `[r,i,p,r',i',p']`，按 `[r,i,r',i']` 计算旧地址并复制完整四类
+logits，因此每个旧 entry 在两个 dominance 维度上扩展为四个语义等价 entry。
+由于 bit 排列交错，旧地址 `0000` 对应的新整数地址为 `0,1,8,9`，不能直接按
+连续内存 `repeat_interleave(4)`。
+
+该 warm start 在初始 hard forward 和 softmax proxy 上都与 LUT4 严格等价，随后
+`p0/p1` 对应的 logits slice 独立接收梯度并允许分化。Phase2 checkpoint 与
+from-scratch 随机 LUT6 仍保留为对照，但不再是推荐起点。默认
+`standard + LUT4` 路线保持不变。
+
+运行配置：
 
 ```bash
-GPU_ID=1 \
-WORKDIR=runs/phase3_pair_lut_real_compatible \
-./run_phase3_real_compatible.sh
+CHECKPOINT=runs/phase3_pair_lut4_categorical_phase2init_sf11_lr002/chkpts/Bestmodel_phase3.pt \
+PAIR_LUT_PARAMETERIZATION=categorical \
+LUT_INPUTS=6 \
+PAIR_LUT_ENCODING=dominance \
+DOMINANCE_GRAD_MODE=stop \
+DOMINANCE_STE_MARGIN=1.0 \
+./run_phase3.sh
 ```
+## 9. 共享 LUT4 基表的 dominance residual
 
-This wrapper defaults `LUT_KERNEL_MODE=binary`. Set
-`LUT_KERNEL_MODE=floating` only for a backend-equivalence diagnostic.
+无约束 dominance LUT6 会把每个 LUT4 地址立即拆成四个低样本 slice。新实验模式
+`PAIR_LUT_PARAMETERIZATION=categorical_residual` 改为：
 
-This recipe deliberately trains on all 50k CIFAR-10 training images and uses
-test accuracy for selection to match the referenced real LUT code. Keep its
-result separate from validation-selected runs used for final reporting.
+[
+Z_6(a,p)=B_4(a)+alpha(D_6(a,p)-mean_p D_6(a,p)).
+]
 
-The launcher defaults the ordinary network LR to 0.01 in scratch mode and
-0.001 in Phase 2 checkpoint mode. An explicit `LR` always overrides this.
+- `B4` 从 categorical LUT4 checkpoint 读取并冻结；
+- `D6` 为可学习 64-entry residual，初始化为零；
+- 同一个旧地址的四个 dominance residual 强制零均值；
+- `alpha` 从较小值逐渐增加，控制 LUT slice 的分化速度；
+- residual 使用独立学习率，普通网络参数使用更小的 continuation LR；
+- forward 从始至终物化为 hard 64-entry LUT6，最终硬件没有额外结构。
 
-Common overrides:
+推荐实验：
 
 ```bash
 GPU_ID=0 \
-WORKDIR=runs/phase2_cosine \
-CHECKPOINT=bi_workdir/chkpts/Bestmodel_phase1.pt \
-NUM_EPOCHS=200 \
-BATCH_SIZE=256 \
-LR=0.01 \
-SCHEDULE=cosine \
-./run_phase2.sh
+CHECKPOINT=runs/phase3_pair_lut4_categorical_phase2init_sf11_lr002/chkpts/Bestmodel_phase3.pt \
+START_FILTER=11 NUM_BLOCKS=3 NUM_EPOCHS=200 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical_residual \
+LUT_INPUTS=6 PAIR_LUT_ENCODING=dominance \
+DOMINANCE_GRAD_MODE=stop \
+LR=0.0002 SCHEDULE=constant \
+DOMINANCE_RESIDUAL_LR=0.002 \
+DOMINANCE_RESIDUAL_ALPHA_START=0.1 \
+DOMINANCE_RESIDUAL_ALPHA_END=1.0 \
+DOMINANCE_RESIDUAL_RAMP_EPOCHS=120 \
+WORKDIR=runs/phase3_lut6_dominance_sharedres_lr2e4_reslr2e3 \
+./run_phase3.sh
 ```
 
-Use a distinct `WORKDIR` for concurrent runs. Phase-specific names prevent
-different phases from overwriting each other in one workdir, but two
-concurrent runs of the same phase must not share a workdir.
+主训练最佳 test accuracy 为 84.28%。随后从其 best checkpoint 以普通参数 LR
+`0.0001`、residual LR `0.001`、`alpha=1` 继续训练 100 epochs，得到当前最佳：
 
-## Training Contract
+- best test accuracy：**84.56%**（continuation epoch 77）；
+- LUT4 categorical warm-start：82.53%；
+- dominance residual 相对 LUT4 提升：2.03 个百分点；
+- p0/p1 hard category sensitivity：17.04% / 17.02%，说明两个新增 bit 已被 LUT6 使用；
+- 最终硬件仍是两张 64-entry、单 bit 输出的 LUT6，不保留训练期 logits、base 或 residual 结构。
 
-- Default epochs: 200.
-- Default batch size: 128 per process.
-- Default optimizer: SGD with momentum 0.9.
-- Default base learning rate: 0.1.
-- Default schedule: five-epoch warmup to the supplied base learning rate,
-  followed by the Bi-Real piecewise decay.
-- Available schedules: `bireal`, `cosine`, `constant`, and `linear`.
-- No schedule may exceed the externally supplied base learning rate.
-- No hidden tuning mode changes epochs, batch size, optimizer, or LR.
-- Phase 3 LUT parameters use an independent learning rate and schedule and no
-  weight decay. Defaults are `LUT_LR=0.01` and a constant LUT schedule.
-- Validation accuracy selects the best checkpoint. With
-  `--no-validation`, test accuracy is the selection metric.
-
-Each workdir receives:
-
-- `chkpts/Bestmodel_phase1.pt`, `Bestmodel_phase2.pt`, or
-  `Bestmodel_phase3.pt`
-- `chkpts/Lastmodel_phase1.pt`, `Lastmodel_phase2.pt`, or
-  `Lastmodel_phase3.pt`
-- `phase_metrics.json`
-- `phase{N}_{train,val,test}_{loss,acc}.txt`
-- `logs/train.txt`
-- `pixel_mean.pt`
-
-## Retained Baseline
-
-Canonical assets remain in `bi_workdir/`:
-
-- Phase 1 best validation accuracy: 0.9092; test accuracy: 0.8948.
-- Phase 2 best validation accuracy: 0.8310; test accuracy: 0.8221.
-- `bi_workdir/chkpts/Bestmodel_phase1.pt`
-- `bi_workdir/chkpts/Bestmodel_phase2.pt`
-
-The rebuilt loader was verified to map all 258 tensors from the retained
-Phase 1 checkpoint into the Phase 2 model without missing keys.
-
-## LUT Building Blocks
-
-The LUT implementation areas are:
-
-- `complexPyTorch/complexLayers.py`
-- `complexPyTorch/lut_backend.py`
-- `lut_cuda/`
-
-`PairLUTNeuronConv2d` is active only in Phase 3. The earlier
-`ComplexLUTConv2d` and `LUTAwareComplexBinaryConv2d` building blocks remain
-importable but are not instantiated by the active model route.
-
-## Archive
-
-All retired route entrypoints, flow modules, tests, scripts, reports,
-checkpoints, logs, and run directories are under
-`backup/route_reset_phase12_20260729/legacy_tree/`. The machine-readable
-inventory is `archive_manifest.json`.
-
-The old experiment history remains at:
-
-`backup/route_reset_phase12_20260729/legacy_tree/PHASE4_LUT_EXPERIMENT_LOG.md`
-
-## Verification
+当前推荐的续训方式：
 
 ```bash
-conda run -n lut_net python -m unittest discover -s tests -v
-conda run -n lut_net python scripts/audit_active_route.py
+GPU_ID=0 \
+CHECKPOINT=runs/phase3_lut6_dominance_sharedres_lr2e4_reslr2e3/chkpts/Bestmodel_phase3.pt \
+START_FILTER=11 NUM_BLOCKS=3 NUM_EPOCHS=100 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical_residual \
+LUT_INPUTS=6 PAIR_LUT_ENCODING=dominance DOMINANCE_GRAD_MODE=stop \
+LR=0.0001 SCHEDULE=constant DOMINANCE_RESIDUAL_LR=0.001 \
+DOMINANCE_RESIDUAL_ALPHA_START=1.0 DOMINANCE_RESIDUAL_ALPHA_END=1.0 \
+DOMINANCE_RESIDUAL_RAMP_EPOCHS=1 \
+WORKDIR=runs/phase3_lut6_dominance_sharedres_continue_lr1e4 \
+./run_phase3.sh
 ```
 
-Analyze a new run before adding conclusions to the experiment log:
-
-```bash
-python scripts/analyze_training_run.py runs/phase3_pair_lut
-```
+Walsh/ANOVA 参数化的 clean 对照只有 83.53%，低于 direct categorical residual。
+因此 Walsh 已从可执行代码、CLI、测试和当前分析脚本中移除；失败结果仍保留在
+`EXPERIMENT_LOG.md` 作为实验历史。

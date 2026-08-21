@@ -5,17 +5,17 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 export GPU_ID=${GPU_ID:-0}
 export DATADIR=${DATADIR:-"$ROOT_DIR/data"}
-export WORKDIR=${WORKDIR:-"$ROOT_DIR/runs/phase2"}
+export WORKDIR=${WORKDIR:-"$ROOT_DIR/runs/phase2_complex_bireal"}
 
-NUM_EPOCHS=${NUM_EPOCHS:-200}
+NUM_EPOCHS=${NUM_EPOCHS:-256}
 BATCH_SIZE=${BATCH_SIZE:-128}
-START_FILTER=${START_FILTER:-11}
+START_FILTER=${START_FILTER:-16}
 NUM_BLOCKS=${NUM_BLOCKS:-3}
-LR=${LR:-0.1}
-SCHEDULE=${SCHEDULE:-bireal}
-WEIGHT_DECAY=${WEIGHT_DECAY:-0.0001}
-SPECTRAL_POOL_SCHEME=${SPECTRAL_POOL_SCHEME:-none}
-BINARY_WEIGHT_SCALE=${BINARY_WEIGHT_SCALE:-channel}
+LR=${LR:-0.01}
+SCHEDULE=${SCHEDULE:-bireal_reference}
+WEIGHT_DECAY=${WEIGHT_DECAY:-0}
+POST_BN_MODE=${POST_BN_MODE:-covariance}
+NUM_WORKERS=${NUM_WORKERS:-8}
 
 ARGS=(
   --phase 2
@@ -23,23 +23,29 @@ ARGS=(
   --batch-size "$BATCH_SIZE"
   --start-filter "$START_FILTER"
   --num-blocks "$NUM_BLOCKS"
+  --optimizer adam
   --lr "$LR"
   --schedule "$SCHEDULE"
   --weight-decay "$WEIGHT_DECAY"
-  --spectral-pool-scheme "$SPECTRAL_POOL_SCHEME"
-  --binary-weight-scale "$BINARY_WEIGHT_SCALE"
+  --clipnorm 0
+  --clipval 0
+  --spectral-pool-scheme none
+  --binary-weight-scale channel
+  --weight-grad-mode ste
+  --activation-grad-mode bireal
+  --post-bn-mode "$POST_BN_MODE"
+  --augmentation real_lut
+  --label-smoothing 0.1
+  --no-validation
+  --num-workers "$NUM_WORKERS"
 )
 
-if [[ "${TRAIN_FROM_SCRATCH:-0}" == "1" ]]; then
-  ARGS+=(--train-from-scratch)
-else
-  CHECKPOINT=${CHECKPOINT:-"$ROOT_DIR/bi_workdir/chkpts/Bestmodel_phase1.pt"}
+if [[ -n "${CHECKPOINT:-}" ]]; then
   ARGS+=(--checkpoint "$CHECKPOINT")
+else
+  ARGS+=(--train-from-scratch)
 fi
 
-printf 'Running Phase 2 on GPU %s\n' "$GPU_ID"
+printf 'Running complex Bi-Real Phase 2 on GPU %s\n' "$GPU_ID"
 printf 'Workdir: %s\n' "$WORKDIR"
-if [[ "${TRAIN_FROM_SCRATCH:-0}" != "1" ]]; then
-  printf 'Checkpoint: %s\n' "$CHECKPOINT"
-fi
 exec "$ROOT_DIR/run_training.sh" "${ARGS[@]}" "$@"

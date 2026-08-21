@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Verify the active Phase 1/2/3 route and retained LUT building blocks."""
+"""Audit the clean Phase 1/2/3 complex Bi-Real route."""
 
 import argparse
 import sys
 from pathlib import Path
-
-import torch.nn as nn
-
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -15,11 +12,13 @@ if str(ROOT) not in sys.path:
 import training
 from complexPyTorch.complexBinaryResNet import BinaryComplexResNet
 from complexPyTorch.complexLayers import (
-    AnalyticPairComparatorConv2d,
-    ComplexAvgPool2d,
-    ComplexLUTConv2d,
-    LUTAwareComplexBinaryConv2d,
-    PairLUTNeuronConv2d,
+    BinaryComplexActivation,
+    BinaryComplexBitActivation,
+    BinaryComplexConv2d,
+    ComplexConv2d,
+    PairLUT4ComplexConv2d,
+    TripleLUT6ComplexConv2d,
+    TwoLUTComplexConv2d,
 )
 
 
@@ -29,143 +28,76 @@ def audit(root):
     if set(training.PHASE_DESCRIPTIONS) != {1, 2, 3}:
         failures.append("training.PHASE_DESCRIPTIONS is not exactly {1, 2, 3}")
 
-    run_phase_scripts = sorted(
-        path.name for path in root.glob("run_phase*.sh")
-    )
-    if run_phase_scripts != [
-        "run_phase1.sh",
-        "run_phase2.sh",
-        "run_phase2_complex_bireal.sh",
-        "run_phase3.sh",
-        "run_phase3_pair_analytic.sh",
-        "run_phase3_real_compatible.sh",
-    ]:
-        failures.append(
-            "active phase scripts are {}".format(run_phase_scripts)
-        )
+    scripts = sorted(path.name for path in root.glob("run_phase*.sh"))
+    if scripts != ["run_phase1.sh", "run_phase2.sh", "run_phase3.sh"]:
+        failures.append("active phase scripts are {}".format(scripts))
 
-    archived_module_names = [
-        "directLut5Flow.py",
-        "dualLut6Flow.py",
-        "fixedAnalyticDominanceFlow.py",
-        "mlpFlow.py",
-    ]
-    for name in archived_module_names:
-        if (root / "complexPyTorch" / name).exists():
-            failures.append("experimental module remains active: " + name)
-
-    for phase in (1, 2):
-        model = BinaryComplexResNet(
+    models = {
+        phase: BinaryComplexResNet(
             in_channels=3,
             num_blocks=1,
-            start_filters=2,
+            start_filters=16,
             num_classes=10,
             is_sar_input=False,
             phase=phase,
         )
-        lut_modules = [
-            module.__class__.__name__
-            for module in model.modules()
-            if "LUT" in module.__class__.__name__
-        ]
-        if lut_modules:
+        for phase in (1, 2, 3)
+    }
+    expected = {
+        1: ComplexConv2d,
+        2: BinaryComplexConv2d,
+        3: PairLUT4ComplexConv2d,
+    }
+    for phase, model in models.items():
+        if not isinstance(model.stage2[0].conv, expected[phase]):
+            failures.append("Phase {} uses {}".format(phase, type(model.stage2[0].conv).__name__))
+        if not hasattr(model, "learn_imag"):
+            failures.append("Phase {} CIFAR path has no LearnImagBlock".format(phase))
+        if hasattr(model.stage2[0], "bn_pre"):
+            failures.append("Phase {} still exposes pre-BN".format(phase))
+
+    phase3 = models[3]
+    if not isinstance(models[2].stage2[0].act, BinaryComplexActivation):
+        failures.append("Phase 2 does not use signed binary activation")
+    if isinstance(models[2].stage2[0].act, BinaryComplexBitActivation):
+        failures.append("Phase 2 unexpectedly uses 0/1 LUT bit activation")
+    if not isinstance(phase3.stage2[0].act, BinaryComplexBitActivation):
+        failures.append("Phase 3 does not use exact 0/1 LUT bit activation")
+    operators = [
+        block.conv
+        for stage in (phase3.stage2, phase3.stage3, phase3.stage4)
+        for block in stage
+    ]
+    if not all(isinstance(op, PairLUT4ComplexConv2d) for op in operators):
+        failures.append("Phase 3 contains a non-grouped complex LUT operator")
+    for operator in operators:
+        expected_groups = (
+            operator.logical_positions
+            + operator.complex_inputs_per_lut
+            - 1
+        ) // operator.complex_inputs_per_lut
+        expected_shape = (
+            2 * operator.out_channels,
+            expected_groups,
+            1 << operator.lut_inputs,
+        )
+        if tuple(operator.weight.shape) != expected_shape:
             failures.append(
-                "Phase {} instantiates LUT modules: {}".format(
-                    phase,
-                    lut_modules,
+                "Phase 3 independent LUT shape {} != {}".format(
+                    tuple(operator.weight.shape), expected_shape
                 )
             )
-    phase3 = BinaryComplexResNet(
-        in_channels=3,
-        num_blocks=1,
-        start_filters=2,
-        num_classes=10,
-        is_sar_input=False,
-        phase=3,
-    )
-    pair_layers = [
-        module
-        for module in phase3.modules()
-        if isinstance(module, PairLUTNeuronConv2d)
-    ]
-    if not pair_layers:
-        failures.append("Phase 3 instantiates no PairLUTNeuronConv2d layers")
-    legacy_active = [
-        module.__class__.__name__
-        for module in phase3.modules()
-        if isinstance(module, (ComplexLUTConv2d, LUTAwareComplexBinaryConv2d))
-    ]
-    if legacy_active:
-        failures.append("Phase 3 instantiates legacy LUT layers: {}".format(legacy_active))
-    if any(".conv.conv_" in name for name, _ in phase3.named_parameters()):
-        failures.append("Phase 3 pair-LUT path retains spatial convolution weights")
 
-    standard_bireal = BinaryComplexResNet(
-        in_channels=3,
-        num_blocks=1,
-        start_filters=2,
-        num_classes=10,
-        is_sar_input=False,
-        phase=2,
-        bireal_topology="standard",
-    )
-    if not hasattr(standard_bireal, "learn_imag"):
-        failures.append(
-            "standard complex Bi-Real CIFAR path has no LearnImagBlock"
-        )
-    if standard_bireal.stage2[0].proj is not None:
-        failures.append(
-            "standard complex Bi-Real Stage 2 has an unnecessary projection"
-        )
-    if not isinstance(standard_bireal.stage2[0].bn_pre, nn.Identity):
-        failures.append(
-            "standard complex Bi-Real block still has pre-activation BN"
-        )
-    stage3_projection = standard_bireal.stage3[0].proj
-    if (
-        stage3_projection is None
-        or not isinstance(stage3_projection[0], ComplexAvgPool2d)
-    ):
-        failures.append(
-            "standard complex Bi-Real downsample does not start with AvgPool"
-        )
-    if standard_bireal.stage2[0].conv.weight_proxy_mode != "bireal":
-        failures.append(
-            "standard complex Bi-Real does not use the reference weight proxy"
-        )
+    parsed = training.parse_args([])
+    if parsed.pair_lut_parameterization != "independent":
+        failures.append("PairLUT parameterization default is not independent")
+    if parsed.pair_lut_inputs != 4:
+        failures.append("PairLUT input default is not 4")
 
-    analytic = BinaryComplexResNet(
-        in_channels=3,
-        num_blocks=1,
-        start_filters=2,
-        num_classes=10,
-        is_sar_input=False,
-        phase=3,
-        phase3_mode="analytic_pair",
-    )
-    analytic_layers = [
-        module
-        for module in analytic.modules()
-        if isinstance(module, AnalyticPairComparatorConv2d)
-    ]
-    if not analytic_layers:
-        failures.append(
-            "Phase 3 analytic mode instantiates no comparator layers"
-        )
-    analytic_parameters = dict(analytic.named_parameters())
-    if any(
-        name.endswith(("pair_lut.lut_r", "pair_lut.lut_i"))
-        for name in analytic_parameters
-    ):
-        failures.append("Phase 3 analytic mode has trainable LUT entries")
-    if not any(".conv.conv_r.weight" in name for name in analytic_parameters):
-        failures.append("Phase 3 analytic mode has no latent real weights")
-    if not any(".conv.conv_i.weight" in name for name in analytic_parameters):
-        failures.append("Phase 3 analytic mode has no latent imaginary weights")
-    if not issubclass(ComplexLUTConv2d, nn.Module):
-        failures.append("ComplexLUTConv2d is unavailable")
-    if not issubclass(LUTAwareComplexBinaryConv2d, nn.Module):
-        failures.append("LUTAwareComplexBinaryConv2d is unavailable")
+    forbidden = ("phase3_mode", "pre_bn", "bireal_topology")
+    for name in vars(parsed):
+        if any(token in name.lower() for token in forbidden):
+            failures.append("archived CLI option remains: " + name)
     return failures
 
 
@@ -178,13 +110,11 @@ def main(argv=None):
         for failure in failures:
             print("FAIL: " + failure)
         raise SystemExit(1)
-    print("PASS: active route exposes only Phase 1/2/3")
-    print("PASS: Phase 1/2 models instantiate no LUT modules")
-    print("PASS: Phase 3 replaces spatial weights with pair-LUT neurons")
-    print("PASS: analytic Phase 3 retains latent weights without trainable LUT entries")
-    print("PASS: standard complex Bi-Real retains the CIFAR LearnImagBlock")
-    print("PASS: standard complex Bi-Real residual topology matches the reference")
-    print("PASS: retained LUT complex layers remain importable")
+    print("PASS: active scripts expose one launcher per Phase 1/2/3")
+    print("PASS: Phase 2 is complex Bi-Real")
+    print("PASS: Phase 2 uses +/-1 while Phase 3 LUT inputs use exact 0/1")
+    print("PASS: Phase 3 uses configurable channel-major complex groups and two LUT outputs")
+    print("PASS: each grouped complex LUT has 2^k entries and hard binary forward")
 
 
 if __name__ == "__main__":
