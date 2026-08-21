@@ -3834,3 +3834,19 @@ CLI、调度、测试和 checkpoint 分析脚本中完全移除 Walsh，不再�
 - 删除旧 `run_phase2_complex_bireal.sh`、`run_phase3_pair_analytic.sh`、
   `run_phase3_real_compatible.sh`、旧 pair-LUT 分析脚本、旧独立测试文件和未使用的
   `lut_conv_bafw_cuda_backend_top1.cu`，使活动目录只呈现当前 Phase1/2/3 路线。
+
+## 2026-08-21：Git 工作目录整理
+
+本次只整理版本控制边界，不删除本地 checkpoint、数据集、backup 或生成报告。历史上
+误跟踪的 Python bytecode、CUDA shared objects、object files 与 nested build 目录已从
+Git index 移除，并由 ignore 规则统一管理。由失败补丁工具产生的 `.orig` 临时副本和
+两个空占位文件已从本地删除。
+
+### 文件修改总结
+
+- `.gitignore`：忽略 native build 产物、backup、checkpoint 工作目录、数据集、报告、
+  外部参考代码、PDF 与补丁临时文件。
+- `EXPERIMENT_LOG.md`：记录本次 Git 目录整理的范围与不删除本地资产的约束。
+- `scripts/analyze_dominance_lut_checkpoint.py`：去掉文件尾多余空行，仅做格式整理。
+- `complexPyTorch/__pycache__/`、`lut_cuda/build/`、`lut_cuda/*.so`：仅取消 Git 跟踪，
+  本地构建文件仍保留，后续可正常运行和重编译。

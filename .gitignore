@@ -9,3 +9,24 @@ htmlcov/
 /runs/
 /logs/
 /chkpts/
+
+# Native extension outputs
+*.so
+*.o
+*.a
+build/
+.ninja_*
+
+# Local experiment assets
+/backup/
+/bi_workdir/
+/data/
+/reports/
+/cifar-10-batches-py/
+/cifar-10-python.tar.gz
+/deep_complex_networks/
+/*.pdf
+/LUT6Function
+/binary_lut
+*.orig
+*.rej
