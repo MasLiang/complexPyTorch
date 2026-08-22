@@ -332,3 +332,107 @@ WORKDIR=runs/phase3_lut6_dominance_sharedres_continue_lr1e4 \
 Walsh/ANOVA 参数化的 clean 对照只有 83.53%，低于 direct categorical residual。
 因此 Walsh 已从可执行代码、CLI、测试和当前分析脚本中移除；失败结果仍保留在
 `EXPERIMENT_LOG.md` 作为实验历史。
+
+
+## 10. 可控 LUT4 common correction
+
+在当前 84.56% categorical residual 路线上，增加与 dominance residual 正交的
+LUT4 common correction：
+
+\[
+Z(a,p)=B(a)+\beta\,C_c(a)+\alpha\,R_c(a,p).
+\]
+
+其中 `B[O,G,16,4]` 是冻结的 LUT4 checkpoint logits；
+`C[O,G,16,4]` 是新增可学习 common correction，并在四个输出类别上减均值得到
+`C_c`；`R[O,G,64,4]` 继续在同一个 LUT4 地址的四个 dominance slice 上减均值
+得到 `R_c`。因此 `C_c` 只修改四个 slice 共同的 LUT4 operation，`R_c` 只修改
+slice 间差异，两者没有不可辨识的重叠。
+
+该功能默认关闭：`DOMINANCE_BASE_LR=0`、base alpha 为 0。旧 84.56% checkpoint
+没有 correction 参数时会自动零初始化，加载后的 hard forward 完全不变。最终仍将总 logits
+argmax 后物化为两张 64-entry LUT6，不增加 FPGA 资源。
+
+建议从当前 best checkpoint 做第一组联合续训：
+
+```bash
+GPU_ID=0 \
+CHECKPOINT=runs/phase3_lut6_dominance_sharedres_continue_lr1e4/chkpts/Bestmodel_phase3.pt \
+WORKDIR=runs/phase3_lut6_commonbase_lr1e4_reslr5e4 \
+START_FILTER=11 NUM_BLOCKS=3 NUM_EPOCHS=100 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical_residual \
+LUT_INPUTS=6 PAIR_LUT_ENCODING=dominance DOMINANCE_GRAD_MODE=stop \
+LR=0.00005 SCHEDULE=constant \
+DOMINANCE_RESIDUAL_LR=0.0005 \
+DOMINANCE_RESIDUAL_ALPHA_START=1 DOMINANCE_RESIDUAL_ALPHA_END=1 \
+DOMINANCE_RESIDUAL_RAMP_EPOCHS=1 \
+DOMINANCE_BASE_LR=0.0001 \
+DOMINANCE_BASE_ALPHA_START=0 DOMINANCE_BASE_ALPHA_END=1 \
+DOMINANCE_BASE_RAMP_EPOCHS=20 \
+./run_phase3.sh
+```
+
+
+### From-scratch 对照
+
+为检验 LUT4/LUT6 warm-start 是否限制在旧局部最优，增加一组除初始化外完全相同的
+对照。`categorical_residual` 无 checkpoint 时，16-entry base 和 64-entry residual
+均使用 `N(0,0.01)`，破除 hard argmax 的类别对称；common correction 仍从 0 开始。
+提供 LUT4 或旧 residual checkpoint 时，加载逻辑会覆盖随机值并恢复严格等价起点。
+
+```bash
+GPU_ID=3 CHECKPOINT= \
+WORKDIR=runs/phase3_lut6_commonbase_fromscratch_samecfg \
+START_FILTER=11 NUM_BLOCKS=3 NUM_EPOCHS=100 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical_residual \
+LUT_INPUTS=6 PAIR_LUT_ENCODING=dominance DOMINANCE_GRAD_MODE=stop \
+LR=0.00005 SCHEDULE=constant \
+DOMINANCE_RESIDUAL_LR=0.0005 \
+DOMINANCE_RESIDUAL_ALPHA_START=1 DOMINANCE_RESIDUAL_ALPHA_END=1 \
+DOMINANCE_RESIDUAL_RAMP_EPOCHS=1 \
+DOMINANCE_BASE_LR=0.0001 \
+DOMINANCE_BASE_ALPHA_START=0 DOMINANCE_BASE_ALPHA_END=1 \
+DOMINANCE_BASE_RAMP_EPOCHS=20 \
+./run_phase3.sh
+```
+
+该命令刻意保留 continuation 的低普通参数 LR，以形成单变量初始化消融。若 scratch
+组失败，结论应限定为“当前低 LR schedule 依赖 warm start”，不能直接推出随机 LUT6
+无法从头训练。
+
+
+### Common correction 首轮结果与联合释放消融
+
+从已训练 LUT6 residual 的 84.56% checkpoint 再释放 LUT4 common correction，100
+epochs 完成：best test 85.09%（epoch 39），final 84.34%。这说明 common correction
+有约 0.53 个百分点收益，但后期存在 drift，必须按 best checkpoint 选择。完全 scratch
+同配置在 epoch 60 停止，best 57.76%（epoch 57），说明 continuation 低 LR 明显依赖
+预训练起点。
+
+下一组从 82.53% categorical LUT4 checkpoint 开始。加载时冻结 base 精确复制旧 LUT4，
+64-entry LUT6 residual 与 16-entry LUT4 common correction 同时为 0；两者都在前 120
+epochs 由 alpha 0.1 增至 1，从同一个起点联合释放：
+
+```bash
+GPU_ID=3 \
+CHECKPOINT=runs/phase3_pair_lut4_categorical_phase2init_sf11_lr002/chkpts/Bestmodel_phase3.pt \
+WORKDIR=runs/phase3_lut4_joint_base_and_lut6_residual \
+START_FILTER=11 NUM_BLOCKS=3 NUM_EPOCHS=200 \
+PHASE3_OPERATOR=pair_lut4 \
+PAIR_LUT_PARAMETERIZATION=categorical_residual \
+LUT_INPUTS=6 PAIR_LUT_ENCODING=dominance DOMINANCE_GRAD_MODE=stop \
+LR=0.0002 SCHEDULE=constant \
+DOMINANCE_RESIDUAL_LR=0.002 \
+DOMINANCE_RESIDUAL_ALPHA_START=0.1 DOMINANCE_RESIDUAL_ALPHA_END=1 \
+DOMINANCE_RESIDUAL_RAMP_EPOCHS=120 \
+DOMINANCE_BASE_LR=0.0002 \
+DOMINANCE_BASE_ALPHA_START=0.1 DOMINANCE_BASE_ALPHA_END=1 \
+DOMINANCE_BASE_RAMP_EPOCHS=120 \
+./run_phase3.sh
+```
+
+该实验与原 84.28% LUT4->LUT6 residual 主训练相比，唯一新增自由度是同步释放
+LUT4 common correction，因此可以直接判断“先训 LUT6 再解冻 LUT4”与“从 LUT4
+同时联合优化”哪种更好。

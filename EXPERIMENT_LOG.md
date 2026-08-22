@@ -3850,3 +3850,305 @@ Git index 移除，并由 ignore 规则统一管理。由失败补丁工具产�
 - `scripts/analyze_dominance_lut_checkpoint.py`：去掉文件尾多余空行，仅做格式整理。
 - `complexPyTorch/__pycache__/`、`lut_cuda/build/`、`lut_cuda/*.so`：仅取消 Git 跟踪，
   本地构建文件仍保留，后续可正常运行和重编译。
+
+## 2026-08-21：加入可控 LUT4 common correction
+
+### 动机与公式
+
+当前最佳公式只包含冻结 LUT4 base 与四个 dominance slice 上零均值的 LUT6 residual，
+因此无法直接表达四个 slice 共同需要的 LUT4 operation 修正。本次加入
+`dominance_base_correction[O,G,16,4]`：
+
+`logits = frozen_base + beta * class_center(common) + alpha * slice_center(residual)`。
+
+common correction 在类别维减均值，residual 在同一旧 LUT4 地址的四个 dominance
+slice 上减均值，因此两部分正交且可解释。训练结束仍只导出两张 hard LUT6，硬件资源
+不变。
+
+### 控制与兼容性
+
+- 新增独立 `dominance_base` optimizer group；
+- 新增 `DOMINANCE_BASE_LR`、`DOMINANCE_BASE_ALPHA_START/END` 和
+  `DOMINANCE_BASE_RAMP_EPOCHS`；
+- 默认 base LR 与 alpha 均为 0，旧命令行为不变；
+- 旧 84.56% checkpoint 缺少 correction 时强制零初始化，初始 hard forward 不变；
+- checkpoint 分析脚本新增 base alpha 与 centered correction RMS。
+
+### 推荐首轮配置
+
+从 84.56% best checkpoint 续训 100 epochs：普通参数 LR `5e-5`，已有 residual LR
+`5e-4`，common correction LR `1e-4`；residual alpha 固定 1，base alpha 在前 20
+epochs 从 0 增至 1。完整命令记录在 `CURRENT_TECHNICAL_ROUTE.md`。
+
+### 验证
+
+- 核心 Python 文件编译检查通过；
+- `run_phase3.sh` shell 语法通过；
+- `tests.test_phase12_route`：53 tests passed；
+- 新测试覆盖 LUT4 warm start 零 correction、common correction 的 slice 共享与类别
+  零均值、独立 LR/alpha schedule，以及旧 residual checkpoint 加载前后输出等价。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`：新增 class-centered LUT4 common correction、beta
+  buffer 和 setter，并合入 categorical logits。
+- `training.py`：新增旧 checkpoint 兼容、独立 optimizer group、base alpha schedule、
+  参数校验、训练日志与 checkpoint metrics。
+- `run_phase3.sh`：暴露 common correction 的 LR 和 alpha 环境变量并打印配置。
+- `tests/test_phase12_route.py`：新增 common correction、调度和 legacy checkpoint 测试。
+- `scripts/analyze_dominance_lut_checkpoint.py`：分析 effective base correction 及其 RMS。
+- `CURRENT_TECHNICAL_ROUTE.md`：记录新公式、默认兼容行为和推荐续训命令。
+- `EXPERIMENT_LOG.md`：记录本次设计、验证结果和全部文件修改。
+
+## 2026-08-21：增加同配置 from-scratch 初始化消融
+
+为判断 84.56% checkpoint 是否把新模型限制在旧 operation 的局部最优，新增不读取
+checkpoint、其余超参数完全一致的并行实验。检查发现原 `categorical_residual` 构造函数
+将 base 与 residual 全部置零，会导致所有 hard LUT entry 初始选择同一类别，因此不能
+作为有效 scratch 对照。
+
+现在无 checkpoint 时：
+
+- `dominance_base[O,G,16,4]` 使用 `N(0,0.01)`；
+- `weight[O,G,64,4]` residual 使用 `N(0,0.01)`；
+- `dominance_base_correction` 仍为 0；
+- hard categorical table 从 epoch 1 即具有多个随机输出类别；
+- LUT4 warm start 仍复制 checkpoint base，并清零 residual/correction，行为不变。
+
+严格同配置 scratch 组继续使用普通参数 LR `5e-5`、residual LR `5e-4`、common LR
+`1e-4`。该实验只改变初始化；若失败，只能说明低 LR continuation schedule 依赖预训练
+起点，不能单独证明随机 LUT6 无法训练。完整 GPU3 命令写入
+`CURRENT_TECHNICAL_ROUTE.md`。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`：将无 checkpoint 的 categorical residual base 与
+  residual 改为小随机初始化；checkpoint 路径仍显式覆盖并清零。
+- `tests/test_phase12_route.py`：新增 scratch hard-category 破除对称测试，并复用 warm-start
+  测试确认 checkpoint 起点不受影响。
+- `CURRENT_TECHNICAL_ROUTE.md`：记录 GPU3 from-scratch 单变量消融命令和结论边界。
+- `EXPERIMENT_LOG.md`：记录初始化问题、修复、实验设计和文件修改。
+
+## 2026-08-21：common correction 结果与 LUT4 起点联合释放消融
+
+使用 `scripts/analyze_training_run.py` 统一处理两组新日志并生成报告。
+
+### 已完成结果
+
+`runs/phase3_lut6_commonbase_lr1e4_reslr5e4`：
+
+- 状态：完成 100/100 epochs，全部 finite；
+- 起点：已训练好的 84.56% LUT6 categorical residual checkpoint；
+- best test：85.09%，epoch 39；
+- final test：84.34%；
+- 相对 84.56% 提升 0.53 pp，相对 LUT4 82.53% 提升 2.56 pp；
+- 略高于 Phase2 85.05% 约 0.04 pp；
+- 后 61 epochs 回落 0.75 pp，说明 common correction 有收益但继续训练会产生 drift。
+
+`runs/phase3_lut6_commonbase_fromscratch_samecfg`：
+
+- 状态：用户在 epoch 60/100 停止；
+- best test：57.76%，epoch 57；
+- final test：57.04%；
+- 该结果验证普通参数 LR `5e-5` 的 continuation 配置不能从随机网络恢复，不支持
+  “完全 scratch 更容易跳出局部最优”的假设。
+
+结构化报告：
+
+- `reports/phase3_lut6_commonbase_lr1e4_reslr5e4.json`；
+- `reports/phase3_lut6_commonbase_fromscratch_samecfg.json`。
+
+### 新消融：从 LUT4 同时释放两部分
+
+此前 85.09% 实验的 LUT6 residual 已经预先训练到 84.56%，随后才释放 LUT4 common
+correction，属于 sequential optimization。新的 joint 实验直接读取 82.53% categorical
+LUT4 checkpoint：
+
+- `dominance_base` 精确复制 LUT4 logits 并冻结；
+- LUT6 zero-mean residual 初始化为 0；
+- LUT4 class-centered common correction 初始化为 0；
+- residual 与 common alpha 均 `0.1 -> 1.0 / 120 epochs`；
+- residual LR `0.002`，common LR `0.0002`，共享 weight/BN LR `0.0002`；
+- 总训练 200 epochs，最终硬件仍只有两张 hard LUT6。
+
+这与原 84.28% residual 主训练只有一个差异：是否同时开放 LUT4 common correction，
+因此是判断 sequential 与 joint release 的直接消融。完整命令写入
+`CURRENT_TECHNICAL_ROUTE.md`。
+
+### 文件修改总结
+
+- `reports/phase3_lut6_commonbase_lr1e4_reslr5e4.json`：common continuation 统一报告。
+- `reports/phase3_lut6_commonbase_fromscratch_samecfg.json`：停止的 scratch 统一报告。
+- `CURRENT_TECHNICAL_ROUTE.md`：记录两组结果和 LUT4 起点 joint-release 命令。
+- `EXPERIMENT_LOG.md`：记录定量结果、结论边界和新消融设计。
+
+## 2026-08-22：LUT4/LUT6 joint release 完整结果与下一步
+
+使用 `scripts/analyze_training_run.py` 和 `scripts/analyze_dominance_lut_checkpoint.py`
+统一分析 joint 与 sequential best checkpoint。
+
+### Joint 训练结果
+
+`runs/phase3_lut4_joint_base_and_lut6_residual`：
+
+- 完成 200/200 epochs，全部 finite；
+- best test：84.61%，epoch 173；
+- final test：83.89%；
+- residual 与 common alpha 在 epoch 120 前后均已达到 1；
+- full-release 后继续约 53 epochs 才达到 best，随后 27 epochs 回落 0.72 pp。
+
+该结果高于 LUT4 82.53%，证明从 LUT4 起点同时开放 LUT6 residual 与 LUT4 common
+correction 可以训练；但低于 sequential common-correction best 85.09%，而且 constant LR
+后期继续产生 drift。差距不能简单归因于 joint 训练少了几十个 epoch，因为 joint 在 best
+之后继续训练反而下降。
+
+### Checkpoint 分解
+
+| 指标 | joint best 84.61% | sequential best 85.09% |
+|---|---:|---:|
+| centered LUT6 residual RMS | 0.4498 | 0.5367 |
+| centered LUT4 common correction RMS | 0.0522 | 0.0104 |
+| p0 hard category sensitivity | 14.77% | 17.53% |
+| p1 hard category sensitivity | 14.73% | 17.51% |
+
+joint 的 common correction 强度约为 sequential 的 5 倍，同时 residual 强度和新增 bit
+sensitivity 更低。逐层结果一致：joint common RMS 从浅层约 0.034 增至深层约
+0.066–0.070；sequential 各层基本稳定在约 0.010–0.011。
+
+因此虽然 common 与 residual 在参数分解上正交，hard argmax 和任务优化仍让两条路径
+发生竞争：joint 中较早、较强的 common 更新吸收了本应由 dominance slice 分化表达的
+改进，降低了第五、第六 bit 的利用。
+
+### 下一步优先级
+
+1. 将 85.09% best checkpoint 的 hard LUT 固定，短程只训练 BN、projection、stem 与
+   classifier，检查是否能消除 LUT 翻转造成的后期 drift。
+2. 从 LUT4 再做 constrained joint：residual 保持 LR `0.002`，common LR 从 `0.0002`
+   降到约 `2e-5`–`5e-5`，或延迟到 residual alpha 接近 1 后再释放；目标是把 common
+   RMS 控制在 sequential 观察到的约 0.01，而不是 0.05。
+3. common correction 应被视为 trust-region 小修正，可增加独立 L2 penalty 或 norm
+   clamp；不建议继续提高 common capacity/LR。
+4. 后期不应继续使用恒定 LUT LR。alpha 达到 1 后，应降低或冻结 LUT LR，再给共享
+   参数一个恢复阶段。
+
+最优先建议是第 1 项，因为不增加硬件、不改变已有 85.09% hard LUT，而且直接针对两组
+实验共同出现的 best 后回落。第 2 项用于验证更受限的 joint 是否能接近 sequential。
+
+### 生成报告
+
+- `reports/phase3_lut4_joint_base_and_lut6_residual.json`：joint 训练汇总；
+- `reports/joint_commonbase_best_lut.json`：joint best 逐层 LUT 分解；
+- `reports/sequential_commonbase_best_lut.json`：sequential best 逐层 LUT 分解。
+
+### 文件修改总结
+
+- `EXPERIMENT_LOG.md`：记录 joint 完整结果、checkpoint 分解、竞争机制与下一步优先级。
+
+## 2026-08-22：85.09% 之后的其他无硬件开销优化方向
+
+基于 LUT4 82.53%、LUT6 residual 84.56%、sequential common 85.09%、joint common
+84.61% 以及 occupancy/逐层分解，筛选不增加最终 FPGA 资源的后续方案。淘汰项仍包括
+Walsh、完全 scratch、强行提高 hard flip、继续增加 LUT capacity 和无约束 common LR。
+
+### 1. Backward-only categorical temperature schedule
+
+当前 forward 始终 hard argmax，backward 固定使用 `softmax(logits / tau)` 且 tau=1。
+可以只调整代理梯度温度，forward 与硬件行为完全不变：初期 tau 约 1.5–2.0，使相邻
+类别都获得梯度；后期降至约 0.5，使已形成 margin 的 hard category 稳定。该方案与历史
+soft-forward annealing 不同，不会产生 soft/hard 前向精度落差。优先级高。
+
+### 2. Occupancy-aware trust-region regularization
+
+真实数据已经证明稀疏性集中在 stage2.0/2.1。对低命中地址施加更强的 categorical KL
+或 centered-residual L2，使其回归 LUT4 base；高频地址保持自由。建议权重与
+`1/sqrt(hit_count+1)` 或其归一化版本成正比，只作用于浅层。最终仍物化同一 hard LUT6。
+这比全局 L2 更有针对性。
+
+### 3. EMA/SWA 或 hard-table temporal voting
+
+sequential best 85.09% 最终回落到 84.34%，joint best 84.61% 最终回落到 83.89%，
+说明单 epoch hard table 存在时间漂移。训练期维护 logits/BN 参数 EMA，或对 plateau 多个
+checkpoint 的每个 LUT entry 做 hard category 多数投票，再校准 BN，可输出唯一 hard table，
+不增加推理资源。该方案直接利用已有训练轨迹，成本较低。
+
+### 4. Phase2 teacher distillation
+
+使用 85.05% Phase2 模型作为 teacher，对 Phase3 分类 logits 增加 early-decaying KL。
+Teacher 不需要进入部署，只作为训练正则，帮助学生在探索 LUT6 operation 时保留旧网络
+决策边界。更进一步可只蒸馏 stage2 浅层 block 输出，因为该处 occupancy 最稀疏。风险是
+系数过大会把模型锁回 Phase2，因此应在 alpha ramp 完成前衰减到 0。
+
+### 5. Stage-wise LUT learning rate
+
+根据逐层统计，stage2.0/2.1 sensitivity 和 occupancy 最低，stage3/4 最高。可以给
+stage2.0/2.1 使用 0.1x–0.25x residual/common LR，stage2.2 以后保持当前 LR。该方案
+不改变参数化，只减少浅层稀疏地址噪声，优先级高于重新设计 third bit。
+
+### 推荐实验顺序
+
+1. 先做 hard LUT freeze + 非 LUT 参数恢复，验证 drift 是否可恢复；
+2. 同时实现 backward-only tau schedule，比较固定 tau=1 与 `2.0 -> 0.5`；
+3. 加入 EMA/hard-table voting，利用一个训练任务同时得到普通与 EMA checkpoint；
+4. 再测试浅层 occupancy-aware regularization 或 stage-wise LR；
+5. teacher distillation 作为后续独立方向。
+
+其中 tau schedule、EMA 和 stage-wise LR 都只改变训练过程，最终硬件与当前 85.09%
+模型完全相同。
+
+### 文件修改总结
+
+- `EXPERIMENT_LOG.md`：记录基于现有全部结果筛选出的无硬件开销优化方向及优先级。
+
+## 2026-08-22：利用 Xilinx LUT6_2 的 O5/O6 增加局部输出信息
+
+根据 AMD/Xilinx `LUT6_2` 原语文档，单个物理 LUT6 的 O5/O6 共享同一个 64-bit
+INIT。令 `u=I[4:0]`、`s=I5`、真值表为 `T`，则：
+
+- `O5(u)=T(0,u)`，O5 与 I5 无关；
+- `O6(s,u)=T(s,u)`；
+- 当 `s=0` 时，`O5=O6`；
+- 当 `s=1` 时，O5 读取低 32 entries，O6 读取高 32 entries，可不同。
+
+因此 O5/O6 不能实现两个任意 6-input Boolean function。它可以实现两个共享五个动态
+输入的独立 LUT5（将 I5 固定为 1），或者同时暴露一个 LUT6 function 及其 I5=0
+cofactor。官方来源：AMD UG953 `LUT6_2` 与 UltraScale UG574 LUT primitives。
+
+### 与当前 dominance LUT6 的匹配
+
+将某一个 dominance bit（建议 p1）接到 I5，其余 `[sr0,si0,p0,sr1,si1]` 接 I0-I4：
+
+- O6 输出当前真实六位地址的 local bit；
+- O5 同时输出“把 p1 强制为 0”时的 counterfactual/reference bit；
+- p1=0 时两个输出重复；
+- p1=1 时二者可以形成四种组合，显式保留 p1 是否改变 operation 的信息。
+
+当前实部和虚部各使用一个物理 LUT6，因此两个 `LUT6_2` 可从原来的 2 个 bit
+`[O6_r,O6_i]` 扩展为 4 根输出线 `[O6_r,O5_r,O6_i,O5_i]`，物理 operator LUT 数量
+不增加，且 O5 不引入额外 INIT 参数。
+
+### 不能忽略的下游成本
+
+额外 O5 不是系统级零成本。如果分别累加四个 bit plane，会增加 accumulator、路由、
+寄存器和 BN/后处理带宽。较紧凑的方案是对每个实/虚 LUT 输出形成二位局部码，例如
+`q=2*O6+O5`，再作为 0..3 的 operand 累加；这不增加 operator LUT 数，但会让加法树
+输入和累加器约增加 1 bit。实际 LUT/carry/route 成本必须通过综合报告判断。
+
+### 推荐软件消融
+
+第一版实现 `LUT6_2-aware 2-bit local output`：
+
+1. 固定 p1 为 I5，保持现有 64-entry categorical LUT6 参数化；
+2. O6 按实际 6-bit 地址查表；O5 按同一地址清除 p1 bit 后查同一张表；
+3. 实部和虚部分别形成 `2*O6+O5`，再沿 group 维累加；
+4. 后续仍进入现有 complex BN 和二值 activation；
+5. 最终导出同一对 LUT6_2 INIT，不新增 LUT truth-table 参数；
+6. 与只使用 O6 的 85.09% 基线比较精度，并用 Vivado 综合比较 accumulator/carry 成本。
+
+另一个资源导向方案是把一个 LUT6_2 的 O6/O5 直接作为实部/虚部输出，从而把两个
+物理 LUT 压成一个，但会强制其中一个输出等于另一个输出的 I5=0 cofactor，约束很强，
+更适合作为面积消融而非当前精度优先主路线。
+
+### 文件修改总结
+
+- `EXPERIMENT_LOG.md`：记录 LUT6_2 O5/O6 的精确逻辑约束、当前网络映射、潜在收益、
+  下游硬件代价及推荐消融。

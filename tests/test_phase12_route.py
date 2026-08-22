@@ -261,6 +261,24 @@ class ActiveRouteTests(unittest.TestCase):
         self.assertTrue(torch.allclose(old_output, new_output, atol=1e-6))
 
 
+    def test_categorical_residual_from_scratch_breaks_lut_symmetry(self):
+        torch.manual_seed(41)
+        layer = PairLUT4ComplexConv2d(
+            2,
+            1,
+            kernel_size=1,
+            parameterization="categorical_residual",
+            lut_inputs=6,
+            activation_encoding="dominance",
+        )
+        self.assertGreater(float(layer.weight.detach().std()), 0.0)
+        self.assertGreater(float(layer.dominance_base.std()), 0.0)
+        self.assertEqual(
+            float(layer.dominance_base_correction.detach().abs().max()), 0.0
+        )
+        categories = layer._categorical_logits().argmax(dim=-1)
+        self.assertGreater(int(categories.unique().numel()), 1)
+
     def test_lut4_warm_starts_zero_mean_dominance_residual_exactly(self):
         torch.manual_seed(29)
         source = self.make_model(
@@ -290,6 +308,11 @@ class ActiveRouteTests(unittest.TestCase):
         for old_lut, new_lut in zip(source_luts, target_luts):
             self.assertTrue(torch.equal(new_lut.dominance_base, old_lut.weight))
             self.assertEqual(float(new_lut.weight.detach().abs().max()), 0.0)
+            self.assertEqual(
+                float(new_lut.dominance_base_correction.detach().abs().max()),
+                0.0,
+            )
+            self.assertEqual(float(new_lut.dominance_base_alpha), 0.0)
             expected = old_lut.weight.index_select(
                 2, new_lut.dominance_old_addresses
             )
@@ -331,6 +354,91 @@ class ActiveRouteTests(unittest.TestCase):
             )
         )
 
+    def test_dominance_base_correction_is_shared_and_class_centered(self):
+        layer = PairLUT4ComplexConv2d(
+            2,
+            1,
+            kernel_size=1,
+            parameterization="categorical_residual",
+            lut_inputs=6,
+            activation_encoding="dominance",
+        )
+        with torch.no_grad():
+            layer.dominance_base.zero_()
+            layer.weight.zero_()
+            layer.dominance_base_correction.normal_()
+            layer.set_dominance_residual_alpha(0.0)
+            layer.set_dominance_base_alpha(1.0)
+        centered = (
+            layer.dominance_base_correction
+            - layer.dominance_base_correction.mean(dim=-1, keepdim=True)
+        )
+        expected = centered.index_select(2, layer.dominance_old_addresses)
+        self.assertTrue(
+            torch.allclose(layer._categorical_logits(), expected, atol=1e-6)
+        )
+        self.assertTrue(
+            torch.allclose(
+                centered.sum(dim=-1),
+                torch.zeros_like(centered[..., 0]),
+                atol=1e-6,
+            )
+        )
+
+    def test_legacy_residual_checkpoint_zero_initializes_base_correction(self):
+        source = self.make_model(
+            3,
+            pair_lut_parameterization="categorical_residual",
+            pair_lut_inputs=6,
+            pair_lut_encoding="dominance",
+        )
+        legacy_state = {
+            key: value
+            for key, value in source.state_dict().items()
+            if not key.endswith("dominance_base_correction")
+            and not key.endswith("dominance_base_alpha")
+        }
+        target = self.make_model(
+            3,
+            pair_lut_parameterization="categorical_residual",
+            pair_lut_inputs=6,
+            pair_lut_encoding="dominance",
+        )
+        with torch.no_grad():
+            for module in target.modules():
+                if isinstance(module, PairLUT4ComplexConv2d):
+                    module.dominance_base_correction.fill_(1.0)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "legacy_residual.pt"
+            torch.save(
+                {
+                    "phase": 3,
+                    "args": {
+                        "phase": 3,
+                        "pair_lut_parameterization": "categorical_residual",
+                    },
+                    "model": legacy_state,
+                },
+                checkpoint,
+            )
+            training.load_phase3_shared_checkpoint(target, checkpoint)
+        for module in target.modules():
+            if isinstance(module, PairLUT4ComplexConv2d):
+                self.assertEqual(
+                    float(
+                        module.dominance_base_correction.detach().abs().max()
+                    ),
+                    0.0
+                )
+                self.assertEqual(float(module.dominance_base_alpha), 0.0)
+        source.eval()
+        target.eval()
+        with torch.no_grad():
+            images = torch.randn(1, 3, 32, 32)
+            self.assertTrue(
+                torch.allclose(source(images), target(images), atol=1e-6)
+            )
+
     def test_dominance_residual_alpha_and_optimizer_lr_schedules(self):
         args = training.parse_args([
             "--phase", "3",
@@ -342,6 +450,10 @@ class ActiveRouteTests(unittest.TestCase):
             "--dominance-residual-alpha-start", "0.1",
             "--dominance-residual-alpha-end", "1.0",
             "--dominance-residual-ramp-epochs", "3",
+            "--dominance-base-lr", "0.0001",
+            "--dominance-base-alpha-start", "0.0",
+            "--dominance-base-alpha-end", "1.0",
+            "--dominance-base-ramp-epochs", "3",
         ])
         self.assertAlmostEqual(
             training.dominance_residual_alpha_for_epoch(0, args), 0.1
@@ -351,6 +463,15 @@ class ActiveRouteTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             training.dominance_residual_alpha_for_epoch(2, args), 1.0
+        )
+        self.assertAlmostEqual(
+            training.dominance_base_alpha_for_epoch(0, args), 0.0
+        )
+        self.assertAlmostEqual(
+            training.dominance_base_alpha_for_epoch(1, args), 0.5
+        )
+        self.assertAlmostEqual(
+            training.dominance_base_alpha_for_epoch(2, args), 1.0
         )
 
         model = self.make_model(
@@ -367,6 +488,7 @@ class ActiveRouteTests(unittest.TestCase):
         self.assertAlmostEqual(group_lrs["decay"], 0.001)
         self.assertAlmostEqual(group_lrs["no_decay"], 0.001)
         self.assertAlmostEqual(group_lrs["dominance_residual"], 0.002)
+        self.assertAlmostEqual(group_lrs["dominance_base"], 0.0001)
 
 
     def test_lut6_groups_three_complex_positions_channel_major(self):

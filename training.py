@@ -185,9 +185,19 @@ def load_phase_checkpoint(
         strict=False,
     )
     parameter_keys = set(dict(base_model.named_parameters()))
+    legacy_zero_parameters = {
+        key for key in parameter_keys
+        if key.endswith("dominance_base_correction")
+    }
     missing_parameters = [
-        key for key in missing_keys if key in parameter_keys
+        key for key in missing_keys
+        if key in parameter_keys and key not in legacy_zero_parameters
     ]
+    if legacy_zero_parameters:
+        with torch.no_grad():
+            for name, parameter in base_model.named_parameters():
+                if name in missing_keys and name in legacy_zero_parameters:
+                    parameter.zero_()
     if missing_parameters:
         raise RuntimeError(
             "Checkpoint did not initialize model parameters: {}".format(
@@ -206,7 +216,7 @@ def load_phase_checkpoint(
         )
 
     print(
-        "==> Loaded {}/{} checkpoint tensors ({} unmatched, {} missing buffers).".format(
+        "==> Loaded {}/{} checkpoint tensors ({} unmatched, {} default-initialized tensors).".format(
             len(mapped_state),
             len(source_state),
             len(skipped),
@@ -363,6 +373,7 @@ def _load_dominance_lut6_warm_start(
                     )
                 )
                 module.weight.zero_()
+                module.dominance_base_correction.zero_()
             else:
                 module.weight.copy_(
                     expanded.to(
@@ -833,14 +844,22 @@ def build_optimizer(args, model):
         if isinstance(module, PairLUT4ComplexConv2d)
         and module.parameterization == "categorical_residual"
     ]
-    residual_ids = {id(parameter) for parameter in residual_params}
+    base_params = [
+        module.dominance_base_correction
+        for module in unwrap_model(model).modules()
+        if isinstance(module, PairLUT4ComplexConv2d)
+        and module.parameterization == "categorical_residual"
+    ]
+    lut_parameter_ids = {
+        id(parameter) for parameter in residual_params + base_params
+    }
     decay_params = [
         parameter for parameter in decay_params
-        if id(parameter) not in residual_ids
+        if id(parameter) not in lut_parameter_ids
     ]
     no_decay_params = [
         parameter for parameter in no_decay_params
-        if id(parameter) not in residual_ids
+        if id(parameter) not in lut_parameter_ids
     ]
     parameter_groups = [
         {
@@ -861,6 +880,15 @@ def build_optimizer(args, model):
                 "params": residual_params,
                 "weight_decay": 0.0,
                 "lr_scale": args.dominance_residual_lr / args.lr,
+            }
+        )
+    if base_params:
+        parameter_groups.append(
+            {
+                "name": "dominance_base",
+                "params": base_params,
+                "weight_decay": 0.0,
+                "lr_scale": args.dominance_base_lr / args.lr,
             }
         )
     if args.optimizer in ("sgd", "nag"):
@@ -948,6 +976,22 @@ def dominance_residual_alpha_for_epoch(epoch, args):
     )
 
 
+def dominance_base_alpha_for_epoch(epoch, args):
+    if args.dominance_base_ramp_epochs <= 1:
+        return args.dominance_base_alpha_end
+    progress = min(
+        max(epoch, 0) / float(args.dominance_base_ramp_epochs - 1),
+        1.0,
+    )
+    return (
+        args.dominance_base_alpha_start
+        + progress * (
+            args.dominance_base_alpha_end
+            - args.dominance_base_alpha_start
+        )
+    )
+
+
 def configure_lut_training_flow(model, epoch, args):
     """Report the always-hard binary Phase 3 LUT configuration."""
     modules = dict(model.named_modules())
@@ -968,10 +1012,13 @@ def configure_lut_training_flow(model, epoch, args):
         and operator.parameterization == "categorical_residual"
     ]
     residual_alpha = None
+    base_alpha = None
     if residual_operators:
         residual_alpha = dominance_residual_alpha_for_epoch(epoch, args)
+        base_alpha = dominance_base_alpha_for_epoch(epoch, args)
         for operator in residual_operators:
             operator.set_dominance_residual_alpha(residual_alpha)
+            operator.set_dominance_base_alpha(base_alpha)
     if args.phase != 3 or not units:
         return {
             "flow": "not_applicable",
@@ -981,6 +1028,7 @@ def configure_lut_training_flow(model, epoch, args):
             "total_operators": operator_count,
             "fully_hard": True,
             "dominance_residual_alpha": residual_alpha,
+            "dominance_base_alpha": base_alpha,
         }
 
     for name, operator, activation in units:
@@ -993,9 +1041,12 @@ def configure_lut_training_flow(model, epoch, args):
     return {
         "flow": "hard",
         "stage": (
-            "dominance_residual_ramp"
+            "dominance_lut_ramp"
             if residual_alpha is not None
-            and epoch < args.dominance_residual_ramp_epochs - 1
+            and (
+                epoch < args.dominance_residual_ramp_epochs - 1
+                or epoch < args.dominance_base_ramp_epochs - 1
+            )
             else "fully_hard"
         ),
         "temperature": None,
@@ -1003,6 +1054,7 @@ def configure_lut_training_flow(model, epoch, args):
         "total_operators": operator_count,
         "fully_hard": True,
         "dominance_residual_alpha": residual_alpha,
+        "dominance_base_alpha": base_alpha,
     }
 
 
@@ -1349,6 +1401,8 @@ def train(args):
         raise ValueError("--lr must be positive")
     if args.dominance_residual_lr <= 0.0:
         raise ValueError("--dominance-residual-lr must be positive")
+    if args.dominance_base_lr < 0.0:
+        raise ValueError("--dominance-base-lr must be non-negative")
     if args.dominance_residual_ramp_epochs < 1:
         raise ValueError("--dominance-residual-ramp-epochs must be at least 1")
     if not 0.0 <= args.dominance_residual_alpha_start <= 1.0:
@@ -1357,6 +1411,14 @@ def train(args):
         raise ValueError("--dominance-residual-alpha-end must be in [0, 1]")
     if args.dominance_residual_alpha_start > args.dominance_residual_alpha_end:
         raise ValueError("dominance residual alpha start must not exceed end")
+    if args.dominance_base_ramp_epochs < 1:
+        raise ValueError("--dominance-base-ramp-epochs must be at least 1")
+    if not 0.0 <= args.dominance_base_alpha_start <= 1.0:
+        raise ValueError("--dominance-base-alpha-start must be in [0, 1]")
+    if not 0.0 <= args.dominance_base_alpha_end <= 1.0:
+        raise ValueError("--dominance-base-alpha-end must be in [0, 1]")
+    if args.dominance_base_alpha_start > args.dominance_base_alpha_end:
+        raise ValueError("dominance base alpha start must not exceed end")
     if not 0.0 <= args.min_lr_factor <= 1.0:
         raise ValueError("--min-lr-factor must be between 0 and 1")
     if not 0.0 <= args.label_smoothing < 1.0:
@@ -1511,7 +1573,7 @@ def train(args):
         ):
             logger.info(
                 (
-                    "Epoch %d LUT flow: stage=%s tau=%s alpha=%s hard_operators=%d/%d"
+                    "Epoch %d LUT flow: stage=%s tau=%s residual_alpha=%s base_alpha=%s hard_operators=%d/%d"
                 ),
                 epoch + 1,
                 lut_state["stage"],
@@ -1525,6 +1587,13 @@ def train(args):
                     if lut_state["dominance_residual_alpha"] is None
                     else "{:.6g}".format(
                         lut_state["dominance_residual_alpha"]
+                    )
+                ),
+                (
+                    "n/a"
+                    if lut_state["dominance_base_alpha"] is None
+                    else "{:.6g}".format(
+                        lut_state["dominance_base_alpha"]
                     )
                 ),
                 lut_state["hard_operators"],
@@ -1629,6 +1698,9 @@ def train(args):
                 "hardware_ready": lut_state["fully_hard"],
                 "dominance_residual_alpha": lut_state[
                     "dominance_residual_alpha"
+                ],
+                "dominance_base_alpha": lut_state[
+                    "dominance_base_alpha"
                 ],
             }
             payload = checkpoint_payload(
@@ -1781,6 +1853,21 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--dominance-residual-ramp-epochs", default=120, type=int
+    )
+    parser.add_argument(
+        "--dominance-base-lr",
+        default=0.0,
+        type=float,
+        help="Learning rate for the LUT4 common categorical correction",
+    )
+    parser.add_argument(
+        "--dominance-base-alpha-start", default=0.0, type=float
+    )
+    parser.add_argument(
+        "--dominance-base-alpha-end", default=0.0, type=float
+    )
+    parser.add_argument(
+        "--dominance-base-ramp-epochs", default=1, type=int
     )
     parser.add_argument(
         "--dominance-ste-margin",

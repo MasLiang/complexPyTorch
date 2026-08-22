@@ -40,6 +40,20 @@ def effective_logits(name, residual, state):
         + ((state_ids >> 2) & 1) * 2
         + ((state_ids >> 1) & 1)
     )
+    base_correction_name = (
+        name.rsplit(".", 1)[0] + ".dominance_base_correction"
+    )
+    base_correction = state.get(base_correction_name)
+    base_alpha_name = name.rsplit(".", 1)[0] + ".dominance_base_alpha"
+    base_alpha_value = state.get(base_alpha_name, torch.tensor(0.0))
+    base_alpha = float(base_alpha_value.detach().cpu())
+    if torch.is_tensor(base_correction):
+        centered_base_correction = (
+            base_correction - base_correction.mean(dim=-1, keepdim=True)
+        )
+        base = base + base_alpha * centered_base_correction
+    else:
+        centered_base_correction = None
     expanded_base = base.index_select(2, old_addresses)
     assignment = torch.nn.functional.one_hot(
         old_addresses, num_classes=16
@@ -56,8 +70,18 @@ def effective_logits(name, residual, state):
         "centered_residual_rms": float(
             centered.detach().float().square().mean().sqrt()
         ),
+        "base_alpha": base_alpha,
+        "centered_base_correction_rms": (
+            0.0
+            if centered_base_correction is None
+            else float(
+                centered_base_correction.detach().float().square().mean().sqrt()
+            )
+        ),
     }
     return logits, metadata
+
+
 def bit_sensitivity(categories, address_bit):
     address_mask = 1 << (5 - address_bit)
     low = torch.arange(64)

@@ -1326,20 +1326,34 @@ class PairLUT4ComplexConv2d(Module):
             nn.init.normal_(self.weight, mean=0.0, std=0.01)
         else:
             self.weight = nn.Parameter(
-                torch.zeros(
+                torch.empty(
                     self.out_channels,
                     self.group_num,
                     self.table_size,
                     4,
                 )
             )
+            nn.init.normal_(self.weight, mean=0.0, std=0.01)
             self.register_buffer(
                 "dominance_base",
-                torch.zeros(self.out_channels, self.group_num, 16, 4),
+                torch.empty(self.out_channels, self.group_num, 16, 4),
             )
+            nn.init.normal_(self.dominance_base, mean=0.0, std=0.01)
             self.register_buffer(
                 "dominance_residual_alpha",
                 torch.tensor(0.1, dtype=torch.float32),
+            )
+            self.dominance_base_correction = nn.Parameter(
+                torch.zeros(
+                    self.out_channels,
+                    self.group_num,
+                    16,
+                    4,
+                )
+            )
+            self.register_buffer(
+                "dominance_base_alpha",
+                torch.tensor(0.0, dtype=torch.float32),
             )
 
         state_ids = torch.arange(self.table_size, dtype=torch.long)
@@ -1532,11 +1546,24 @@ class PairLUT4ComplexConv2d(Module):
             return
         self.dominance_residual_alpha.fill_(float(alpha))
 
+    def set_dominance_base_alpha(self, alpha):
+        if self.parameterization != "categorical_residual":
+            return
+        self.dominance_base_alpha.fill_(float(alpha))
+
     def _categorical_logits(self):
         if self.parameterization != "categorical_residual":
             return self.weight
         addresses = self.dominance_old_addresses
-        expanded_base = self.dominance_base.index_select(2, addresses)
+        base_correction = self.dominance_base_correction
+        base_correction = base_correction - base_correction.mean(
+            dim=-1, keepdim=True
+        )
+        effective_base = (
+            self.dominance_base
+            + self.dominance_base_alpha * base_correction
+        )
+        expanded_base = effective_base.index_select(2, addresses)
         assignment = self.dominance_assignment.to(self.weight.dtype)
         residual_mean = torch.einsum(
             "ogsc,sa->ogac", self.weight, assignment
