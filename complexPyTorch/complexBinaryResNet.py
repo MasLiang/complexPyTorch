@@ -28,6 +28,7 @@ from .complexResNet import (
 ACTIVE_PHASES = (1, 2, 3)
 _PHASE3_OPERATORS = ("triple_lut6", "pair_lut4", "shared_lut6")
 _BN_MODES = ("covariance", "naive", "none")
+_SHORTCUT_MODES = ("fp", "option_a")
 
 
 def _same_padding(kernel_size):
@@ -49,6 +50,37 @@ def _make_complex_batch_norm(num_features, mode, eps=1e-4):
             _BN_MODES,
         )
     )
+
+
+class ComplexOptionAShortcut(nn.Module):
+    """Parameter-free spatial decimation and symmetric channel zero-padding."""
+
+    def __init__(self, in_channels, out_channels, stride):
+        super().__init__()
+        if out_channels < in_channels:
+            raise ValueError("Option-A shortcut cannot reduce channel count")
+        self.stride = int(stride)
+        channel_padding = int(out_channels) - int(in_channels)
+        self.pad_before = channel_padding // 2
+        self.pad_after = channel_padding - self.pad_before
+
+    def forward(self, inp):
+        output = inp[..., :: self.stride, :: self.stride]
+        if not (self.pad_before or self.pad_after):
+            return output
+        shape = list(output.shape)
+        before_shape = shape.copy()
+        after_shape = shape.copy()
+        before_shape[1] = self.pad_before
+        after_shape[1] = self.pad_after
+        return torch.cat(
+            (
+                output.new_zeros(before_shape),
+                output,
+                output.new_zeros(after_shape),
+            ),
+            dim=1,
+        )
 
 
 class BiRealComplexResidualBlock(nn.Module):
@@ -75,12 +107,20 @@ class BiRealComplexResidualBlock(nn.Module):
         pair_lut_encoding="standard",
         dominance_grad_mode="stop",
         dominance_ste_margin=1.0,
+        shortcut_mode="fp",
     ):
         super().__init__()
         padding = _same_padding(kernel_size)
         self.projection = bool(projection)
         self.spectral_pool_scheme = spectral_pool_scheme
         self.spectral_pool_gamma = spectral_pool_gamma
+        if shortcut_mode not in _SHORTCUT_MODES:
+            raise ValueError(
+                "Unknown shortcut mode {!r}; expected one of {}".format(
+                    shortcut_mode, _SHORTCUT_MODES
+                )
+            )
+        self.shortcut_mode = shortcut_mode
 
         if is_binary:
             if phase == 3:
@@ -147,6 +187,11 @@ class BiRealComplexResidualBlock(nn.Module):
         )
 
         if projection or stride != 1 or in_channels != out_channels:
+            if self.shortcut_mode == "option_a":
+                self.proj = ComplexOptionAShortcut(
+                    in_channels, out_channels, stride
+                )
+                return
             projection_layers = []
             if stride != 1:
                 projection_layers.append(
@@ -235,6 +280,7 @@ class BinaryComplexResNet(nn.Module):
         pair_lut_encoding="standard",
         dominance_grad_mode="stop",
         dominance_ste_margin=1.0,
+        shortcut_mode="fp",
     ):
         super().__init__()
         if phase not in ACTIVE_PHASES:
@@ -300,6 +346,13 @@ class BinaryComplexResNet(nn.Module):
         self.dominance_grad_mode = dominance_grad_mode
         self.dominance_ste_margin = float(dominance_ste_margin)
         self.post_bn_mode = post_bn_mode
+        if shortcut_mode not in _SHORTCUT_MODES:
+            raise ValueError(
+                "Unknown shortcut mode {!r}; expected one of {}".format(
+                    shortcut_mode, _SHORTCUT_MODES
+                )
+            )
+        self.shortcut_mode = shortcut_mode
 
         if not self.is_sar_input:
             self.learn_imag = LearnImagBlock(
@@ -399,6 +452,7 @@ class BinaryComplexResNet(nn.Module):
             "pair_lut_encoding": self.pair_lut_encoding,
             "dominance_grad_mode": self.dominance_grad_mode,
             "dominance_ste_margin": self.dominance_ste_margin,
+            "shortcut_mode": self.shortcut_mode,
         }
         layers = [
             BiRealComplexResidualBlock(

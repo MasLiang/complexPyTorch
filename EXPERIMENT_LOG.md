@@ -4152,3 +4152,589 @@ cofactor。官方来源：AMD UG953 `LUT6_2` 与 UltraScale UG574 LUT primitives
 
 - `EXPERIMENT_LOG.md`：记录 LUT6_2 O5/O6 的精确逻辑约束、当前网络映射、潜在收益、
   下游硬件代价及推荐消融。
+
+## 2026-08-22：实现 LUT6_2 O5/O6 双输出 residual
+
+在已推送的 85% 路线基线 `82d3a96` 上增加默认关闭的 `o5_o6` 模式。现有
+`categorical_residual`、LUT4 common correction、dominance 编码、hard argmax forward
+及 softmax STE backward 均保持不变；`complexPyTorch/lut_backend.py` 和所有 CUDA
+kernel 均未修改。
+
+### 计算与硬件映射
+
+当前逻辑地址仍为 `[sr0,si0,p0,sr1,si1,p1]`。物理导出时将 `p1` 连接到
+`LUT6_2.I5` 并相应置换 INIT，因而同一张 64-entry table 同时给出：
+
+- `O6=T(sr0,si0,p0,sr1,si1,p1)`；
+- `O5=T(sr0,si0,p0,sr1,si1,0)`。
+
+软件输出使用 `y=O6+gamma*(O5-O6)/3`。`gamma=0` 完全复现当前 O6-only checkpoint；
+`gamma=1` 等价于 `(2*O6+O5)/3`。硬件只需累加整数 `2*O6+O5`，除以 3 可折叠进
+后续 complex BN。两张实/虚 LUT6 的 INIT 与参数量不增加，但加法树操作数由 1 bit
+增至 2 bit，综合时需要单独评估 carry、寄存器和路由代价。
+
+O5 被作为 residual readout 逐渐释放，默认 `gamma: 0->1`、120 epochs。首轮推荐从
+85.09% best checkpoint 开始，以 60-epoch ramp 做 100-epoch continuation，冻结已学
+LUT4 common correction，继续小学习率训练 LUT6 residual 与共享网络参数。完整命令写入
+`CURRENT_TECHNICAL_ROUTE.md`。
+
+### 验证结果
+
+- 关键 CPU 测试 6/6 通过：O5 cofactor、四级局部码、LUT4 warm start、现有 LUT6
+  checkpoint alpha=0 等价性、alpha schedule 与优化器分组。
+- 当前路线完整回归测试 56/56 通过。
+- GPU2 上 CUDA/CPU 对拍：forward 最大绝对误差 0；输入梯度最大误差约
+  `2.98e-8`；LUT weight 梯度最大误差约 `5.59e-9`。
+- `python -m py_compile`、`bash -n run_phase3.sh` 和 `git diff --check` 均通过。
+
+### 文件修改总结
+
+- `complexPyTorch/complexLayers.py`：为 `PairLUT4ComplexConv2d` 增加 O6-only/O5+O6
+  模式、同表 O5 cofactor、非持久 O5 alpha 和归一化 residual 聚合；默认行为不变。
+- `complexPyTorch/complexBinaryResNet.py`：校验并透传 `lut6_output_mode` 到所有 Phase 3
+  PairLUT operator。
+- `training.py`：增加 CLI、O5 alpha 线性调度、合法性检查、epoch 日志和 checkpoint
+  metric；模型 checkpoint 参数会记录输出模式与调度配置。
+- `run_phase3.sh`：增加 `LUT6_OUTPUT_MODE`、`LUT6_O5_ALPHA_START/END` 和
+  `LUT6_O5_RAMP_EPOCHS` 环境变量及启动摘要。
+- `tests/test_phase12_route.py`：增加 O5 真值表、局部二位码、LUT4/LUT6 checkpoint
+  等价性、调度和 CUDA-compatible 数学路径的回归覆盖。
+- `CURRENT_TECHNICAL_ROUTE.md`：加入完整公式、物理映射、硬件代价边界和首轮运行命令。
+- `EXPERIMENT_LOG.md`：记录本次设计选择、验证结果及全部文件变更。
+
+## 2026-08-22：O5/O6 首轮结果与真实 lookup 分析
+
+使用 `scripts/analyze_training_run.py`、`scripts/analyze_dominance_lut_checkpoint.py`
+和扩展后的 `scripts/analyze_dominance_occupancy.py` 分析
+`runs/phase3_lut6_o5o6_from_best8509`。
+
+### 训练结果
+
+- 源 checkpoint：85.09%；
+- O5/O6 best：84.81%，epoch 45，`lut6_o5_alpha=0.7458`；
+- O5/O6 final：84.60%，epoch 100，`lut6_o5_alpha=1`；
+- best 比源模型低 0.28 pp，final 低 0.49 pp。
+
+日志确认 `output_mode=o5_o6`，alpha 在 epoch 1 为 0、epoch 60 达到 1，因此实验并非
+开关未生效。best 出现在 ramp 中途，而完全释放后更差，说明当前 O5 readout 强度增加
+并不能改善任务指标。
+
+### 真值表与真实数据
+
+| checkpoint | p1 table real diff | p1 table imag diff | hit-weighted category diff | hit-weighted real diff | hit-weighted imag diff |
+|---|---:|---:|---:|---:|---:|
+| source 85.09 | 9.78% | 9.80% | 6.46% | 3.61% | 3.67% |
+| O5/O6 best 84.81 | 10.05% | 10.09% | 6.61% | 3.71% | 3.74% |
+| O5/O6 last 84.60 | 10.42% | 10.45% | 6.74% | 3.76% | 3.84% |
+
+真实 lookup 中 `p1=1` 约为 47.7%，所以 dominance bit 分布正常。O5/O6 单输出 bit
+只有约 3.6%–3.8% 的实际 lookup 不同；再经过 `(O5-O6)/3` 后，每个局部 operand 的
+平均绝对增量只有约 1.2% 的单位幅度。训练只略微增加分歧，没有形成新的有效表征。
+
+### 原因判断
+
+1. `O5` 是现有 table 在 `p1=0` 的 cofactor，不是独立可学习输出；`p1=0` 时严格重复
+   O6，只有 `p1=1` 且两个 slice 输出不同才提供信息。
+2. 当前把两个 bit 编为标量 `2*O6+O5` 后立即对所有 group 求和。不同 O5/O6 组合可
+   得到相同总和，后续 complex BN 无法恢复两个出口各自的统计量。
+3. alpha residual 保证稳定 warm start，但也把本来就稀疏的差异缩小到三分之一。
+4. full-alpha 结果比中途 best 更差，排除了“只需继续增大 O5 贡献”的简单解释。
+
+结论：当前实现正确地使用了两个物理输出，但新增信息受 LUT6_2 cofactor 约束和标量
+聚合共同限制，因此 accuracy 基本不变且略降。若继续，应测试 `sum(O6)`、`sum(O5)`
+分开累计后再学习融合，并明确评估新增 accumulator、路由和 BN 资源；否则应保留
+O6-only 85.09% 作为当前主线。
+
+### 同时发现的 checkpoint 可复现性问题
+
+O5 alpha 是 runtime buffer，旧实现只写入 checkpoint metrics，不写入 model state。
+训练曲线不受影响，但单独加载 epoch 45 best 时会默认使用 alpha=1，而非保存时的
+0.7458。加载器现已从 metrics 恢复该值，occupancy 脚本也调用同一恢复逻辑。
+
+### 文件修改总结
+
+- `scripts/analyze_dominance_occupancy.py`：增加真实命中加权的 O5/O6 category、real、
+  imag 分歧及四级码分布，并恢复 checkpoint 保存时的 runtime alpha。
+- `training.py`：增加 `restore_lut_runtime_state`，从 checkpoint metrics 恢复 O5 alpha。
+- `tests/test_phase12_route.py`：将 LUT6 checkpoint 兼容测试扩展为 O5 alpha 恢复测试。
+- `CURRENT_TECHNICAL_ROUTE.md`：记录首轮结果、真实 lookup 指标与下一步资源边界。
+- `EXPERIMENT_LOG.md`：记录本次定量分析、原因判断和文件变更。
+
+生成但受 `.gitignore` 管理的报告：
+
+- `reports/phase3_lut6_o5o6_from_best8509.json`；
+- `reports/o5o6_{source8509,best8481,last8460}_lut.json`；
+- `reports/o5o6_{source8509,best8481,last8460}_occupancy_1000.json`。
+
+## 2026-08-22：回退 O5/O6，恢复 O6-only 主线
+
+O5/O6 首轮实验 best 84.81%、final 84.60%，均低于 O6-only 85.09%。真实 lookup
+分析确认新增信息仅影响约 6.5% 的 complex category，且标量聚合进一步压缩信息。
+因此按实验结论回退全部 O5/O6 可执行代码，当前主线恢复到远端提交 `82d3a96`：
+categorical LUT6 residual + 可控 LUT4 common correction，只使用 O6 输出。
+
+O5/O6 的设计、结果与报告路径保留在本日志中作为失败实验记录；
+`CURRENT_TECHNICAL_ROUTE.md` 恢复为 O6-only 当前路线，不再暴露 O5/O6 运行命令。
+
+### 文件回退总结
+
+- `complexPyTorch/complexLayers.py`：移除 O5 cofactor、O5 alpha 与双输出聚合，恢复
+  单次 LUT6 O6 查表和原始 complex 聚合。
+- `complexPyTorch/complexBinaryResNet.py`：移除 `lut6_output_mode` 的验证与透传。
+- `training.py`：移除 O5 CLI、alpha schedule、runtime checkpoint 恢复与日志字段。
+- `run_phase3.sh`：移除全部 O5/O6 环境变量和启动摘要。
+- `tests/test_phase12_route.py`：移除 O5/O6 数学、调度和 checkpoint 专用测试。
+- `scripts/analyze_dominance_occupancy.py`：恢复原始 dominance occupancy 分析。
+- `CURRENT_TECHNICAL_ROUTE.md`：恢复已推送的 O6-only 技术路线。
+- `EXPERIMENT_LOG.md`：保留失败实验并记录本次回退决定。
+
+## 2026-08-22：恢复 O6-only 后的下一步筛选
+
+基于 85.09% best checkpoint 的逐层 LUT 分解：平均/中位 top1-top2 categorical margin
+约为 3，只有 0.050% entries 的 margin 小于 `1e-3`、0.50% 小于 `1e-2`、3.83%
+小于 `0.1`、12.71% 小于 `0.5`。绝大多数 hard category 已稳定，后期精度从 85.09%
+回落到 84.34% 更可能由少量边界 entry 翻转及共享参数/BN drift 引起，而不是整体 LUT
+capacity 不足。
+
+新增 dominance bit 的 p1 category sensitivity 呈明显深度趋势：stage2.0/2.1 约
+6.97%/7.69%，stage3 后段约 14%–17.7%，stage4 约 16.6%–22.2%。说明深层真正使用
+新增 bit，浅层更容易被稀疏地址和无效 LUT 更新干扰。
+
+下一步优先级：
+
+1. **固定 hard LUT，恢复非 LUT 参数**：从 85.09% best 开始冻结 residual、common
+   correction 和 base，只训练 BN、stem/projection、classifier 及其他共享参数 20–40
+   epochs；这是最干净、无硬件变化且直接针对 drift 的实验。
+2. **stage-wise LUT LR**：若仍要更新 LUT，stage2.0/2.1 使用约 0.1x LR，stage2.2–
+   stage3 使用 0.5x，stage4 保持 1x；避免浅层低 sensitivity LUT 噪声拖累。
+3. **backward-only temperature**：hard argmax forward 不变，只将 softmax STE 的
+   temperature 从当前 1 提高到约 1.5–2，降低少量边界 entry 的抖动；先做固定 tau
+   单变量实验，不重新引入 soft forward。
+4. **EMA/硬表投票**：后续训练保存 plateau checkpoints，对 hard category 做时间多数
+   投票，再用训练集校准 BN；利用已观察到的后期 drift，不增加推理资源。
+5. **固定布线的 pairing 消融**：当前同 channel 相邻空间点成对。可测试层级固定的
+   horizontal/vertical/center-neighbor pairing；LUT 数量不变，仅改变输入布线。该方向
+   风险高于前四项，应后置。
+
+不建议立即继续 O5/O6、增加 LUT 数量、重新做 Walsh、scratch 或无约束提高 common
+LR，这些方向已被现有实验否定或显示出明显优化竞争。
+
+### 文件修改总结
+
+- `EXPERIMENT_LOG.md`：记录 O6-only 恢复后的 margin、逐层 sensitivity 与下一步优先级。
+
+## 2026-08-23：固化当前最佳方案文档
+
+将当前真正采用的 O6-only 最佳路线从历史实验中单独整理为
+`CURRENT_BEST_SCHEME.md`。文档只保留可复现主链：Phase 2 complex Bi-Real ->
+categorical LUT4 82.53% -> dominance categorical-residual LUT6 84.28% -> residual
+续训 84.56% -> 小幅释放 LUT4 common correction 85.09%。
+
+文档明确区分训练参数化与最终硬件：训练期的冻结 LUT4 base、零均值 LUT6 residual、
+class-centered common correction 和 softmax STE 最终合并为实部/虚部各一张 64-entry、
+1-bit 输出的 hard LUT6，只使用 O6。并记录完整 checkpoint 路径、分阶段命令、硬件映射、
+已失败消融、test-best 选择限制以及下一步冻结 hard LUT 的优先建议。
+
+### 文件修改总结
+
+- `CURRENT_BEST_SCHEME.md`：新增当前最佳方案的独立、可复现技术说明。
+- `EXPERIMENT_LOG.md`：记录最佳方案文档的范围、核心结论和本次文件修改。
+
+
+<!-- experiment-entry:flevoland-fp-baseline-20260823 -->
+## 2026-08-23 - Flevoland FP32 complex baseline and experiment directory split
+
+目标：将 CIFAR-10 专用实验、公用复数算子和 Flevoland 实验明确分层，并实现文档指定的 phase-preserving FP32 complex CNN baseline。
+
+目录与兼容性：
+- complexPyTorch/complexComponents.py：新增公用 ComplexConvBase、FPComplexConv2d、BiRealComplexConv2d、LUTComplexConv2d 占位接口、activation factory 和独立实虚 Complex BN；复用现有 complexLayers 实现，不修改 CUDA kernel 或 lut_backend.py。
+- experiments/__init__.py、experiments/README.md：定义 dataset-specific experiment 边界，complexPyTorch 继续作为 shared package。
+- experiments/cifar10/README.md：说明根目录 training.py 与 phase 脚本属于已验证 CIFAR-10 flow，并保留兼容性。
+- experiments/cifar10/run_phase1.sh、run_phase2.sh、run_phase3.sh：新增 CIFAR-10 专用入口，透传到现有脚本，不改变训练行为。
+
+Flevoland 数据：
+- experiments/flevoland/__init__.py、datasets/__init__.py：建立独立 package 和公开数据接口。
+- experiments/flevoland/datasets/flevoland.py：分离 raw loading、SHH/SHV/SVV 到 Pauli 转换、复数实虚独立归一化、可复现分层 pixel split 和 11x11 complex patch extraction；支持 MAT/NPY/NPZ；训练坐标拟合并保存 normalization statistics；明确拒绝不含相位的 dbs.bin 特征。
+
+Flevoland 模型与训练：
+- experiments/flevoland/models/__init__.py、models/complex_cnn.py：实现 3->32->64->128 的模块化 FP complex CNN，三层均经 complex conv、independent complex BN、ComplexReLU，随后 complex GAP、real/imag concat 和 linear classifier。
+- experiments/flevoland/train.py：实现 Adam baseline、sanity diagnostics、best checkpoint、OA、AA、per-class accuracy、confusion matrix、history 和 prediction map。
+- experiments/flevoland/run_baseline.sh：提供独立 baseline 启动入口和环境变量覆盖。
+- experiments/flevoland/README.md：记录所需 phase-preserving 输入格式、运行方法和输出文件。
+- tests/test_flevoland_baseline.py：覆盖 Pauli 公式、complex64 patch、归一化统计、复数 feature 前后向及训练入口 smoke test。
+
+数据审计：已下载的 data/flevoland 镜像包含 T/C diagonal dB 实值通道和固定标注位置，但不含 complex SHH/SHV/SVV，相位不可恢复，因此保留为原始资料，不用于该 FP complex Pauli baseline。
+
+验证：lut_net 环境 compileall 通过；4 项合成数据 smoke checks 通过；额外执行 1 epoch 端到端训练，成功生成 best.pt、normalization.json、history.json、test_metrics.json 和 prediction_map.npy。环境未安装 pytest，因此没有使用 pytest runner，而是直接执行同等测试函数。CIFAR-10 原训练文件未修改。
+
+<!-- experiment-entry:flevoland-label-map-20260823 -->
+## 2026-08-23 - Flevoland dense ground truth added
+
+下载并校验 data/flevoland/Label_Flevoland_15cls.mat：shape 为 750x1024，包含 background 0 与 15 个类别 1..15。该数据文件受 data/ gitignore 管理，不进入代码版本；complex scattering/Pauli 输入仍缺失。
+
+<!-- experiment-entry:flevoland-s2-audit-20260823 -->
+## 2026-08-23 - Flevoland S2 availability audit
+
+目标输入被明确为每像素 complex S2（SHH/SHV/SVH/SVV）或由其无损生成的 3-channel complex Pauli，而不是 dB diagonal features 或 Pauli RGB。NASA AIRSAR format documentation 显示经典 AIRSAR 标准 CM 产品先对多个 look 的 scattering matrix 构造 Stokes matrix，再进行 incoherent averaging；平均后的每像素只剩 9 个独立二阶统计量，不能恢复唯一的单个 S vector。文档同时明确 compressed scattering-matrix data were not archived at JPL。因此经典 750x1024 Flevoland benchmark 的公开 CM/T3 版本不能无损满足当前 Pauli-from-S2 baseline。后续必须二选一：获得同场景未公开/第三方保存的 single-look complex S2；或将 baseline 严格改为 complex T3/C3 off-diagonal representation，并明确它不是 S2 Pauli baseline。当前代码不采用 imag=0 或矩阵分解伪造 S2。
+
+<!-- experiment-entry:san-francisco-airsar-dataset-20260824 -->
+## 2026-08-24 - San Francisco AIRSAR complex dataset pipeline
+
+目标：停止使用不含相位的 Flevoland dB-only 镜像，建立 San Francisco AIRSAR STK-MLC 到 Complex CNN 输入的可复现数据管线；本次不修改任何模型、CUDA kernel 或 LUT backend。
+
+格式结论：官方样例 san_francisco900x1024.stk 是 1993 年前 AIRSAR old-processor STK-MLC，无内嵌 header，采用逐像素 10 个 signed-char 压缩量。实现严格对齐 PolSARpro airsar_convert.c，而非误用新版 CM####.dat 的 unsigned mantissa/header 语义。先恢复 10 个 Stokes 独立量 M11/M12/M13/M14/M22/M23/M24/M33/M34/M44，再在 [S_hh, sqrt(2)S_hv, S_vv] 基底构造标准 Hermitian C3。
+
+文件修改总结：
+- datasets/__init__.py：新增共享数据 package 出口，公开 STK decoder、C3 转换、normalization、dataset 和 bundle builder。
+- datasets/san_francisco.py：新增 old STK 解码、Stokes dataclass、标准六通道 C3 [C11,C22,C33,C12,C13,C23]、Hermitian 展开、PNG 标签校验、训练坐标拟合的 real/imag 独立归一化、标签 1..5 到 0..4 映射、reflect padding 的可配置奇数 patch、分层 random split，以及按主导类别分层且剔除跨 split patch 的 spatial block split。train/val/test 共享一份归一化 padding 场景，避免重复内存。
+- tools/download_san_francisco.sh：新增可重复下载脚本，从 PolSARpro 下载官方 ZIP、从 PolSF 下载 label2d，并校验 STK 必须为 900*1024*10 bytes。
+- tools/check_san_francisco.py：新增可重复验证脚本，打印 C3 shape/dtype、每通道 real/imag 统计、非对角相位统计、Hermitian error、标签分布、split 分布、样本 shape/dtype/range，并保存 normalization.json。
+- tests/test_san_francisco_dataset.py：新增合成 STK 参考公式、C3 Hermitian/复相位、complex64 patch/标签映射、random/spatial split 确定性与互斥性检查。
+- EXPERIMENT_LOG.md：通过 scripts/append_experiment_log.py 写入本条逐文件记录。
+
+实际数据验证：已下载 data/san_francisco/san_francisco900x1024.stk 与 SF-AIRSAR-label2d.png；data/ 受 gitignore 管理。C3 输出 shape=(6,900,1024)、dtype=complex64，Hermitian max error=0，三个对角虚部 max=0，C12/C13/C23 非零虚部比例分别为 0.993141/0.975876/0.995275，全部 finite，三个对角实部最小值均大于 0。原始标签计数为 [background=119298, class1=13701, class2=62731, class3=329566, class4=342795, class5=53509]。
+
+默认 spatial split（seed=0, block=64, patch=11）在去除跨边界 patch 后：train=53987，类别 [2366,6102,17214,23759,4546]；val=68320，类别 [1696,7199,25831,27463,6131]；test=594094，类别 [7185,41799,250343,258190,36577]。样本为 torch.complex64 [6,11,11]，target 为 torch.long scalar。
+
+验证状态：Python compile 与 shell bash -n 通过；4 个测试函数直接调用全部通过。lut_net/base 环境未安装 pytest，因此 pytest runner 未执行。数据管线已经可供后续 Complex CNN baseline 使用，但本次按要求没有接入或修改模型。
+
+<!-- experiment-entry:san-francisco-baseline-interface-20260824 -->
+## 2026-08-24 - San Francisco AIRSAR baseline training interface
+
+- `experiments/san_francisco/__init__.py`: added an independent San Francisco AIRSAR experiment package.
+- `experiments/san_francisco/train.py`: added a six-complex-channel, five-class FP/BiReal training CLI backed by the validated C3 dataset; uses validation-only checkpoint selection, one final test pass, OA/AA/confusion-matrix JSON outputs, optional prediction-map export, and a finite forward/backward smoke test.
+- `experiments/san_francisco/run_baseline.sh`: added a GPU-selectable launcher with environment overrides for dataset, split, optimizer, and runtime settings.
+- `experiments/san_francisco/README.md`: documented the baseline flow, default spatial split, artifacts, normal run, and smoke-test commands.
+- Validation: `py_compile` and `git diff --check` passed. A real-data CUDA smoke test passed with input `(8, 6, 11, 11)` complex64, features `(8, 128)`, logits `(8, 5)`, finite loss `1.754685`, and finite gradients.
+
+<!-- experiment-entry:san-francisco-prediction-map-fix-20260824 -->
+## 2026-08-24 - San Francisco prediction-map interface correction
+
+- `experiments/san_francisco/train.py`: replaced the Flevoland-specific prediction-map helper with a San Francisco implementation that maps model classes `0..4` back to raw labels `1..5`, leaves unlabeled/background pixels at `0`, and writes a `uint8` map. This prevents the optional final export from requiring a nonexistent dataset `class_values` field.
+- Validation: Python compilation, shell syntax, and `git diff --check` passed.
+
+<!-- experiment-entry:san-francisco-bireal-lut-flow-20260824 -->
+## 2026-08-24 - San Francisco FP-BiReal-LUT three-stage flow
+
+- `experiments/san_francisco/models.py`: added the shared-topology `bireal_fp`, `bireal`, and `bireal_lut` model builder. All stages reuse the existing BiReal residual blocks; San Francisco inputs are deterministically padded from odd patch dimensions to a multiple of four before the two stride-2 stages, then complex adaptive average pooling produces a fixed classifier input.
+- `experiments/san_francisco/checkpoints.py`: added strict FP-to-BiReal loading and BiReal-to-PairLUT4 conversion. The latter copies every shared stem/BN/projection/classifier tensor and compiles each residual main-branch binary complex convolution into its categorical LUT4 truth table; missing shared tensors or operators raise errors.
+- `experiments/san_francisco/train_bireal_flow.py`: added one configurable training entry point for all three stages, including real-data loading, stage initialization, Adam optimization, constant/cosine/BiReal schedules, separate LUT learning rate, validation checkpoint selection, final test OA/AA/confusion matrix, and optional prediction maps.
+- `experiments/san_francisco/run_bireal_fp.sh`: added the full-precision BiReal-topology launcher.
+- `experiments/san_francisco/run_bireal.sh`: added the binary BiReal launcher with an FP checkpoint default.
+- `experiments/san_francisco/run_bireal_lut.sh`: added the categorical PairLUT4 launcher with a BiReal checkpoint default and independently configurable LUT LR.
+- `experiments/san_francisco/run_bireal_flow.sh`: added serial FP-BiReal -> BiReal -> LUT execution with explicit checkpoint handoff.
+- `tests/test_san_francisco_bireal_flow.py`: added finite forward/backward tests for all stages plus strict tests for both checkpoint transitions, LUT count, categorical parameterization, LUT4 inputs, bit activation pairing, and shared classifier preservation.
+- `experiments/san_francisco/README.md`: documented the three stages, checkpoint semantics, serial launcher, per-stage launchers, and defaults.
+- Validation: Python and shell syntax checks and `git diff --check` passed. Pytest is unavailable in `lut_net`, so all three test functions were invoked directly and passed. Real San Francisco GPU smoke tests passed for all stages; the LUT test compiled 6/6 operators in the small test model and produced finite forward/backward results through the CUDA LUT path.
+- Protected implementation note: no CUDA kernel or `complexPyTorch/lut_backend.py` file was modified.
+
+<!-- experiment-entry:san-francisco-residual-stages-20260824 -->
+## 2026-08-24 - San Francisco LUT6 residual and LUT4 common-correction stages
+
+- Removed the previous `runs/san_francisco/` experiment outputs at the user's request. The dataset under `data/san_francisco/` and all source files were preserved; no San Francisco process was running when cleanup occurred.
+- `experiments/san_francisco/models.py`: extended the shared topology with logical stages 4 (`lut6_residual`) and 5 (`lut6_lut4_residual`). Both use the existing Phase-3 PairLUT operator configured as dominance LUT6 with categorical-residual parameterization and stopped dominance gradient.
+- `experiments/san_francisco/checkpoints.py`: added exact categorical LUT4-to-LUT6 warm start by copying each 16-entry base across dominance combinations, zeroing the 64-entry residual and common correction, and added strict LUT6 residual-to-common-correction loading.
+- `experiments/san_francisco/train_bireal_flow.py`: added independent network, LUT6 residual, and LUT4 common-correction optimizer groups; separate learning rates; residual/base alpha ramps; stage-specific initialization; alpha logging/history; and a guard that permits `best.pt` selection only after every active alpha reaches its final value.
+- `experiments/san_francisco/run_lut6_residual.sh`: added the established 200-epoch residual configuration (`LR=2e-4`, residual LR `2e-3`, residual alpha `0.1->1` over 120 epochs, frozen base correction).
+- `experiments/san_francisco/run_lut6_lut4_residual.sh`: added the established 100-epoch common-correction configuration (`LR=5e-5`, residual LR `5e-4`, base LR `1e-4`, residual alpha 1, base alpha `0->1` over 20 epochs).
+- `experiments/san_francisco/run_bireal_flow.sh`: extended the serial BiReal route from three to five stages with explicit best-checkpoint handoff.
+- `experiments/san_francisco/run_all_stages.sh`: added a full serial run from the independent FP baseline through all five BiReal/LUT stages.
+- `tests/test_san_francisco_bireal_flow.py`: expanded finite forward/backward coverage to all five stages; verified LUT4->LUT6 and LUT6->common-correction initial logits are exactly equal; verified zero residual/correction initialization and checkpoint eligibility after alpha completion.
+- `experiments/san_francisco/README.md`: documented the five-stage route, established residual hyperparameters, output layout, and GPU2 full-flow command.
+- Validation: all Python/shell syntax checks and `git diff --check` passed. All five direct test functions passed. Real San Francisco GPU2 CUDA smoke tests passed for both new stages with finite forward/backward; stage 4 expanded 6/6 LUT operators in the small smoke model, and stage 5 began with the same loss as stage 4.
+- Protected implementation note: no CUDA kernel or `complexPyTorch/lut_backend.py` file was modified.
+
+<!-- experiment-entry:san-francisco-full-flow-gpu2-launch-20260824 -->
+## 2026-08-24 - San Francisco full five-stage flow launched on GPU2
+
+- The first `nohup conda run` wrapper exited before Python startup with an empty log, so it was not treated as a valid launch.
+- Relaunched with `setsid` and the absolute interpreter `/home/jliangbr/miniconda3/envs/lut_net/bin/python` to detach reliably.
+- Driver PID: `3293978`; current baseline Python PID: `3293982`; DataLoader worker processes are expected children.
+- GPU selection: physical GPU2 through `CUDA_VISIBLE_DEVICES=2`.
+- Run root: `runs/san_francisco/full_flow`.
+- Driver log: `runs/san_francisco/full_flow/driver.log`.
+- Verified startup: FP baseline completed epoch 1 with train loss `0.124927`, train OA `0.9583`, validation OA `0.9317`, and validation AA `0.8363`.
+- The serial driver will automatically hand off best checkpoints through BiReal-FP, BiReal, categorical LUT4, LUT6 residual, and LUT4 common-correction stages.
+
+<!-- experiment-entry:san-francisco-full-flow-results-20260825 -->
+## 2026-08-25 - San Francisco complete FP-BiReal-LUT flow results
+
+- Status: the GPU2 serial driver completed successfully and exited. All six output directories contain `history.json`, `best.pt`, and `test_metrics.json`.
+- FP baseline: best validation OA 95.18% at epoch 45; test OA 94.67%, test AA 81.77%.
+- BiReal-topology FP: best validation OA 93.94% at epoch 25; test OA 92.92%, test AA 81.36%.
+- BiReal: best validation OA 94.86% at epoch 29; test OA 94.35%, test AA 79.99%.
+- Categorical LUT4: best validation OA 94.77% at epoch 194; test OA 93.55%, test AA 78.87%. Relative to BiReal, LUT replacement loses 0.80 percentage points of test OA.
+- LUT6 dominance residual: best eligible validation OA 94.74% at epoch 123 after alpha reached 1; test OA 93.74%, test AA 78.97%. It recovers only 0.19 percentage points over LUT4 and remains 0.60 points below BiReal.
+- LUT6 plus LUT4 common correction: best eligible validation OA 94.58% at epoch 93; test OA 93.59%, test AA 78.37%. Common correction loses 0.15 points versus LUT6 residual and does not transfer the CIFAR-10 gain.
+- Interpretation: the dominant loss occurs at BiReal-to-LUT4 conversion. Additional LUT6 conditional capacity is useful but modest on this split; releasing the LUT4 common correction is not beneficial. Near-100% training OA and materially lower validation/test metrics indicate strong overfitting. AA also drops more than OA, suggesting minority-class performance is the main weakness under the imbalanced spatial split.
+- Current best deployable LUT model is the LUT6 residual checkpoint at `runs/san_francisco/full_flow/bireal_flow/lut6_residual/best.pt`. The overall best model is the independent FP baseline.
+
+<!-- experiment-entry:sf-lut-usage-shortcut-ablation-20260825 -->
+## 2026-08-25 - San Francisco dominance/address analysis and shortcut ablation
+
+### Purpose
+
+The current LUT6 residual gain over LUT4 is small. Three hypotheses were isolated: dominance may have low entropy, LUT6 addresses may be poorly utilized, or the floating-point projection shortcuts may mask the benefit of the added phase information.
+
+### Reusable analysis and results
+
+Both checkpoints were measured on the same first 100 non-shuffled training batches (12,800 patches), using each layer's real `_group_patches` path and per-LUT-group counts rather than a layer-global union.
+
+- LUT4 report: `runs/san_francisco/full_flow/bireal_flow/bireal_lut/lut_usage/`
+- LUT6 report: `runs/san_francisco/full_flow/bireal_flow/lut6_residual/lut_usage/`
+- Comparison: `runs/san_francisco/full_flow/bireal_flow/lut_address_analysis.md`
+- Stage 2: mean dominance entropy 0.993 bit, p(1)=0.451, LUT6 effective states 30.83/64, normalized address entropy 0.814.
+- Stage 3: mean dominance entropy 0.976 bit, p(1)=0.411, LUT6 effective states 26.47/64, normalized address entropy 0.776.
+- Stage 4: mean dominance entropy 0.903 bit, p(1)=0.323, LUT6 effective states 17.43/64, normalized address entropy 0.668.
+- Entry coverage alone is not the main issue: mean unused LUT6 entries are 0% in Stages 2/3 and 2.6% in Stage 4 over this sample. The stronger finding is frequency concentration: the deepest layers visit most addresses at least once but train mainly on about 16 effective states.
+- Dominance therefore does not collapse globally. Its balance and address diversity degrade with depth, especially after `stage4.0`.
+
+### Shortcut ablation design
+
+A new `shortcut_mode` keeps the existing `fp` path as default and adds `option_a`. At each channel/stride transition, option-A performs `x[..., ::stride, ::stride]` and symmetric channel zero-padding. It removes the shortcut's FP ComplexConv1x1 and ComplexBN without adding trainable parameters. The complete flow must be retrained under one shortcut mode; swapping an existing checkpoint would confound the experiment with a projection-path discontinuity.
+
+### Per-file changes
+
+- `complexPyTorch/complexBinaryResNet.py`: added `ComplexOptionAShortcut`, validated `shortcut_mode`, and propagated it into all residual blocks. CUDA and LUT backend files were not touched.
+- `experiments/san_francisco/models.py`: exposed `shortcut_mode` in the San Francisco model builder; default remains `fp`.
+- `experiments/san_francisco/train_bireal_flow.py`: added `--shortcut-mode`, passed it to the model, stored it in checkpoint args, and logged it at startup.
+- `experiments/san_francisco/run_bireal_fp.sh`: added the `SHORTCUT_MODE` environment mapping.
+- `experiments/san_francisco/run_bireal.sh`: added the `SHORTCUT_MODE` environment mapping.
+- `experiments/san_francisco/run_bireal_lut.sh`: added the `SHORTCUT_MODE` environment mapping.
+- `experiments/san_francisco/run_lut6_residual.sh`: added the `SHORTCUT_MODE` environment mapping.
+- `experiments/san_francisco/run_lut6_lut4_residual.sh`: added the `SHORTCUT_MODE` environment mapping.
+- `experiments/san_francisco/run_option_a_shortcut_ablation.sh`: added a dedicated serial launcher for the full option-A flow.
+- `experiments/san_francisco/analyze_lut_usage.py`: added reusable per-layer/per-group dominance entropy, LUT4/LUT6 occupancy, normalized entropy, and effective-state analysis with JSON/CSV output.
+- `experiments/san_francisco/summarize_lut_usage.py`: added reusable LUT4/LUT6 JSON comparison and Markdown report generation.
+- `tests/test_san_francisco_bireal_flow.py`: added a shape and zero-parameter projection test for option-A.
+- `experiments/san_francisco/README.md`: documented analysis commands, metric interpretation, and the valid full-flow shortcut ablation protocol.
+- `EXPERIMENT_LOG.md`: recorded the experiment definition, measured results, interpretation, and all file-level changes.
+
+### Runtime status
+
+The full option-A ablation was launched on GPU0 at 2026-08-25 18:39 Asia/Hong_Kong. The active main process started as PID 2609879 with `shortcut=option_a`, 540,341 FP-stage parameters, 53,987 training patches, and output root `runs/san_francisco/option_a_shortcut_flow/`. Its serial log is `runs/san_francisco/option_a_shortcut_flow/flow.log`. The first stage was healthy and computing when this entry was written; no completed accuracy result is claimed yet.
+
+<!-- experiment-entry:sf-option-a-shortcut-complete-20260827 -->
+## 2026-08-27 - San Francisco option-A shortcut ablation completed
+
+The serial flow at `runs/san_francisco/option_a_shortcut_flow` completed all five stages with finite metrics. Results were regenerated by `experiments/san_francisco/summarize_bireal_flow.py`, which only considers checkpoint-eligible epochs when reporting best validation metrics.
+
+| Stage | Test OA | Test AA | Eligible best validation OA | Epoch |
+|---|---:|---:|---:|---:|
+| bireal_fp | 93.19% | 80.93% | 94.36% | 94 |
+| bireal | 93.34% | 80.66% | 94.82% | 7 |
+| bireal_lut | 93.37% | 78.54% | 94.79% | 200 |
+| lut6_residual | 93.49% | 78.77% | 94.66% | 177 |
+| lut6_lut4_residual | 93.31% | 77.39% | 94.74% | 24 |
+
+Option-A LUT6 residual improves over option-A LUT4 by only `+0.12 pp` test OA. The original FP-shortcut flow improved by `+0.19 pp`. Removing the FP projection convolution/BN therefore did not increase the measurable value of dominance conditioning; the shortcut-masking hypothesis is not supported by this run. Releasing the LUT4 common correction after LUT6 also reduced test OA by `0.19 pp` and AA by `1.38 pp`, despite a slightly higher validation OA, indicating validation/test drift rather than a robust gain.
+
+### File-level update
+
+- `experiments/san_francisco/summarize_bireal_flow.py`: added a reusable five-stage metrics summarizer with optional reference-flow comparison; best validation selection respects `selection_eligible` so pre-ramp residual epochs are not mislabeled as saved checkpoints.
+- `EXPERIMENT_LOG.md`: recorded completed option-A metrics and the negative shortcut-masking conclusion.
+
+<!-- experiment-entry:sf-classwise-flow-analysis-20260827 -->
+## 2026-08-27 - San Francisco class-wise flow analysis
+
+`experiments/san_francisco/summarize_bireal_flow.py` was extended and rerun on the completed option-A and reference FP-shortcut flows. The reusable report now records checkpoint-eligible validation selection, test class support, per-class accuracy, LUT4-to-LUT6 deltas, and current-versus-reference stage deltas. Generated report: `runs/san_francisco/option_a_shortcut_flow/flow_summary.md`.
+
+### Findings
+
+- The test split is strongly imbalanced: class shares are 1.21%, 7.04%, 42.14%, 43.46%, and 6.16%. Classes 3/4 jointly contribute 85.60% of OA and remain near 97-99% accuracy, so similar OA can hide large minority-class changes.
+- Under option-A, LUT4 to LUT6 changes test OA by +0.12 pp and AA by +0.23 pp. Per-class changes are +0.65, -2.94, +0.35, -0.05, and +3.15 pp. The gain is primarily a class-5 recovery traded against class 2, not a broad improvement.
+- Under the reference FP shortcut, the same transition changes OA by +0.19 pp and AA by +0.09 pp. Per-class changes are -4.89, -0.58, -0.00, -0.19, and +6.11 pp. Again, the principal positive effect is class 5.
+- Option-A does not improve the LUT6 stage versus the reference flow: OA is lower by 0.25 pp and AA by 0.20 pp. The FP shortcut is therefore retained.
+- Releasing LUT4 common correction after LUT6 is harmful on option-A: test OA falls 0.19 pp and AA falls 1.38 pp. The validation-selected checkpoint does not generalize this apparent gain to the spatial test split.
+- Existing dominance analysis showed high shallow-layer bit entropy but only about 17 effective LUT6 states in Stage 4. Combined with the class-wise result, dominance carries information but its deep conditional partitions are concentrated and mostly help one minority decision boundary.
+
+### Decision and next priorities
+
+1. Keep the FP shortcut and stop the deployable flow at `lut6_residual`; do not use option-A or the common-correction continuation as defaults.
+2. Add dual checkpoint selection by validation OA and validation AA (or a declared combined score), because OA-only selection is dominated by classes 3/4.
+3. Test a moderate fixed terminal residual alpha such as 0.35 or 0.5. Alpha can be compiled into the final hard table, and the current run's strongest pre-eligibility validation region occurred before full release.
+4. Separately test a conservative class-balanced objective, preferably square-root inverse frequency or effective-number weighting rather than full inverse frequency, and report both OA and AA.
+
+### File-level update
+
+- `experiments/san_francisco/summarize_bireal_flow.py`: added class support validation, per-class accuracy tables, transition deltas, and reference-flow comparisons while preserving checkpoint eligibility semantics.
+- `EXPERIMENT_LOG.md`: recorded the class-wise analysis, rejected shortcut/common-correction branches, and prioritized alpha and balanced-selection experiments.
+
+<!-- experiment-entry:paper-method-draft-cn-20260829 -->
+## 2026-08-29 - Current method organized as a paper-style Chinese draft
+
+The active method, implementation equations, hardware mapping, CIFAR-10 results, San Francisco results, ablations, limitations, and next experiments were consolidated into `PAPER_METHOD_DRAFT_CN.md`. The document treats categorical LUT4 warm start plus zero-mean dominance residual LUT6 as the transferable core method. LUT4 common correction is explicitly classified as a dataset-specific optional extension because it improved CIFAR-10 best accuracy to 85.09% but reduced San Francisco accuracy.
+
+The audit checked the six-bit address order, LUT4 projection address, four-class complex output codebook, class-centered common correction, four-slice-centered LUT6 residual, hard-argmax/softmax-STE path, group count, physical LUT6 count, O6-only deployment, CIFAR-10 metrics, San Francisco OA/AA and class imbalance, address entropy, and rejected option-A/O5-O6/Walsh/triple-LUT6 branches. The draft also distinguishes training-only parameterization from deployable truth tables and notes that a fixed residual alpha need not equal one because it is folded into hard table generation.
+
+### File-level changes
+
+- `PAPER_METHOD_DRAFT_CN.md`: added a 17-section, paper-style Chinese method draft covering abstract, motivation, network stages, binary complex encoding, categorical LUT4, exact LUT4-to-LUT6 warm start, residual equations, hardware resource formulas, training algorithm, experimental protocols/results, ablations, limitations, next experiments, suggested paper structure, and a one-sentence method definition.
+- `EXPERIMENT_LOG.md`: recorded the document scope, methodological decisions, audit coverage, and file-level change summary.
+
+Validation: `git diff --check` passed. No model, CUDA kernel, LUT backend, dataset, or training behavior was changed in this documentation task.
+
+<!-- experiment-entry:sf-next-experiment-priorities-20260829 -->
+## 2026-08-29 - San Francisco next experiment priorities
+
+This analysis is based on the completed reference and option-A flows, class-wise summaries, and per-group LUT address statistics. The largest structural loss is still BiReal-to-LUT4 (`94.35% -> 93.55%` OA), while LUT4-to-residual-LUT6 recovers only `+0.19 pp`. LUT6 improvements are concentrated in class 5, and Stage 4 uses only about 17 effective LUT6 states despite broad nominal address coverage. Option-A shortcut and LUT4 common correction are rejected as defaults.
+
+Priority order:
+
+1. Add class-conditional dominance/address diagnostics before changing the third bit: measure `P(p=1 | class, layer)`, class-conditional address entropy, and which samples LUT6 corrects or breaks relative to LUT4.
+2. Improve the LUT4 conversion using a frozen BiReal teacher and progressive stage replacement (`stage4 -> stage3 -> stage2`). Use hard LUT forward throughout; distillation is training-only and adds no deployment hardware.
+3. During LUT6 training, save hard checkpoints throughout the alpha ramp and compare declared validation OA/AA criteria. A lower fixed alpha is hardware-valid, but alpha alone is not a strict capacity constraint because residual logits can rescale.
+4. Add occupancy-weighted anchoring of rare LUT6 slices to the expanded LUT4 base, freeing high-frequency addresses while preventing weakly trained entries from drifting.
+5. Evaluate conservative class balancing separately using square-root inverse-frequency or effective-number weights, with OA, AA, per-class accuracy, and multiple spatial seeds.
+6. Retain the FP shortcut and stop the default deployable flow at residual LUT6. Do not prioritize option-A, common correction, Walsh, O5/O6, or larger input grouping.
+
+No source code or training behavior was changed in this analysis entry; only `EXPERIMENT_LOG.md` was updated.
+
+<!-- experiment-entry:sf-oa-aa-loss-selection-ablation-20260829 -->
+## 2026-08-29 - San Francisco OA/AA loss and checkpoint-selection ablation
+
+Goal: separate the training objective from checkpoint selection on the current deployable LUT6-residual route. Two trainings are defined: ordinary cross entropy and square-root inverse-frequency weighted cross entropy. Each training independently saves the validation-OA and validation-AA optima, yielding four testable combinations without using the test split for selection.
+
+Per-file changes:
+
+- `experiments/san_francisco/train.py`: added `--loss-mode ce|sqrt_inverse`; computes weights only from the training split and normalizes them to mean one; added independent `best_oa.pt` and `best_aa.pt` selection, independent final test evaluation, selection-specific metrics/maps, and `selection_results.json`. Existing `best.pt` and `test_metrics.json` remain OA-selected compatibility aliases.
+- `experiments/san_francisco/train_bireal_flow.py`: applied the same configurable criterion and dual-checkpoint protocol to every shared BiReal/LUT stage. Residual stages continue to require completed alpha ramps before either OA or AA checkpoint is eligible.
+- `experiments/san_francisco/run_baseline.sh`: exposed `LOSS_MODE` while preserving `ce` as the default.
+- `experiments/san_francisco/run_bireal_fp.sh`: exposed `LOSS_MODE` while preserving all established architecture and optimizer defaults.
+- `experiments/san_francisco/run_bireal.sh`: exposed `LOSS_MODE`; checkpoint handoff remains OA-selected through `best.pt`.
+- `experiments/san_francisco/run_bireal_lut.sh`: exposed `LOSS_MODE` without changing LUT parameterization or learning rates.
+- `experiments/san_francisco/run_lut6_residual.sh`: exposed `LOSS_MODE` without changing the established residual-alpha schedule.
+- `experiments/san_francisco/run_lut6_lut4_residual.sh`: exposed `LOSS_MODE` without changing residual/common-correction behavior.
+- `experiments/san_francisco/run_loss_selection_ablation.sh`: added a reusable two-GPU launcher that starts CE and square-root-inverse LUT6-residual runs from the same LUT4 checkpoint, waits for both, and invokes the reusable summarizer.
+- `experiments/san_francisco/summarize_loss_selection.py`: added deterministic Markdown/JSON reporting for CE/Best-OA, CE/Best-AA, balanced/Best-OA, and balanced/Best-AA.
+- `experiments/san_francisco/README.md`: documented loss semantics, compatibility artifacts, output files, and the reusable two-GPU command.
+- `tests/test_san_francisco_bireal_flow.py`: added a synthetic imbalanced training-split test that verifies exact square-root inverse-frequency weights, mean-one normalization, and unweighted CE behavior.
+- `EXPERIMENT_LOG.md`: recorded the design, each modified file, compatibility guarantees, and validation results.
+
+Validation:
+
+- Python compilation and all launcher shell syntax checks passed.
+- `pytest` is unavailable in the `lut_net` environment; the new test was invoked directly and passed.
+- Synthetic report generation and `git diff --check` passed.
+- Real San Francisco LUT6-residual CUDA smoke tests passed on GPUs 4 and 5 for both loss modes.
+- Training counts were `[2366, 6102, 17214, 23759, 4546]`; normalized balanced weights were `[1.649935, 1.027397, 0.611693, 0.520667, 1.190308]`.
+- No CUDA kernel, LUT backend, model architecture, hard LUT mapping, optimizer schedule, or deployment hardware behavior was modified.
+
+## 2026-08-29 - San Francisco loss-selection ablation launched
+
+The validated LUT6-residual loss ablation was launched from the same LUT4 checkpoint at `runs/san_francisco/full_flow/bireal_flow/bireal_lut/best.pt`. The CE run uses GPU4 and PID 2120597; the square-root inverse-frequency run uses GPU5 and PID 2120598. The detached coordinating launcher has PID 2120592. Both jobs use the established 200-epoch LUT6 residual schedule and differ only in `loss_mode`.
+
+Run root: `runs/san_francisco/loss_selection_ablation/`. Per-run logs are `ce/train.log` and `sqrt_inverse/train.log`; the coordinator log is `driver.log`. At launch verification, both GPUs were at 98% utilization with finite initialization, 18 expanded PairLUT4 operators, and the expected 53,987/68,320/594,094 train/validation/test split. When both jobs finish, the launcher will generate `loss_selection_summary.md` and `loss_selection_summary.json`.
+
+<!-- experiment-entry:sf-oa-aa-loss-selection-results-20260903 -->
+## 2026-09-03 - San Francisco OA/AA loss-selection final results
+
+Both 200-epoch LUT6-residual runs completed, including independent final test evaluation of the validation-OA and validation-AA checkpoints. All selection remained validation-only; the test split was evaluated only after checkpoint selection.
+
+Final comparison:
+
+| Training loss | Selection | Epoch | Val OA | Val AA | Test OA | Test AA |
+|---|---|---:|---:|---:|---:|---:|
+| CE | Best OA | 152 | 94.81% | 86.58% | 93.94% | 80.36% |
+| CE | Best AA | 152 | 94.81% | 86.58% | 93.94% | 80.36% |
+| sqrt inverse | Best OA | 140 | 94.31% | 85.48% | 93.23% | 77.52% |
+| sqrt inverse | Best AA | 138 | 94.24% | 85.75% | 92.88% | 78.00% |
+
+The ordinary-CE run selected the same epoch for OA and AA. Relative to the previous reference LUT4 result (93.55% OA, 78.87% AA), the new CE LUT6 result improves by +0.39 pp OA and +1.49 pp AA. Relative to the previous reference LUT6 result (93.74% OA, 78.97% AA), it improves by +0.20 pp OA and +1.39 pp AA. Its per-class accuracies are 64.86%, 88.13%, 97.14%, 98.34%, and 53.34%.
+
+Square-root inverse weighting is rejected as the default. Its AA-selected checkpoint raises class 1 to 68.64% but lowers class 5 to 40.25%, producing worse aggregate OA and AA than CE. Training-frequency weighting therefore does not solve the spatial generalization pattern. The CE validation-to-test AA gap (86.58% to 80.36%) further indicates spatial/domain shift rather than only global class imbalance.
+
+File correction:
+
+- `experiments/san_francisco/summarize_loss_selection.py`: added the missing module entry point that calls `main()`. The computation itself was already complete, and no training result changed. Python compilation passed and the reusable summary was regenerated at `runs/san_francisco/loss_selection_ablation/loss_selection_summary.md` with a matching JSON file.
+- `EXPERIMENT_LOG.md`: recorded final OA/AA, per-class interpretation, comparisons against prior LUT4/LUT6 references, and the reporting-script correction.
+
+Decision: retain ordinary CE and dual OA/AA checkpoint saving. Do not use square-root inverse-frequency weighting as the main San Francisco objective. Future minority-class work should target spatial/domain robustness or class-conditional representation diagnostics rather than stronger global frequency weights.
+
+<!-- experiment-entry:sf-retain-ce-cleanup-current-state-20260903 -->
+## 2026-09-03 - San Francisco retained ordinary CE and cleaned the ablation code
+
+Decision: the square-root inverse-frequency experiment was negative, and validation-OA/validation-AA selection chose the same epoch under the winning CE run. The active San Francisco code therefore returns to ordinary unweighted cross entropy with validation-OA checkpoint selection only. Completed ablation artifacts under `runs/san_francisco/loss_selection_ablation/` are retained as evidence and were not deleted.
+
+Per-file cleanup:
+
+- `experiments/san_francisco/train.py`: removed `--loss-mode`, training-frequency weight construction, class-weight logging, dual OA/AA checkpoints, duplicate test passes, and selection-specific artifacts; restored fixed `nn.CrossEntropyLoss()`, `best.pt`, and `test_metrics.json`.
+- `experiments/san_francisco/train_bireal_flow.py`: removed the balanced-loss option and dual checkpoint path from every BiReal/LUT stage; restored ordinary CE and validation-OA-only selection while preserving the residual alpha eligibility guard.
+- `experiments/san_francisco/run_baseline.sh`, `run_bireal_fp.sh`, `run_bireal.sh`, `run_bireal_lut.sh`, `run_lut6_residual.sh`, and `run_lut6_lut4_residual.sh`: removed the temporary `LOSS_MODE` environment mapping.
+- `experiments/san_francisco/run_loss_selection_ablation.sh`: removed the completed two-GPU ablation launcher from active source.
+- `experiments/san_francisco/summarize_loss_selection.py`: removed the ablation-only summarizer from active source; its generated Markdown/JSON reports remain in the run directory.
+- `experiments/san_francisco/README.md`: removed the temporary balanced-loss and dual-selection usage section.
+- `tests/test_san_francisco_bireal_flow.py`: removed the square-root inverse-frequency unit test and its ablation-only imports.
+- `EXPERIMENT_LOG.md`: recorded all cleanup and the retained current state.
+
+Retained San Francisco state:
+
+- Independent FP baseline: 94.67% test OA / 81.77% AA.
+- Shared-topology BiReal: 94.35% OA / 79.99% AA.
+- Reference categorical LUT4: 93.55% OA / 78.87% AA.
+- Previous reference residual LUT6: 93.74% OA / 78.97% AA.
+- Latest ordinary-CE residual LUT6: 93.94% OA / 80.36% AA, selected at epoch 152; this is the current best deployable San Francisco LUT result.
+- The latest LUT6 result improves over its LUT4 starting point by +0.39 pp OA and +1.49 pp AA, but remains 0.41 pp OA below BiReal and 0.73 pp below the independent FP baseline.
+- The active method retains the FP shortcut, categorical LUT4 warm start, dominance-conditioned zero-mean LUT6 residual, stopped dominance gradient, O6-only hard LUT export, and no LUT4 common correction continuation.
+- Main unresolved issues are the BiReal-to-LUT4 conversion loss, near-perfect training accuracy versus lower spatial validation/test accuracy, minority-class/domain-shift sensitivity, and deep-stage LUT6 address-frequency concentration.
+
+Validation: no active loss-ablation process remained. Python compilation, all launcher shell syntax checks, `git diff --check`, residual checkpoint eligibility testing, and finite forward/backward testing across all San Francisco stages passed. CUDA kernels, LUT backend, dataset splits, model topology, LUT equations, and hard deployment mapping were not modified.
+
+<!-- experiment-entry:sf-current-paper-positioning-20260903 -->
+## 2026-09-03 - San Francisco current accuracy-efficiency positioning
+
+The retained comparison now contains the three models required for the main San Francisco claim: independent FP at 94.67% OA / 81.77% AA, shared-topology BiReal at 94.35% OA / 79.99% AA, and the best deployable ordinary-CE residual LUT6 at 93.94% OA / 80.36% AA. The LUT model is only 0.41 pp OA below BiReal and 0.73 pp below FP, while its AA is 0.37 pp above BiReal and 1.41 pp below FP.
+
+Interpretation: the accuracy side is close enough to support an efficiency-oriented FPGA result. The LUT operator compiles the local binary activation relation into fixed O6 truth tables and removes floating-point multiplication from the deployed main branch. However, superiority over BiReal in LUT count, latency, throughput, frequency, and energy must be established by synthesis and hardware measurement rather than inferred from software accuracy or operation labels alone. The next evidence priority is therefore a matched FPGA comparison of FP, BiReal, and LUT under the same network width, input resolution, device, clock constraint, and I/O assumptions, together with repeated-seed accuracy to characterize the remaining sub-percentage-point gap.
+
+No source code, training behavior, checkpoint, CUDA kernel, or LUT backend was changed; only this interpretation was recorded in `EXPERIMENT_LOG.md`.
+
+<!-- experiment-entry:sf-multiseed-core-flow-implementation-20260903 -->
+## 2026-09-03 - San Francisco multi-seed retained core flow
+
+Goal: measure seed sensitivity for the retained ordinary-CE comparison from FP through the final residual LUT6. Existing seed 0 remains the reference. New seeds 1 and 2 run independently and serially within each seed, while the two seeds run in parallel on separate GPUs. The retained route contains independent FP baseline, shared-topology FP, BiReal, categorical LUT4, and dominance residual LUT6; it intentionally stops before LUT4 common correction.
+
+Per-file changes:
+
+- `experiments/san_francisco/run_core_flow.sh`: added a reusable one-seed serial launcher. It propagates the same seed through the dataset spatial split, initialization, and all five comparison points, with explicit best-checkpoint handoff from shared FP to BiReal to LUT4 to LUT6.
+- `experiments/san_francisco/run_multiseed_core_flow.sh`: added a reusable parallel coordinator with configurable comma-separated `SEEDS` and `GPUS`; each seed receives an isolated output root and log. It waits for all runs and then combines the completed seed-0 reference with the new runs.
+- `experiments/san_francisco/summarize_multiseed.py`: added structured JSON input processing and Markdown/JSON output for per-seed FP/BiReal/LUT4/LUT6 OA/AA, LUT6-over-LUT4 OA delta, and cross-seed mean plus sample standard deviation.
+- `experiments/san_francisco/README.md`: documented the retained multi-seed route, default seed/GPU assignment, output layout, and automatic report artifacts.
+- `EXPERIMENT_LOG.md`: recorded the rationale, exact retained stages, all file changes, and validation.
+
+Validation: shell and Python syntax checks, `git diff --check`, stage-boundary/seed/checkpoint audit, and a real report-generation test using the completed seed-0 flow all passed. The seed-0 report reproduced FP 94.67%/81.77%, BiReal 94.35%/79.99%, LUT4 93.55%/78.87%, and LUT6 93.74%/78.97% OA/AA. No dataset, model, optimizer, CUDA kernel, LUT backend, loss, or deployment mapping was changed.
+
+<!-- experiment-entry:sf-multiseed-fixed-split-correction-20260903 -->
+## 2026-09-03 - San Francisco multi-seed protocol fixed the spatial split
+
+The first seed-1/seed-2 launch was stopped after two FP epochs because the existing `--seed` controlled both model randomness and the spatial block split. The unequal split sizes exposed the confound immediately. Those partial outputs were preserved, not deleted, under `runs/san_francisco/multiseed_invalid_varying_split_20260903/` and must not be used as results.
+
+Protocol correction and per-file changes:
+
+- `experiments/san_francisco/train.py`: added an optional independent `--split-seed`; dataset construction uses it when provided, while `--seed` continues to control training randomness. Logging now prints both values.
+- `experiments/san_francisco/train_bireal_flow.py`: added the same independent split seed to every shared FP/BiReal/LUT stage and records both seeds through checkpoint arguments and startup logs.
+- `experiments/san_francisco/run_baseline.sh`, `run_bireal_fp.sh`, `run_bireal.sh`, `run_bireal_lut.sh`, `run_lut6_residual.sh`, and `run_lut6_lut4_residual.sh`: exposed `SPLIT_SEED`; when omitted, it defaults to `SEED` to preserve prior launcher behavior.
+- `experiments/san_francisco/run_core_flow.sh`: fixed `SPLIT_SEED=0` by default and propagates it to all five retained stages while varying the training seed.
+- `experiments/san_francisco/run_multiseed_core_flow.sh`: propagates one fixed split seed to every parallel seed and keeps isolated roots/logs.
+- `experiments/san_francisco/README.md`: clarified that the reproducibility experiment fixes split seed 0 and changes only training randomness.
+- `EXPERIMENT_LOG.md`: documented the stopped invalid launch, preserved location, methodological reason, correction, and validation.
+
+Validation: all Python and shell syntax checks and `git diff --check` passed. A real GPU4 smoke test with training seed 1 and split seed 0 reproduced the seed-0 split exactly: 53,987 train, 68,320 validation, 594,094 test, with training counts [2366, 6102, 17214, 23759, 4546]. The forward/backward pass was finite. No model, loss, dataset membership for split seed 0, CUDA kernel, LUT backend, or deployment behavior changed.
+
+## 2026-09-03 - San Francisco fixed-split seed 1/2 core flows launched
+
+The corrected reproducibility runs are active under `runs/san_francisco/multiseed/`. Seed 1 runs serially on GPU4 and seed 2 runs serially on GPU3; both fix `split_seed=0` and use ordinary CE. The coordinating PID is 3525616, per-seed launcher PIDs are 3525622 and 3525624, and the initial FP trainer PIDs are 3525629 and 3525630.
+
+Launch verification confirmed identical split sizes (53,987 train / 68,320 validation / 594,094 test) and identical training class counts [2366, 6102, 17214, 23759, 4546] for both seeds. Both completed two finite FP epochs. Per-seed progress is written to `seed_1/flow.log` and `seed_2/flow.log`; the coordinator writes `driver.log`. Each seed will proceed through independent FP, shared-topology FP, BiReal, LUT4, and residual LUT6. After both finish, the reusable summarizer will combine the original seed-0 reference with seeds 1/2 into `multiseed_summary.md` and JSON. The earlier `multiseed_invalid_varying_split_20260903` directory remains explicitly invalid and excluded.
+
+## 2026-09-04 - San Francisco final experiment/report organization
+
+The completed fixed-split (`split_seed=0`) three-seed San Francisco AIRSAR comparison is now packaged as the retained final experiment. Generated run artifacts, raw AIRSAR files, checkpoints, histories, and prediction maps remain local under ignored `data/` and `runs/`; only reproducible source, tests, launchers, and compact result snapshots are prepared for version control.
+
+- `experiments/san_francisco/summarize_multiseed.py`: expanded the reusable report so each seed includes independent FP, shared-topology FP, BiReal, LUT4, and LUT6-residual test OA/AA, followed by mean and sample standard deviation.
+- `experiments/san_francisco/README.md`: reduced the public workflow to the retained five-point core flow and fixed-split multi-seed protocol; removed discarded common-correction and shortcut-ablation routes from the main documentation.
+- `experiments/san_francisco/results/README.md`: added regeneration/provenance guidance for versioned result snapshots.
+- `experiments/san_francisco/results/multiseed_core_flow.md` and `.json`: generated the final three-seed test-result snapshot from `runs/san_francisco/full_flow`, `runs/san_francisco/multiseed/seed_1`, and `runs/san_francisco/multiseed/seed_2`.
+- Normalized end-of-file whitespace across the retained San Francisco Python modules and launchers so the versioned experiment passes `git diff --check`.
+
+Validation: regenerated the snapshot through `python -m experiments.san_francisco.summarize_multiseed`; Python compilation and `git diff --check` are run before commit. No dataset values, model equations, CUDA kernel, LUT backend, checkpoints, or ignored run artifacts are modified by this organization step.
