@@ -4962,3 +4962,19 @@ The Pol-InSAR input is a spatially correlated, class-imbalanced complex T3/coher
 - `experiments/pol_insar_island/protocol.py`: model construction now reads `dominance_grad_mode` and `dominance_ste_margin` through `getattr`, defaulting to the established `stop` / `1.0` behavior. Full CLI runs continue to pass their explicit settings unchanged; lightweight callers such as the unified stage-transition test can construct the protocol using only shared topology fields.
 
 Validation follows with direct execution of all four unified protocol transition tests.
+
+
+<!-- experiment-entry:project-handoff-20260922 -->
+## 2026-09-22 - Server migration handoff document
+
+- Added `HANDOFF.md` as the maintained migration entry point. It records the
+  active unified flow, branch/remote state, ignored assets that must be copied
+  separately, CUDA extension verification, dataset contracts, reproducible
+  commands, validated results, analysis tools, and prioritized next work.
+- It explicitly distinguishes the maintained shared workflow from legacy
+  root-level CIFAR launchers and flags `POL_INSAR_OPENSARSHIP_RESULTS.md` as an
+  older scaffold whose pending wording is superseded by dated experiment-log
+  entries.
+- No model, trainer, CUDA backend, data loader, checkpoint, or experiment
+  artifact changed. The locally untracked `experiments/flevoland/` archive note
+  remains intentionally outside this commit.
