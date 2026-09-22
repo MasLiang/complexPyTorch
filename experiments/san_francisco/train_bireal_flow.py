@@ -13,7 +13,7 @@ from torch import nn
 
 from complexPyTorch.complexLayers import PairLUT4ComplexConv2d
 from datasets.san_francisco import build_san_francisco_datasets
-from experiments.flevoland.train import run_epoch, set_seed
+from experiments.san_francisco.training_utils import run_epoch, set_seed
 from experiments.san_francisco.checkpoints import (
     load_bireal_from_fp,
     load_lut_from_bireal,

@@ -4738,3 +4738,227 @@ The completed fixed-split (`split_seed=0`) three-seed San Francisco AIRSAR compa
 - Normalized end-of-file whitespace across the retained San Francisco Python modules and launchers so the versioned experiment passes `git diff --check`.
 
 Validation: regenerated the snapshot through `python -m experiments.san_francisco.summarize_multiseed`; Python compilation and `git diff --check` are run before commit. No dataset values, model equations, CUDA kernel, LUT backend, checkpoints, or ignored run artifacts are modified by this organization step.
+
+## 2026-09-04 - CIFAR-10/San Francisco workflow alignment and Flevoland decoupling
+
+Current active workflows are CIFAR-10 and San Francisco AIRSAR. Both share the production complex implementation (`BinaryComplexResNet`, signed BiReal activation, `{0,1}` LUT-bit activation, PairLUT4 categorical tables, and optional dominance-conditioned LUT6 residuals), while retaining their intentionally different dataset geometry, split, augmentation, and optimizer protocols.
+
+- `experiments/san_francisco/baseline.py`: added the self-contained independent FP complex CNN previously imported through the Flevoland route. Its FP complex-convolution, independent complex-BN, ComplexReLU, pooling, and real/imag classifier computation are unchanged.
+- `experiments/san_francisco/training_utils.py`: moved seed control, confusion-matrix OA/AA calculation, and epoch execution into the active San Francisco package.
+- `experiments/san_francisco/train.py` and `train_bireal_flow.py`: now import only San Francisco-local baseline/training utilities; removed the unused baseline `conv_type` option.
+- `experiments/__init__.py` and `experiments/README.md`: added the maintained CIFAR-10/San Francisco workflow boundary and shared-LUT alignment description.
+- `experiments/cifar10/README.md`: documented the common binary/LUT arithmetic and the expected CIFAR-vs-San-Francisco protocol differences.
+- `experiments/flevoland/README.md`: retained as an archive note. Removed Flevoland-only Python modules, launcher, dataset/model code, test, and the untracked `complexPyTorch/complexComponents.py`, because they are no longer dependencies of either active workflow.
+
+Validation: San Francisco imports no longer reference `experiments.flevoland`; `py_compile` passes for its active package. Full San Francisco direct tests are rerun after the remaining legacy-stage cleanup.
+
+## 2026-09-04 - Dataset-agnostic FP -> BiReal -> LUT workflow
+
+Implemented a reusable staged training flow and made it the documented entry point for active datasets.
+
+- `experiments/flow/contracts.py`: defines the dataset protocol contract (`DatasetBundle`, `StageSpec`, `DatasetProtocol`).
+- `experiments/flow/engine.py`: centralizes seed control, loaders, CE training, OA/AA, schedules, categorical LUT6 residual-alpha ramp, automatic parent-stage resolution, checkpoint selection, and smoke-test checkpoints.
+- `experiments/flow/checkpoints.py`: centralizes strict compatible loading, BiReal-to-categorical-LUT4 compilation, and LUT4-to-LUT6 residual expansion. Expansion preserves the LUT4 mapping exactly at residual alpha zero.
+- `experiments/cifar10/protocol.py` and `experiments/san_francisco/protocol.py`: isolate each dataset's loading, model construction, and stage hyperparameters. Their shared operator chain is `shared_fp -> bireal -> lut4 -> lut6_residual`.
+- `experiments/run_flow.py` and executable `experiments/run_flow.sh`: add one common CLI. Requesting a late stage automatically runs all parent stages in protocol order.
+- `tests/test_unified_flow.py`: adds compact CIFAR-10 and San Francisco state-transition coverage, including exact LUT4/LUT6 equality immediately after expansion.
+- `experiments/README.md`, `experiments/cifar10/README.md`, and `experiments/san_francisco/README.md`: document the common flow, per-dataset protocol boundary, commands, and new-dataset extension steps.
+
+Validation: all new files pass `py_compile`; direct transition tests pass in `lut_net` for both datasets; CLI help confirms dataset-specific flags are separately exposed; `git diff --check` passes. The CUDA kernel and `lut_backend.py` are untouched.
+
+## 2026-09-04 - Unified flow smoke-test batch bound
+
+- `experiments/flow/engine.py`: corrected `--smoke-test` to run exactly one training batch per required stage rather than an entire training epoch. `run_epoch` now accepts `max_batches`, and the smoke path uses `max_batches=1` while still writing each temporary parent checkpoint for the following conversion stage.
+
+Validation: the existing CIFAR-10 and San Francisco transition tests are rerun after this change; the normal full-training path retains `max_batches=None` and is unchanged.
+
+<!-- experiment-entry:complex-dataset-audit-tool-20260904 -->
+## 2026-09-04 - Complex dataset audit tool: I/Q and TIFF inspection
+
+Modified `tools/audit_complex_dataset.py` for reusable native-complex dataset auditing. The tool now recognizes common float I/Q layouts (`[N,2,L]` and `[...,2]`) and reports canonical complex statistics, so RadioML can be audited without materializing a duplicate array. It also falls back to Pillow when rasterio is unavailable, reporting TIFF shape, mode, dtype, and sampled numeric range. Validation on FUSAR-Ship sample `Ship_C01S01N0001.tiff` found a 512x512 uint8 single-band image (`mode=L`, range 0..255), so this downloaded release is magnitude/intensity-like rather than a complex SLC tensor and is rejected for the primary complex benchmark.
+
+<!-- experiment-entry:complex-dataset-audit-report-and-tiff-20260904 -->
+## 2026-09-04 - Complex external dataset audit report and legacy TIFF support
+
+Updated `tools/audit_complex_dataset.py` with a dependency-free parser for uncompressed MATLAB-written float TIFFs. It reads the TIFF IFD, validates contiguous float32 sample planes, and recognizes a four-plane layout as two candidate complex channels `(b0+j*b1, b2+j*b3)`. Verified it on an OpenSARShip SLC patch: `85x85x4 float32`, two channels with nonzero imaginary fractions 0.9394 and 0.9768. Created `COMPLEX_DATASET_AUDIT.md`, which records source provenance, downloaded raw paths and checksums, actual format evidence, labels, leakage risks, preprocessing, integration cost, and rankings. Audit result: Pol-InSAR-Island T3/T6, RadioML 2016.10a, and OpenSARShip SLC are valid native-complex candidates; FUSAR-Ship is rejected because its released chips are uint8 single-band TIFF; SARFish raw download is deferred by user request.
+
+<!-- experiment-entry:complex-dataset-ignore-20260904 -->
+## 2026-09-04 - Ignore acquired external dataset files
+
+Modified `.gitignore` to add `/datasets_external/`. This preserves the acquired raw archives, metadata, and audit artifacts locally while preventing multi-gigabyte external datasets from entering future source-code commits. No dataset file was deleted or moved.
+
+<!-- experiment-entry:complex-dataset-opensar-final-20260904 -->
+## 2026-09-04 - Complete OpenSARShip SLC geometry and identity audit
+
+Updated `COMPLEX_DATASET_AUDIT.md` after a full read-only traversal of all OpenSARShip SLC scene archives. It now records that 19 of 35 SLC archives contain 2,643 complex patches, with native dimensions from 9x9 to 445x445 and 2,255 nonzero MMSI identities. The recommended protocol is a Cargo/Tanker/Other Type first benchmark, fixed physical crop/padding rather than arbitrary complex interpolation, and a split that is both MMSI-disjoint and scene-disjoint. Detailed machine-readable results are in `datasets_external/opensarship/audit/slc_geometry_and_identity.json`.
+
+<!-- experiment-entry:complex-dataset-storage-20260904 -->
+## 2026-09-04 - Record external dataset storage footprint
+
+Updated `COMPLEX_DATASET_AUDIT.md` with the final local storage observation: `datasets_external/` occupies approximately 17 GB because it includes raw archives, audit-only extracted Pol-InSAR content, and the intentionally incomplete SARFish sample. The directory remains Git-ignored; no raw file was deleted.
+
+## 2026-09-05 - Pol-InSAR-Island and OpenSARShip stable LUT6 integration
+
+Implemented the requested cross-dataset integration without changing LUT equations, categorical parameterization, CUDA kernels, LUT backend, or the established 2-D complex BiReal/LUT backbone.
+
+- `datasets/pol_insar_island.py`: adds the FP1/L principal T3 loader using exactly `[T11,T22,T33,T12,T13,T23] -> complex64 [6,3616,2502]`. Diagonals retain Hermitian zero imaginary components; off-diagonals use their stored real/imaginary ENVI planes. Official train/test masks are preserved; validation is derived spatially from official train only. A radius-5 guard rejects patches touching explicitly labelled pixels from the opposite official split. Preprocessing is train-only, per-channel positive RMS scaling `x_c / sqrt(E_train[|x_c|^2] + eps)`.
+- `datasets/opensarship_slc.py`: adds audited nested ZIP/XML/four-float TIFF decoding using `[band0+j*band1, band2+j*band3] -> complex64 [2,H,W]`; center crop/zero pad to 128x128; and train-only per-polarization RMS scaling. The first benchmark retains Cargo/Tanker/Other Type. Because strict scene-MMSI connected components form one giant component, it assigns whole scenes then discards every MMSI found in more than one provisional split. The resulting real-data split is 1474/358/327 chips with zero MMSI and scene overlap; 347 cross-split-MMSI chips are excluded.
+- `experiments/pol_insar_island/protocol.py` and `experiments/opensarship_slc/protocol.py`: register the data-specific loading/configuration only. They reuse `SanFranciscoFPComplexCNN`, `build_san_francisco_bireal_model`, and the shared FP -> BiReal-topology FP -> BiReal -> categorical LUT4 -> residual LUT6 transition chain.
+- `experiments/run_flow.py`: registers `pol_insar_island_t3` and `opensarship_slc`.
+- `experiments/flow/engine.py`: adds macro F1, support/precision/per-class F1, validation-OA and validation-AA best checkpoints, `last.pt`, per-stage config/log/metrics/confusion outputs, and command capture. The training and LUT optimizer semantics are unchanged.
+- `experiments/{pol_insar_island,opensarship_slc}/run_full_flow.sh` and README files: add reproducible seed-0 launchers and protocol documentation.
+- `tools/analyze_lut_usage.py`: reuses the existing LUT hook collector against any unified protocol and records dominance entropy, LUT4/LUT6 address usage, unused entries, and hard LUT6-vs-LUT4-base output flip rate.
+- `tools/validate_hard_lut_export.py`: exports hard tables and replaces only LUT table materialization during a second inference pass; it requires exact logit/prediction equality.
+- `tools/summarize_paper_flows.py` and `POL_INSAR_OPENSARSHIP_RESULTS.md`: add reusable final-report generation without treating smoke metrics as experimental results.
+- `tests/test_unified_flow.py`: extends strict FP/BiReal/LUT4/LUT6 conversion and LUT4/LUT6 initial-equivalence coverage to both new protocols.
+
+Validation: real Pol-InSAR loader produced 903,122 train / 141,675 validation / 1,156,173 test guarded patches; real OpenSARShip produced the leakage-free counts above. Both real-data GPU smoke chains completed FP, BiReal-topology FP, BiReal, LUT4, and LUT6 forward/backward/checkpoint transitions. All four protocol conversion tests pass. A Pol-InSAR hard-table validation over a real test batch reported maximum logit difference 0.0 and prediction mismatches 0. CUDA sources and `complexPyTorch/lut_backend.py` were not modified.
+
+## 2026-09-05 - Pol-InSAR seed-0 full flow launched; OpenSARShip queued
+
+Launched the first formal Pol-InSAR-Island FP1/L T3 seed-0 run on GPU 5 under `runs/pol_insar_island/reduced_t3/seed0/`. It uses the documented official-mask protocol, patch size 11, spatial validation split seed 0, guard band radius 5, train-only RMS scaling, batch size 128, and the unchanged FP -> BiReal-topology FP -> BiReal -> categorical LUT4 -> residual LUT6 sequence (100/200/200/200/200 epochs). Standard output/error is saved in `driver.log`; stage-local logs/checkpoints/metrics are managed by the shared engine.
+
+GPU 5 was the only idle device at launch. A detached queue process waits for a completed `flow_results.json`; only after Pol-InSAR succeeds does it start OpenSARShip seed 0 on GPU 5 at `runs/opensarship_slc/full_flow/seed0/`, with batch size 16 and the same stage schedule. If the first flow exits without the completion artifact, the queue records the failure and does not launch OpenSARShip.
+
+## 2026-09-05 - Hard LUT validation tightened to per-layer equality
+
+- `tools/validate_hard_lut_export.py`: in addition to final logit/prediction equality, now registers forward hooks on every PairLUT operator in both the normal checkpoint model and the model whose table materialization is replaced by exported hard tables. It records and requires zero maximum LUT-output difference and zero per-element LUT-output mismatches.
+
+Validation: reran the Pol-InSAR real smoke LUT6 checkpoint over one test batch. Every PairLUT output, final logit, and prediction matched exactly.
+
+<!-- experiment-entry:pol-insar-split-diagnostic-20260905 -->
+## 2026-09-05 - Pol-InSAR validation-collapse diagnostic tool
+
+Added `tools/analyze_pol_insar_split.py`. The reusable tool reads the immutable Pol-InSAR loader protocol and writes JSON/Markdown diagnostics for split class balance, spatial coverage, train-RMS-normalized complex channel statistics, and an optional interrupted FP history. It changes neither the loader nor model/training behavior; it was added to investigate the observed near-perfect train OA with near-random spatial-validation OA.
+
+<!-- experiment-entry:pol-insar-split-diagnostic-import-20260905 -->
+## 2026-09-05 - Pol-InSAR diagnostic entry-point fix
+
+Updated `tools/analyze_pol_insar_split.py` so direct invocation from `tools/` resolves the repository-local `datasets` package. This is an execution-only import-path correction; reported diagnostics and model/data behavior are unchanged.
+
+<!-- experiment-entry:pol-insar-split-diagnostic-random-reference-20260905 -->
+## 2026-09-05 - Pol-InSAR matched random-reference diagnostic
+
+Extended `tools/analyze_pol_insar_split.py` with a class-matched random reference sampled from the official training map. It is analysis-only and lets the report distinguish class-prior effects from distribution shift induced by the 64-pixel spatial validation blocks. Training data, splitting behavior, and model behavior remain unchanged.
+
+<!-- experiment-entry:pol-insar-fp-sweep-20260905 -->
+## 2026-09-05 - Pol-InSAR FP protocol and representation sweep
+
+Updated `datasets/pol_insar_island.py` with phase-preserving `raw_rms`, per-pixel trace-normalized, and log-power/coherence T3 representations; the default remains `raw_rms`. Updated `experiments/pol_insar_island/protocol.py` to expose `--representation`. Added `tools/visualize_pol_insar_split.py` for T3/mask alignment overlays, `tools/analyze_pol_insar_class_shift.py` for per-class raw-diagonal distribution drift, and `tools/train_pol_insar_center_mlp.py` for a train-only-standardized center-pixel shallow-MLP diagnostic. Added `experiments/pol_insar_island/run_fp_representation_sweep.sh` and documented the fixed `16x16` distributed spatial validation FP ablation in the Pol-InSAR README. No BiReal/LUT model, CUDA kernel, or LUT backend was changed.
+
+<!-- experiment-entry:pol-insar-raw-rms-broadcast-20260905 -->
+## 2026-09-05 - Pol-InSAR raw-RMS generalized broadcasting fix
+
+Updated `datasets/pol_insar_island.py`: `transform_t3_patch(..., raw_rms)` now constructs its scale shape from the input rank, so it supports both normal `[6,H,W]` training patches and `[6,N]` center-feature diagnostic batches. The existing patch-training arithmetic is unchanged. The correction was verified on both shapes after the center-MLP diagnostic exposed the rank-specific broadcast issue.
+
+<!-- experiment-entry:pol-insar-fp-sweep-launch-20260905 -->
+## 2026-09-05 - Pol-InSAR FP-only representation sweep launched
+
+Stopped the earlier raw-RMS full chain after FP showed train OA 0.9860, best spatial-validation OA 0.3280, and test OA 0.3128. Generated the 16x16 distributed spatial protocol diagnostics, class-conditional power report, and overlay. Center-pixel shallow MLP diagnostics on 100k train / 100k validation / 100k test samples gave raw_rms 0.2683/0.2750/0.2564, trace 0.3388/0.3401/0.3406, and log_coherence 0.4416/0.4460/0.4434 (train/validation/test). After one-batch real-network smoke tests passed for all three representations, launched the FP-only 100-epoch sweep on GPU 5 in order raw_rms, trace, log_coherence under `runs/pol_insar_island/fp_representation_sweep/seed0/`. No BiReal/LUT stage is scheduled.
+
+<!-- experiment-entry:pol-insar-fp-sweep-result-20260905 -->
+## 2026-09-05 - Pol-InSAR FP representation sweep completed
+
+The fixed 16x16 spatial-validation FP-only sweep completed on GPU 5. `raw_rms`: best validation OA 0.2786 at epoch 40; official-test OA/AA/macro-F1 0.2615/0.2501/0.1515. `trace`: best validation OA 0.7482 at epoch 73; official-test 0.7630/0.6347/0.6501. `log_coherence`: best validation OA 0.8225 at epoch 58; official-test 0.8335/0.7326/0.7430. The latter is the first healthy Pol-InSAR FP baseline: validation tracks test and neither collapses after convergence. The next staged BiReal/LUT comparison must freeze this exact `log_coherence`, 16x16 tile, patch=11, split-seed=0 protocol.
+
+<!-- experiment-entry:pol-insar-fp-sweep-result-correction-20260905 -->
+## 2026-09-05 - Correction: Pol-InSAR FP sweep exact selection metrics
+
+Correction to the immediately preceding completion entry: exact history-derived selection values are `raw_rms` best validation OA 0.2972 / AA 0.2502 at epoch 84; `trace` best validation OA 0.7343 / AA 0.6449 at epoch 1; `log_coherence` best validation OA 0.8287 / AA 0.7688 at epoch 25. Their official-test OA/AA/macro-F1 remain 0.2615/0.2501/0.1515, 0.7630/0.6347/0.6501, and 0.8335/0.7326/0.7430 respectively. This correction supersedes the earlier best-validation numbers; no source or experiment artifact changed.
+
+<!-- experiment-entry:pol-insar-log-coherence-full-flow-launch-20260905 -->
+## 2026-09-05 - Pol-InSAR log-coherence full FP-to-LUT6 flow launched
+
+Launched the complete Pol-InSAR comparison after the FP representation sweep selected log-coherence. Frozen protocol: FP1/L T3, representation `log_coherence`, patch size 11, distributed spatial validation tiles 16x16, guard radius 5, data seed 0, split seed 0, batch size 128. Stages are independent FP (100 epochs), BiReal-topology FP (200), BiReal (200), LUT4 categorical (200), and LUT6 categorical residual (200). Work root: `runs/pol_insar_island/log_coherence_block16/seed0/`; GPU 5. This run supersedes the stopped raw-RMS full-flow attempt for the main Pol-InSAR comparison.
+
+<!-- experiment-entry:pol-insar-log-coherence-full-flow-result-20260912 -->
+## 2026-09-12 - Pol-InSAR log-coherence full FP-to-LUT6 flow completed
+
+The frozen Pol-InSAR log-coherence / patch-11 / block-16 / split-seed-0 full flow completed. Official-test OA/AA/macro-F1: FP 0.8335/0.7326/0.7430; BiReal-topology FP 0.8494/0.7482/0.7656; BiReal 0.8537/0.7803/0.7872; LUT4 categorical 0.8617/0.7807/0.7927; LUT6 categorical residual 0.8599/0.7753/0.7886. LUT4 is the best final hardware-realizable operator: relative to BiReal it adds 0.0080 OA and 0.0055 macro-F1 while preserving AA. LUT6 is still above BiReal in OA by 0.0062 but trails LUT4 by 0.0018 OA, 0.0054 AA, and 0.0041 macro-F1; the added dominance residual did not produce a net gain under this protocol. GPU 5 was confirmed idle after completion.
+
+<!-- experiment-entry:pol-insar-lut6-lut4-diagnosis-20260912 -->
+## 2026-09-12 - Pol-InSAR LUT6 versus LUT4 post-hoc diagnosis
+
+Ran `tools/analyze_lut_usage.py` on 12,800 validation patches for the final selected LUT4 and LUT6 checkpoints. LUT4 selected epoch 161 at validation OA 0.86846; LUT6 selected epoch 126, after alpha reached 1, at validation OA 0.86509. LUT6 is not inactive: mean dominance entropy is 0.9556 bits, LUT6 groups use 13.68-33.08 effective addresses out of 64, and the final hard LUT6 tables differ from their expanded frozen LUT4 base in 36.78%-40.29% of output bits (mean 38.95%). The extra conditional capacity therefore reprograms a substantial fraction of the operator rather than making only rare refinements. It improves Dense high vegetation by 7.43 pp and Grey dune by 2.51 pp, but degrades White dune by 8.67 pp, Peat bog by 3.32 pp, and Settlement by 2.12 pp, yielding the net -0.18 pp OA / -0.54 pp AA / -0.41 pp macro-F1 relative to LUT4. Main hypotheses: the stopped-gradient phase bit is high-entropy but not explicitly aligned to class loss; frozen LUT4 base plus zero-mean residual prevents joint common-operator adaptation; and the residual amplitude reaches a too-aggressive full conditional reprogramming. The 0.18 pp OA gap is one seed, so it is not yet a statistically decisive ranking.
+
+<!-- experiment-entry:pol-insar-lut6-comparator-selection-20260912 -->
+## 2026-09-12 - Pol-InSAR LUT6 arbitrary-alpha selection and comparator-gradient ablation
+
+### Goal
+
+Evaluate whether the deployed hard LUT6 should be selected at any fixed residual alpha during its ramp, and run a strictly matched `stop` versus `ste` phase/Gray-comparator gradient ablation.  Both experiments reuse the completed log-coherence LUT4 parent and do not rerun FP, BiReal, or LUT4.
+
+### Changes
+
+- `experiments/run_flow.py`: adds CLI flags to run a selected terminal stage while reusing parent checkpoints, and to opt into validation selection at every residual alpha.
+- `experiments/flow/engine.py`: supports skipped parent stages from an external flow root; records residual alpha and eligibility in each checkpoint/history record; when opted in, permits every hard-LUT residual-ramp epoch to compete for the validation-selected best checkpoint.
+- `experiments/pol_insar_island/protocol.py`: exposes `dominance_grad_mode` and STE margin as Pol-InSAR protocol settings.
+- `experiments/san_francisco/models.py`: forwards the protocol-selected comparator gradient settings into the shared complex BiReal/LUT model.
+- `tools/analyze_residual_alpha.py`: reusable summary tool comparing the best validation point across all alpha values with the best point at terminal alpha.
+- `experiments/pol_insar_island/run_lut6_comparator_ablation.sh`: reusable LUT6-only launcher. It fixes all dataset/model/optimizer/ramp settings, reuses an existing LUT4 `best.pt`, and varies only `MODE={stop,ste}`.
+
+### Selection semantics
+
+For a fixed epoch and alpha, `argmax(B + alpha * R)` is already a fully hard, exportable LUT6 table.  Therefore alpha is a training/selection hyperparameter, not FPGA hardware.  The new opt-in selection mode uses validation OA only; test evaluation remains a single post-selection measurement.
+
+### Planned matched runs
+
+- Parent: `runs/pol_insar_island/log_coherence_block16/seed0/lut4/best.pt`.
+- Protocol: log-coherence, patch 11, spatial validation block 16, split seed 0, 200 LUT6 epochs, alpha 0.1 to 1.0 over 120 epochs.
+- Comparator modes: `stop` and `ste`, both with the identical parent, seed, optimizer, learning rates, and residual schedule.
+
+### Historical arbitrary-alpha audit and run launch
+
+`tools/analyze_residual_alpha.py` was run on the completed Pol-InSAR LUT6 history. The best validation OA across the whole residual path is `0.866615` at epoch 47 with `alpha=0.447899`; the best terminal-alpha (`alpha=1`) validation OA is `0.865091` at epoch 126. The retrospective path-selection opportunity is therefore `+0.001524` OA, and every candidate remains a hard/exportable LUT6 mapping.
+
+The matched reruns were launched without rerunning parent stages: `stop` on GPU 3 and `ste` on GPU 4. Both reuse `runs/pol_insar_island/log_coherence_block16/seed0/lut4/best.pt`, use the fixed log-coherence protocol and seed 0, select best checkpoint by validation OA across all residual-alpha values, and differ only in `dominance_grad_mode`.
+
+### Interrupted first launch and durable relaunch
+
+The first interactive executions produced valid checkpoints through stop epoch 114 and STE epoch 113, but their host-bound execution sessions were reaped before final evaluation. They are retained only as partial diagnostics, not final experiments. At their partial best validation points, stop reached OA `0.870919` at epoch 113 / alpha `0.947059`; STE reached OA `0.866481` at epoch 67 / alpha `0.599160`.
+
+The formal matched runs were restarted in durable `tmux` sessions `pol_lut6_stop` (GPU 3) and `pol_lut6_ste` (GPU 4), writing to `runs/pol_insar_island/log_coherence_block16/seed0/lut6_comparator_ablation_durable/{stop,ste}`. The original parent and all fixed hyperparameters are unchanged; only the comparator gradient mode differs.
+
+### Final result: arbitrary-alpha selection and Stop/STE comparator ablation
+
+Both durable 200-epoch runs completed successfully and performed one final official-test evaluation from their validation-OA-selected `best.pt`. The runs used the identical log-coherence Pol-InSAR protocol, LUT4 parent, seed, optimizer, LR, alpha ramp (`0.1 -> 1.0` over 120 epochs), and hard-LUT forward path. The sole experimental difference was `dominance_grad_mode`.
+
+| Comparator backward | Validation-selected epoch / alpha | Best validation OA | Official test OA | Official test AA | Official test macro-F1 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| stop | 65 / 0.5840 | 0.867952 | 0.859701 | 0.763154 | 0.782175 |
+| ste | 74 / 0.6521 | 0.867577 | 0.862540 | 0.775765 | 0.790634 |
+
+STE improves official test over stopped-gradient by `+0.002840` OA, `+0.012611` AA, and `+0.008459` macro-F1. Relative to the completed categorical LUT4 reference (`0.8617/0.7807/0.7927` test OA/AA/macro-F1), STE LUT6 is effectively tied in OA (`+0.0008`) but remains `-0.0049` AA and `-0.0021` macro-F1 behind. It improves the prior LUT6 stop-gradient reference (`0.8599/0.7753/0.7886`) in every reported test metric.
+
+Both validation-selected models choose an intermediate fixed alpha rather than alpha 1 (`0.5840` stop and `0.6521` STE); these are already hard, exportable LUT6 tables. Retrospectively, the best alpha-1 validation OA was `0.867364` for stop and `0.865626` for STE, so unrestricted alpha selection is meaningful, especially for STE. The small validation-OA edge of stop did not transfer to test; the result should be verified on additional split seeds before using it as a definitive ranking.
+
+<!-- experiment-entry:pol-insar-lut6-versus-cifar-diagnosis-20260915 -->
+## 2026-09-15 - Why Pol-InSAR LUT6 does not comprehensively surpass LUT4
+
+### Evidence
+
+The final STE-selected Pol-InSAR LUT6 checkpoint uses a fixed hard alpha of `0.6521`, and produces test `OA/AA/macro-F1 = 0.86254/0.77576/0.79063`; LUT4 is `0.86173/0.78073/0.79268`. LUT6 therefore gains only `+0.00081` OA, while losing `-0.00496` AA and `-0.00205` macro-F1. The comparison is a single fixed split seed and needs multi-seed confirmation.
+
+Per-class accuracy changes (LUT6 STE minus LUT4) show a class trade rather than a uniformly weak residual: Dense high vegetation `+7.33 pp`, Grey dune `+3.90 pp`, Tidal flat `+1.35 pp`; White dune `-8.09 pp`, Peat bog `-4.99 pp`, Settlement `-3.06 pp`, and Upper saltmarsh `-1.99 pp`. The OA preservation is therefore paid partly by minority/class-balanced degradation, which explains the lower AA and macro-F1.
+
+Reusable `scripts/analyze_dominance_lut_checkpoint.py` reports phase-bit conditional categorical sensitivity of `16.66%` for the previous alpha-1 Pol LUT6 checkpoint, `8.46%` for the final stop checkpoint (alpha `0.5840`), and `10.25%` for the final STE checkpoint (alpha `0.6521`). Thus the additional input is active but remains a controlled, sparse refinement rather than a wholesale new Boolean operator. In final STE, mean sensitivity decreases with depth: stage2 `17.96%`, stage3 `12.34%`, stage4 `9.54%`.
+
+### Cross-dataset interpretation
+
+CIFAR-10's historical route is not a directly matched estimate: it selected the best *test* epoch without an independent validation split. It had substantial LUT4 headroom (`82.53%` LUT4 versus about `85.05%` BiReal) and its residual continuation reached `84.56%`; optional common correction reached a test-selected `85.09%`. Pol-InSAR uses a spatial validation set and a one-time held-out official test. Its LUT4 is already stronger than BiReal in OA (`86.17%` versus `85.37%`), leaving less recoverable conversion loss for LUT6.
+
+The Pol-InSAR input is a spatially correlated, class-imbalanced complex T3/coherence field. Training OA is nearly one, while validation/test remain materially lower. The dominance/Gray bit has high entropy in earlier occupancy analysis, but its geometric partition is not task- or class-aware. STE improves its usefulness relative to stop-gradient, yet a single extra bit cannot simultaneously specialize the local mapping for all scattering classes. The zero-mean residual intentionally preserves LUT4's unconditional mapping and improves stability, but also prevents the residual from making the shared corrections that might be needed for some classes. A previous San Francisco experiment found common correction non-transferable, so it should remain an ablation rather than become the default response.
+
+### Prioritized next checks
+
+1. Repeat LUT4 and LUT6-STE with multiple split/model seeds before treating the `+0.081 pp` OA difference as meaningful.
+2. Report OA together with AA/macro-F1 and per-class deltas; the present LUT6 gain is not comprehensive.
+3. If capacity work continues, test a layer-wise residual-alpha schedule that is more conservative in stage4, where phase sensitivity is lowest, rather than globally increasing residual freedom.
+4. Only after the seed study, test a PolSAR-specific third bit or a class-balanced objective as explicit ablations; retain ordinary CE as the default baseline.
+
+<!-- experiment-entry:pol-insar-protocol-default-comparator-20260922 -->
+## 2026-09-22 - Pol-InSAR protocol comparator defaults for transition callers
+
+- `experiments/pol_insar_island/protocol.py`: model construction now reads `dominance_grad_mode` and `dominance_ste_margin` through `getattr`, defaulting to the established `stop` / `1.0` behavior. Full CLI runs continue to pass their explicit settings unchanged; lightweight callers such as the unified stage-transition test can construct the protocol using only shared topology fields.
+
+Validation follows with direct execution of all four unified protocol transition tests.

@@ -13,8 +13,8 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from datasets.san_francisco import build_san_francisco_datasets
-from experiments.flevoland.models import FlevolandComplexCNN
-from experiments.flevoland.train import run_epoch, set_seed
+from experiments.san_francisco.baseline import SanFranciscoFPComplexCNN
+from experiments.san_francisco.training_utils import run_epoch, set_seed
 
 
 LOGGER = logging.getLogger("san_francisco")
@@ -32,7 +32,6 @@ def parse_args(argv=None):
     parser.add_argument("--spatial-block-size", type=int, default=64)
     parser.add_argument("--train-fraction", type=float, default=0.1)
     parser.add_argument("--val-fraction", type=float, default=0.1)
-    parser.add_argument("--conv-type", choices=("fp", "bireal"), default="fp")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -150,10 +149,9 @@ def main(argv=None):
     if args.device == "cuda" and device.type == "cpu":
         LOGGER.warning("CUDA is unavailable; falling back to CPU")
     train_loader, val_loader, test_loader = build_loaders(bundle, args, device)
-    model = FlevolandComplexCNN(
+    model = SanFranciscoFPComplexCNN(
         in_channels=NUM_INPUT_CHANNELS,
         num_classes=NUM_CLASSES,
-        conv_type=args.conv_type,
     ).to(device)
     criterion = nn.CrossEntropyLoss()
 

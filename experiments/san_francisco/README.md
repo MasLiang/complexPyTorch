@@ -25,12 +25,17 @@ The core flow intentionally stops at LUT6 residual. The discarded LUT4 common
 correction and shortcut ablations remain in local `runs/` history only and are
 not part of the final reported method.
 
-Run one seed serially:
+Run one seed through the unified flow:
 
 ```bash
-GPU_ID=0 SEED=1 SPLIT_SEED=0 \
-  ./experiments/san_francisco/run_core_flow.sh
+GPU_ID=0 PYTHON_BIN=/home/jliangbr/miniconda3/envs/lut_net/bin/python \
+  ./experiments/run_flow.sh \
+  --dataset san_francisco --data-root data/san_francisco \
+  --workdir runs/san_francisco/unified_seed1 --seed 1 --split-seed 0
 ```
+
+The legacy `run_core_flow.sh` remains available for reproducing the already
+reported run layout. New experiments should use the shared flow above.
 
 Run reproducibility seeds in parallel, holding the spatial split fixed:
 

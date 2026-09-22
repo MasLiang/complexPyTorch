@@ -71,6 +71,8 @@ def build_san_francisco_bireal_model(
     post_bn_mode="covariance",
     pair_lut_parameterization="categorical",
     shortcut_mode="fp",
+    dominance_grad_mode="stop",
+    dominance_ste_margin=1.0,
 ):
     try:
         phase = STAGE_TO_MODEL_PHASE[stage]
@@ -98,6 +100,7 @@ def build_san_francisco_bireal_model(
         ),
         pair_lut_inputs=6 if residual_stage else 4,
         pair_lut_encoding="dominance" if residual_stage else "standard",
-        dominance_grad_mode="stop",
+        dominance_grad_mode=dominance_grad_mode,
+        dominance_ste_margin=dominance_ste_margin,
         shortcut_mode=shortcut_mode,
     )
